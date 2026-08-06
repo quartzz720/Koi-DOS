@@ -28,4 +28,11 @@ void free_pages(void* address, boot_uint64_t count);
 /* Free page count, for the `mem` command and diagnostics. */
 boot_uint64_t memory_free_pages(void);
 
+/* Every page the firmware described, usable or not - the machine's memory
+   rather than the part of it we are allowed to allocate from. */
+boot_uint64_t memory_physical_pages(void);
+
+/* Size of the loaded kernel image, `.bss` included. */
+boot_uint64_t memory_kernel_bytes(void);
+
 #endif

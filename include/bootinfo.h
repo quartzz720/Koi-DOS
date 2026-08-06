@@ -9,6 +9,24 @@ typedef unsigned long long boot_uint64_t;
 
 #define BOOT_MEMORY_USABLE 7U
 
+/* The EFI memory types that describe RAM the board actually has, whether or
+   not we are allowed to allocate from it.
+ *
+ * The list is an allowlist on purpose. The obvious alternative - count
+ * everything except the memory-mapped I/O types - is wrong, because firmware
+ * uses type 0 (reserved) both for RAM held back and for address space that is
+ * not memory at all. On QEMU that is a 12 GiB reserved region at 1012 GiB,
+ * which is how a 2 GiB machine comes to report fourteen gigabytes. */
+#define BOOT_MEMORY_LOADER_CODE 1U
+#define BOOT_MEMORY_LOADER_DATA 2U
+#define BOOT_MEMORY_BOOT_SERVICES_CODE 3U
+#define BOOT_MEMORY_BOOT_SERVICES_DATA 4U
+#define BOOT_MEMORY_RUNTIME_CODE 5U
+#define BOOT_MEMORY_RUNTIME_DATA 6U
+#define BOOT_MEMORY_ACPI_RECLAIM 9U
+#define BOOT_MEMORY_ACPI_NVS 10U
+#define BOOT_MEMORY_PERSISTENT 14U
+
 typedef struct {
     boot_uint32_t type;
     boot_uint32_t reserved;

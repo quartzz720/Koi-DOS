@@ -4,6 +4,7 @@
 #include "idt.h"
 #include "io.h"
 #include "pic.h"
+#include "xhci.h"
 
 #define PS2_DATA 0x60U
 #define PS2_STATUS 0x64U
@@ -252,6 +253,10 @@ int keyboard_init(void) {
     return KEYBOARD_READY;
 }
 
+void keyboard_submit(int key) {
+    if (key) buffer_push((boot_uint16_t)key);
+}
+
 int keyboard_poll(void) {
     boot_uint16_t key;
     if (buffer_tail == buffer_head) return 0;
@@ -262,11 +267,27 @@ int keyboard_poll(void) {
 
 int keyboard_getchar(void) {
     int key;
-    if (!keyboard_present) return 0;
+    int usb = xhci_has_keyboard();
+
+    if (!keyboard_present && !usb) return 0;
     console_show_cursor(1);
-    /* hlt rather than a spin: the next interrupt wakes us, and an idle guest
-       stops burning a host core. */
-    while (!(key = keyboard_poll())) __asm__ volatile ("hlt");
+    for (;;) {
+        if ((key = keyboard_poll())) break;
+        if (usb) {
+            /* The controller's interrupt is not routed anywhere yet, so USB
+               keystrokes have to be collected rather than waited for. That
+               rules out hlt: nothing would wake us.
+               `pause` costs nothing and tells the processor this is a spin
+               loop, which matters on anything with hyperthreading. Routing
+               the controller's interrupt is the real fix. */
+            xhci_poll();
+            __asm__ volatile ("pause");
+            continue;
+        }
+        /* PS/2 raises IRQ1, so sleeping until the next interrupt is both
+           correct and stops an idle guest burning a host core. */
+        __asm__ volatile ("hlt");
+    }
     console_show_cursor(0);
     return key;
 }

@@ -10,6 +10,28 @@
 
 static boot_uint8_t page_bitmap[PAGE_BITMAP_SIZE];
 static boot_uint64_t page_search_hint;
+static boot_uint64_t physical_pages;
+static boot_uint64_t kernel_bytes;
+
+/* Does this descriptor describe RAM the machine has? See bootinfo.h for why
+   this is an allowlist rather than "everything that is not a device window". */
+static int describes_memory(boot_uint32_t type) {
+    switch (type) {
+    case BOOT_MEMORY_LOADER_CODE:
+    case BOOT_MEMORY_LOADER_DATA:
+    case BOOT_MEMORY_BOOT_SERVICES_CODE:
+    case BOOT_MEMORY_BOOT_SERVICES_DATA:
+    case BOOT_MEMORY_RUNTIME_CODE:
+    case BOOT_MEMORY_RUNTIME_DATA:
+    case BOOT_MEMORY_USABLE:
+    case BOOT_MEMORY_ACPI_RECLAIM:
+    case BOOT_MEMORY_ACPI_NVS:
+    case BOOT_MEMORY_PERSISTENT:
+        return 1;
+    default:
+        return 0;
+    }
+}
 
 static void bitmap_set(boot_uint64_t page) {
     page_bitmap[page >> 3] |= (boot_uint8_t)(1U << (page & 7));
@@ -52,16 +74,23 @@ static void release_conventional_range(boot_uint64_t start, boot_uint64_t count)
 
 void memory_init(BOOT_INFO* info) {
     for (boot_uint64_t i = 0; i < PAGE_BITMAP_SIZE; i++) page_bitmap[i] = 0xFF;
+    physical_pages = 0;
 
     for (boot_uint64_t offset = 0;
          offset + info->memory_map_descriptor_size <= info->memory_map_size;
          offset += info->memory_map_descriptor_size) {
         BOOT_MEMORY_DESCRIPTOR* descriptor =
             (BOOT_MEMORY_DESCRIPTOR*)(info->memory_map + offset);
+        /* Runtime-services and ACPI regions count towards the machine's
+           memory: they are RAM the board has, simply RAM we are not allowed
+           to hand out. */
+        if (describes_memory(descriptor->type))
+            physical_pages += descriptor->page_count;
         if (descriptor->type == BOOT_MEMORY_USABLE)
             release_conventional_range(descriptor->physical_start,
                                        descriptor->page_count);
     }
+    kernel_bytes = info->kernel_image_size;
 
     reserve_range(0, PAGE_SIZE);
     /* The image range covers .bss, so the bitmap below - which lives in .bss -
@@ -131,6 +160,14 @@ void free_pages(void* address, boot_uint64_t count) {
     if (!first || first + count > PAGE_BITMAP_PAGES) return;
     for (boot_uint64_t i = 0; i < count; i++) bitmap_clear(first + i);
     if (first < page_search_hint) page_search_hint = first;
+}
+
+boot_uint64_t memory_physical_pages(void) {
+    return physical_pages;
+}
+
+boot_uint64_t memory_kernel_bytes(void) {
+    return kernel_bytes;
 }
 
 boot_uint64_t memory_free_pages(void) {

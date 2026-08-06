@@ -4,6 +4,7 @@ boot/efi/boot/KERNEL.ELF
 boot/efi/boot/KERNEL.BIN
 boot/efi/boot/*.efi
 kernel/kernel.elf
+kernel/build.h
 build/
 *.o
 *.obj

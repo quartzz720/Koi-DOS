@@ -28,6 +28,10 @@
 
 int keyboard_init(void);
 
+/* Push a key into the shared buffer. Used by the USB driver, so that a key
+   reaches the shell the same way whichever kind of keyboard produced it. */
+void keyboard_submit(int key);
+
 /* Non-blocking: returns 0 when nothing is buffered. */
 int keyboard_poll(void);
 

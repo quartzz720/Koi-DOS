@@ -22,20 +22,22 @@ KERNEL_LDFLAGS = -nostdlib -no-pie -Wl,-T,linker.ld -Wl,--build-id=none \
 EFI_DIR = boot/efi/boot
 KERNEL_ELF = kernel/kernel.elf
 KERNEL_IMAGE = $(EFI_DIR)/KERNEL.ELF
+BUILD_HEADER = kernel/build.h
 
 KERNEL_SOURCES = kernel/kernel.c kernel/console.c kernel/font.c kernel/serial.c \
                  kernel/string.c kernel/memory.c kernel/cpu.c kernel/idt.c \
                  kernel/isr.S kernel/pic.c kernel/acpi.c kernel/keyboard.c \
                  kernel/heap.c kernel/paging.c kernel/rtc.c kernel/block.c \
                  kernel/partition.c kernel/fat32.c kernel/command.c \
-                 kernel/syscall.c kernel/program.c kernel/config.c \
+                 kernel/syscall.c kernel/program.c kernel/config.c kernel/xhci.c \
                  kernel/timer.c kernel/pci.c kernel/ahci.c
 KERNEL_HEADERS = kernel/kernel.h kernel/console.h kernel/font.h kernel/serial.h \
                  kernel/string.h kernel/io.h kernel/memory.h kernel/cpu.h \
                  kernel/idt.h kernel/pic.h kernel/acpi.h kernel/keyboard.h \
                  kernel/heap.h kernel/paging.h kernel/rtc.h kernel/block.h \
                  kernel/partition.h kernel/fat32.h kernel/command.h \
-                 kernel/syscall.h kernel/program.h kernel/config.h include/syscall.h \
+                 kernel/syscall.h kernel/program.h kernel/config.h kernel/xhci.h \
+                 include/syscall.h $(BUILD_HEADER) \
                  kernel/timer.h kernel/pci.h kernel/ahci.h include/bootinfo.h
 
 # Programs are built with the same compiler as the kernel but their own linker
@@ -54,6 +56,21 @@ PROGRAMS = $(patsubst programs/%.c,build/%.EXE,\
              $(filter-out programs/start.c,$(PROGRAM_SOURCES)))
 
 all: $(EFI_DIR)/BOOTX64.EFI $(KERNEL_IMAGE) $(PROGRAMS)
+
+# The build stamp: commit count as a build number, the date, and the commit
+# itself with a `+` when the tree is dirty. Generated rather than checked in,
+# and rewritten only when it actually changes - otherwise every `make` would
+# relink the kernel whether or not anything moved. Outside a git checkout the
+# numbers fall back to zero rather than failing the build.
+$(BUILD_HEADER): FORCE
+	@printf '#ifndef KERNEL_BUILD_H\n#define KERNEL_BUILD_H\n#define KOI_BUILD_NUMBER %s\n#define KOI_BUILD_DATE "%s"\n#define KOI_BUILD_COMMIT "%s"\n#endif\n' \
+	  "$$(git rev-list --count HEAD 2>/dev/null || echo 0)" \
+	  "$$(date -u +%Y-%m-%d)" \
+	  "$$(git describe --always --dirty=+ --abbrev=7 2>/dev/null || echo unknown)" > $@.tmp
+	@cmp -s $@.tmp $@ || mv -f $@.tmp $@
+	@rm -f $@.tmp
+
+FORCE:
 
 build/%.EXE: programs/%.c programs/start.c programs/koi.h programs/program.ld include/syscall.h
 	mkdir -p build
@@ -83,6 +100,7 @@ check: $(KERNEL_ELF)
 
 clean:
 	rm -f $(EFI_DIR)/BOOTX64.EFI $(KERNEL_IMAGE) $(EFI_DIR)/KERNEL.BIN $(KERNEL_ELF)
+	rm -f $(BUILD_HEADER)
 	rm -rf build
 
-.PHONY: all check clean
+.PHONY: all check clean FORCE

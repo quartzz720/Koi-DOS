@@ -64,9 +64,43 @@ Z:\> dir *.exe
 | `attrib [+-RHSA] file` | show or change attributes |
 | `copy`, `del`/`erase`, `ren`/`rename` | file management |
 | `md`/`mkdir`, `rd`/`rmdir` | directories |
-| `vol`, `mem`, `date`, `time` | volume label, memory use, the clock |
+| `vol`, `date`, `time` | volume label and the clock |
+| `mem` | memory, and what the drivers actually found |
 | `echo`, `ver`, `cls`, `help` | the usual |
 | `Z:` | change drive |
+
+`mem` doubles as the system's self-description, because the alternative to a line reading
+`USB : keyboard, storage` is rebooting with a serial cable attached to find out whether a driver
+came up:
+
+```
+Z:\> mem
+Physical memory : 2047 MB
+Available       : 1978 MB
+
+Kernel image    : 2152 KB
+Page tables     : 80 KB
+Identity map    : 16386 MB (RAM and device windows)
+Heap            : 1023 KB
+Heap free       : 1023 KB
+
+PCI devices     : 7
+Disks           : 2  ahci0, usb0
+Volumes         : 2  Z:, Y:
+USB             : keyboard, storage (2 of 8 ports in use)
+```
+
+`ver` carries a build number, which during development is worth more than the version — two
+kernels both claiming 0.5 differ by whatever happened in between. The number is the commit count,
+so it only moves when history does, and a trailing `+` means the tree had uncommitted changes
+when that kernel was built:
+
+```
+Z:\> ver
+Koi-DOS 0.5 Alpha
+Kernel 0.5.20, built 2026-08-06 (65230ca+)
+A DOS-like operating system for UEFI machines.
+```
 
 Patterns work where they should — `dir *.exe`, `copy *.txt backup`, `del *.bak`. `*` matches any
 run of characters including dots, `?` exactly one. `del` with a pattern asks first.
@@ -157,14 +191,29 @@ those calls and whatever it writes itself.
 
 ## Status
 
-Working: the boot chain, framebuffer console with an 8×16 CP437 font, PS/2 keyboard, exception
-handling with a register dump instead of a silent reboot, physical page allocator, `kmalloc`
-heap, own page tables, AHCI, GPT/MBR/whole-device partitioning, FAT32 read **and** write with
-long names, the command interpreter, programs and system calls.
+Working: the boot chain, framebuffer console with an 8×16 CP437 font, exception handling with a
+register dump instead of a silent reboot, physical page allocator, `kmalloc` heap, own page
+tables, AHCI, GPT/MBR/whole-device partitioning, FAT32 read **and** write with long names, the
+command interpreter, programs and system calls.
 
-Missing: USB and NVMe. There is no `edit` — the line editor is the one command from the old shell
-not carried over, and it belongs as a program now that programs exist. `chkdsk` does not exist,
-so an interrupted write has to be repaired from another system.
+**Keyboards work over both PS/2 and USB.** The xHCI driver takes the controller from the
+firmware, resets the port, addresses the device, reads its descriptors and drives it in HID boot
+protocol; keys land in the same buffer as PS/2 ones, so the shell cannot tell which kind produced
+them. Verified with PS/2 switched off, leaving USB as the only way in.
+
+**USB sticks work too.** SCSI over bulk-only transport, registered through the same block
+interface AHCI uses, so the filesystem never learns which controller it is reading. A keyboard
+and a stick share the controller — every event carries the slot and endpoint it came from, so a
+keystroke that arrives during a disk read is delivered rather than swallowed. Booting from a
+stick with an internal disk also present puts `Z:` on the stick and the internal EFI System
+Partition on `Y:`.
+
+Missing: **NVMe**, then graphics, audio and networking. There is no `edit` — the line editor is
+the one command from the old shell not carried over, and it belongs as a program now that
+programs exist. `chkdsk` does not exist, so an interrupted write has to be repaired from another
+system. The xHCI interrupt is not routed anywhere, so waiting for a USB key spins rather than
+sleeps, and USB devices are enumerated once at boot: plugging a stick in afterwards does nothing
+until a reboot.
 
 **Nothing has been run on physical hardware yet — QEMU only.** See
 [Running on real hardware](#running-on-real-hardware).
@@ -251,15 +300,20 @@ make check    # undefined symbols, relocations, program headers
 ./qemu.sh     # build a FAT32 image and boot it
 ```
 
-`qemu.sh` does the whole cycle: runs `make`, creates a 64 MiB FAT32 image with `mkfs.vfat`,
-populates it with `mtools`, copies a fresh OVMF variable store to `/tmp/koi-vars.fd`, and
+`qemu.sh` does the whole cycle: runs `make`, creates two 64 MiB FAT32 images with `mkfs.vfat`,
+populates them with `mtools`, copies a fresh OVMF variable store to `/tmp/koi-vars.fd`, and
 launches QEMU. Extra arguments pass straight through:
 
 ```bash
 ./qemu.sh -display none     # no window, serial log in the terminal only
 ./qemu.sh -s -S             # wait for gdb on :1234
-KEEP_IMAGE=1 ./qemu.sh      # reuse the existing image instead of rebuilding it
+KEEP_IMAGE=1 ./qemu.sh      # reuse the existing images instead of rebuilding them
 ```
+
+Two images, because one device of a kind never exercises the code that handles two. `esp.img` is
+the system volume on an emulated SATA disk; `stick.img` is presented as a USB stick alongside a
+USB keyboard, so the mass storage driver has something to enumerate and the drive-letter code has
+more than one volume to hand out.
 
 The boot log appears **in your terminal** as well as in the QEMU window, because `-serial stdio`
 is always on. `Ctrl+C` in the terminal quits.
@@ -275,24 +329,24 @@ relocations (must be none, or the kernel is not actually position-fixed), and th
 
 ## Running on real hardware
 
-Safe, but not yet useful from a USB stick.
+A USB stick is now the sensible way to try it.
 
 The bootloader records the FAT volume serial of the device it was loaded from, and the kernel
 matches on it rather than assuming the first FAT volume it finds is the right one. That
-assumption would have been dangerous: USB mass storage is invisible to the AHCI driver, so the
-first FAT volume found booting off a stick is the **internal drive's EFI System Partition**, and
-`Z:` would have pointed at the real system's boot files.
+assumption would have been dangerous: booted off a stick, the first FAT volume the AHCI driver
+finds is the **internal drive's EFI System Partition**, and `Z:` would have pointed at the real
+system's boot files — with `del` and `copy` aimed there.
 
-What happens now, booted from a stick, is that nothing matches — no drive is assigned, the prompt
-reads `?:\>`, and the log says `BOOT VOLUME: NOT FOUND`. Correct and harmless, but there is
-nothing to do until USB mass storage exists.
+With mass storage working, the stick itself is enumerated, the serial matches, and `Z:` is the
+stick. The internal ESP still shows up, as `Y:`, where it can be looked at but is not where
+anything lands by default. If no volume matches, none is assigned: the prompt reads `?:\>` and
+the log says `BOOT VOLUME: NOT FOUND`, which is the only safe answer.
 
-Booting from a SATA disk the AHCI driver can see works properly today. A spare drive is the
-sensible way to try it; putting Koi-DOS on the EFI partition of a system you care about is not
-recommended, since it can write.
+Booting from a SATA disk the AHCI driver can see works too. Either way, putting Koi-DOS on the
+EFI partition of a system you care about is not recommended, since it can write.
 
-A note on keyboards, since the obvious guess is backwards. A **laptop's internal keyboard is
-usually PS/2** — it hangs off the embedded controller, which presents itself as an 8042 — so it
+A note on keyboards, since the obvious guess is backwards — though with USB working, either kind
+now does. A **laptop's internal keyboard is usually PS/2** — it hangs off the embedded controller, which presents itself as an 8042 — so it
 stands a good chance of working already. A **desktop with a USB keyboard** is the harder case,
 because the firmware's legacy emulation generally stops once boot services are gone. And an
 8042 in the chipset does not mean a socket on the board: the driver resets the device and waits
@@ -338,6 +392,7 @@ kernel/
   timer.c              PIT, polled
   pci.c                PCI enumeration
   ahci.c               SATA/AHCI disk I/O
+  xhci.c               USB 3 controller, HID boot keyboard and mass storage
   block.c              sector-device abstraction over any controller
   partition.c          GPT / MBR / whole device, and drive letters
   fat32.c              FAT32 with long names, read and write

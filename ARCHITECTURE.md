@@ -42,6 +42,17 @@ Z:\> save notes.txt written by a koi dos program
 `vol`, `mem`, `date`, `time`, `echo`, `ver`, `cls` and `help` all work, plus `Z:` to change
 drive. Patterns work where they should: `dir *.exe`, `copy *.txt backup`, `del *.bak`.
 
+Two of those carry more than their DOS namesakes did, and deliberately. `mem` reports what each
+driver found — PCI device count, block devices by name, volumes by letter, and which USB class
+drivers claimed something — because the alternative to reading that off the screen is rebooting
+with a serial cable attached. `ver` carries a build number taken from the commit count, with a
+`+` on the hash when the tree was dirty, so a screenshot identifies the kernel that produced it.
+
+Counting installed memory needed an allowlist of EFI memory types rather than "everything that
+is not a device window". Firmware uses type 0 for both RAM held back and address space that is
+not memory: QEMU describes a 12 GiB reserved region at 1012 GiB, which made a 2 GiB machine
+report fourteen gigabytes.
+
 The filesystem reads **and writes**. Reading was proven against a known image first, on purpose:
 FAT keeps two copies of its allocation table plus an FSInfo sector, and a half-correct writer
 corrupts a volume rather than merely failing. What the guest writes is checked from outside with
@@ -112,6 +123,7 @@ the whole span is what initialises `.bss`, which has no presence in the file at 
 | [kernel/rtc.c](kernel/rtc.c) | CMOS wall clock, and FAT timestamp packing |
 | [kernel/pci.c](kernel/pci.c) | PCI enumeration; drivers look themselves up |
 | [kernel/ahci.c](kernel/ahci.c) | SATA/AHCI, IDENTIFY, `disk_read` / `disk_write` |
+| [kernel/xhci.c](kernel/xhci.c) | USB 3 host controller, the HID boot keyboard and mass storage |
 | [kernel/block.c](kernel/block.c) | Sector-device abstraction over any controller |
 | [kernel/partition.c](kernel/partition.c) | GPT, MBR and whole-device volumes; drive letters |
 | [kernel/fat32.c](kernel/fat32.c) | FAT32 with VFAT long names, read and write |
@@ -121,6 +133,91 @@ the whole span is what initialises `.bss`, which has no presence in the file at 
 | [kernel/syscall.c](kernel/syscall.c) | System call dispatch |
 | [include/syscall.h](include/syscall.h) | The ABI, shared with programs |
 | [programs/](programs/) | Programs and the header they are written against |
+
+### USB
+
+xHCI fails quietly. A controller set up incorrectly does not complain — it simply never posts an
+event, and every later step waits for something that will not come. So the driver was built and
+verified in slices, each with something observable at the end, rather than written whole and
+switched on.
+
+The checkpoint that matters is a **No-Op command**: a command that does nothing, whose completion
+event proves the ring layout, the cycle bits, the doorbell and the event ring are all correct
+together. Everything after it is about USB rather than about the controller.
+
+Three things the slices caught that would have been miserable to find later:
+
+**The event ring is shared.** Resetting a port posts a Port Status Change event, and it arrives
+before the completion of whatever command was issued next. Taking the first event that turns up
+therefore reads a port notification as a command result — and because the completion-code field
+lands in the same bits for both, it looks like a success carrying nonsense. Commands wait for
+their own event type.
+
+**A 64-bit BAR can be assigned far above RAM.** QEMU puts xHCI at 768 GiB, well outside the
+boot-time identity map, and the first register read was a page fault. Drivers now ask
+`paging_map_device()` for their window before touching it; mapping everything up to 768 GiB
+instead would have meant mapping most of a terabyte of nothing.
+
+**`PORTSC` is a minefield of write-1-to-clear bits**, and bit 1 *disables* the port rather than
+reporting it. Any read-modify-write of that register has to mask them out.
+
+The firmware handoff capability is honoured before the reset. A BIOS that provided legacy USB
+keyboard emulation still owns the controller when we arrive and will fight for it through SMM;
+asking for it properly is the difference between a controller that works and one that behaves
+erratically for invisible reasons.
+
+The keyboard uses the HID **boot protocol** — the mode every USB keyboard supports so that a BIOS
+can drive it without a report-descriptor parser. A boot report is a set rather than an event: it
+lists which keys are down right now, so a key counts as newly pressed when it appears in this
+report and not the previous one, which is also how repeat is avoided without any timing.
+
+Keys go into the same ring buffer `keyboard.c` fills from IRQ1, so the shell cannot tell which
+kind of keyboard produced them.
+
+**Devices are a table, not a singleton.** A real machine has a keyboard and a stick plugged in at
+once, so slots, rings and endpoint state belong to a device rather than to the driver. That
+distinction is what makes the event ring workable: every event carries the slot and endpoint it
+came from, and a wait for one endpoint steps over — and *services* — everything else. A keystroke
+arriving in the middle of a disk read is handed to the keyboard driver and the read carries on
+waiting. Without that, one would swallow the other.
+
+**Endpoint zero starts at a guessed size.** Every speed but full has exactly one legal packet size
+for the control endpoint; a full-speed device may use 8, 16, 32 or 64 and only says which in the
+descriptor that has to be read through that same endpoint. So enumeration reads the first eight
+bytes — safe at any size — and issues an Evaluate Context command if the answer disagrees. A
+SuperSpeed device reports the size as a power of two rather than a byte count, which is why that
+case is excluded rather than "corrected" to nine bytes.
+
+### USB mass storage
+
+Bulk-only transport, which is what every USB stick made in the last two decades speaks: a 31-byte
+command block out, an optional data stage, and a 13-byte status block in. The SCSI command sits
+inside the command block, and a tag ties the three phases together — a status block carrying
+somebody else's tag means the two ends have lost sync, which is worth detecting rather than
+papering over.
+
+`INQUIRY` is the checkpoint here, the way the No-Op was for the controller: a vendor string coming
+back proves the whole transport works before any sector is at stake.
+
+**Transfers bounce through a page of the driver's own.** A TRB's buffer may not cross a 64 KiB
+boundary, and the block layer above hands down pointers from anywhere. A page-aligned bounce
+buffer costs a copy per chunk and makes the rule impossible to break.
+
+**A stall is not a failure.** It is the device saying no to one endpoint, and it stays halted until
+both ends agree it is clear: the controller through Reset Endpoint and Set TR Dequeue Pointer, the
+device through `CLEAR_FEATURE`. A stalled data stage still owes a status block, so recovery reads
+one rather than abandoning the command. (This path is written but untested — QEMU's emulated
+storage never stalls.)
+
+A device that has just been given power answers "not ready" while it spins up, and holds a pending
+condition that makes it refuse everything until somebody reads it. `TEST UNIT READY` and
+`REQUEST SENSE` in a loop are that handshake; skipping it is a common way to make a working stick
+look dead.
+
+The result registers through `block.c` as an ordinary disk, so `partition.c` and `fat32.c` never
+learn what kind of controller they are reading. Booting from a stick now assigns `Z:` to the stick
+even with an internal disk carrying its own EFI System Partition — verified in QEMU with both
+present.
 
 ### Storage stack
 
@@ -136,10 +233,12 @@ partition.c      GPT / MBR / whole device  →  volumes Z:, Y:, X:
 block.c          block_read(device, lba, count, buffer)
    ↓
 ahci.c           SATA command FIS, DMA
+xhci.c           SCSI over bulk-only transport
 ```
 
 `block.c` is why NVMe will not require touching the filesystem: it registers through the same
-interface and everything above it is unchanged. It also range-checks against the sector count
+interface and everything above it is unchanged. USB mass storage is the proof that this works —
+it arrived as a second driver under the same interface, and nothing above `block.c` changed. It also range-checks against the sector count
 IDENTIFY reported — reading past the end of a disk returns garbage rather than an error on some
 controllers, which becomes a baffling filesystem bug three layers up.
 
@@ -166,6 +265,10 @@ real one. Booted from a USB stick, the first FAT volume the AHCI driver can see 
 drive's EFI System Partition — so `Z:` would be the real system's boot files, with `del` and
 `copy` pointed there. When no volume matches, none is assigned, the prompt reads `?:\>` and the
 boot log says so. Refusing is the only safe answer; there is nothing sensible to fall back to.
+
+Now that USB mass storage exists this is more than a precaution: booting from a stick with an
+internal disk also present puts `Z:` on the stick and the internal EFI System Partition on `Y:`,
+which is what the serial match was written for.
 
 ### Long file names
 
@@ -452,10 +555,13 @@ condition under which truncated DMA addresses stay invisible.
 
 ## What comes next
 
-USB (xHCI + HID) for keyboards on real laptops, NVMe, graphics, audio and networking.
+NVMe, then graphics, audio and networking.
 
-Two things the current code is honest about not having: the timer is still polled through the
-PIT rather than driven by the APIC, and nothing has been run on physical hardware yet.
+Four things the current code is honest about not having: the xHCI interrupt is not routed
+anywhere, so waiting for a USB key spins rather than sleeps; the timer is still polled through
+the PIT rather than driven by the APIC; USB devices are enumerated once at boot, so plugging a
+stick in afterwards does nothing until a reboot; and nothing has been run on physical hardware
+yet.
 
 ## Historical
 

@@ -5,11 +5,16 @@
 #include "string.h"
 #include "memory.h"
 #include "heap.h"
+#include "paging.h"
+#include "pci.h"
+#include "block.h"
+#include "xhci.h"
 #include "fat32.h"
 #include "partition.h"
 #include "rtc.h"
 #include "program.h"
 #include "syscall.h"
+#include "build.h"
 #include "../include/syscall.h"
 
 /* The command semantics follow legacy/shell.c and legacy/fs.c, which worked
@@ -291,12 +296,27 @@ static void print_prompt(void) {
     console_use_theme();
 }
 
+/* The build stamp is worth more than the version during development: two
+   kernels claiming 0.5 differ by whatever happened between them, and the
+   number is the only way to tell from the screen which one is running. It is
+   the commit count, so it only moves when history does; a trailing `+` on the
+   hash means the tree had uncommitted changes when this was built. */
 static void command_ver(void) {
-    print("Koi-DOS version ");
+    print("Koi-DOS ");
     print_dec(KOI_DOS_VERSION >> 8);
     put('.');
     print_dec(KOI_DOS_VERSION & 0xFF);
+    print_line(" Alpha");
+
+    print("Kernel ");
+    print_dec(KOI_DOS_VERSION >> 8);
+    put('.');
+    print_dec(KOI_DOS_VERSION & 0xFF);
+    put('.');
+    print_dec(KOI_BUILD_NUMBER);
+    print(", built " KOI_BUILD_DATE " (" KOI_BUILD_COMMIT ")");
     print("\n");
+
     print_line("A DOS-like operating system for UEFI machines.");
 }
 
@@ -314,7 +334,7 @@ static void command_help(void) {
     print_line("tree [path]    show the directory tree");
     print_line("attrib [+-RHSA] file   show or change attributes");
     print_line("vol            show the volume label");
-    print_line("mem            show memory use");
+    print_line("mem            memory, devices and volumes");
     print_line("date           show the date");
     print_line("time           show the time");
     print_line("echo [text]    print text");
@@ -362,16 +382,65 @@ static void command_vol(void) {
     print("\n");
 }
 
+/* `mem` is the one place the system describes itself, so it reports what was
+   found as well as what is free. A line that reads `USB : keyboard` is the
+   fastest way to answer "did the driver actually come up", which otherwise
+   means rebooting with a serial cable attached. */
+static void print_field(const char* label, boot_uint64_t value,
+                        const char* unit) {
+    print(label);
+    print_dec(value);
+    print_line(unit);
+}
+
 static void command_mem(void) {
-    print("Physical memory free : ");
-    print_dec(memory_free_pages() * PAGE_SIZE / 1024U);
-    print_line(" KB");
-    print("Kernel heap total    : ");
-    print_dec(heap_total() / 1024U);
-    print_line(" KB");
-    print("Kernel heap in use   : ");
-    print_dec(heap_used() / 1024U);
-    print_line(" KB");
+    print_field("Physical memory : ", memory_physical_pages() * PAGE_SIZE / 1024U / 1024U, " MB");
+    print_field("Available       : ", memory_free_pages() * PAGE_SIZE / 1024U / 1024U, " MB");
+    print_line("");
+
+    print_field("Kernel image    : ", memory_kernel_bytes() / 1024U, " KB");
+    print_field("Page tables     : ", paging_table_bytes() / 1024U, " KB");
+    print_field("Identity map    : ", paging_mapped_bytes() / 1024U / 1024U,
+                " MB (RAM and device windows)");
+    print_field("Heap            : ", heap_total() / 1024U, " KB");
+    print_field("Heap free       : ", (heap_total() - heap_used()) / 1024U, " KB");
+    print_line("");
+
+    print_field("PCI devices     : ", pci_device_count(), "");
+
+    print("Disks           : ");
+    print_dec(block_device_count());
+    for (boot_uint32_t index = 0; index < block_device_count(); index++) {
+        BLOCK_DEVICE* device = block_device(index);
+        print(index ? ", " : "  ");
+        print(device ? device->name : "?");
+    }
+    print_line("");
+
+    print("Volumes         : ");
+    print_dec(volume_count());
+    for (boot_uint32_t index = 0; index < volume_count(); index++) {
+        VOLUME* volume = volume_at(index);
+        print(index ? ", " : "  ");
+        put(volume ? volume->letter : '?');
+        put(':');
+    }
+    print_line("");
+
+    print("USB             : ");
+    if (!xhci_port_count()) {
+        print_line("no controller");
+    } else {
+        if (xhci_has_keyboard()) print("keyboard");
+        if (xhci_has_keyboard() && xhci_has_storage()) print(", ");
+        if (xhci_has_storage()) print("storage");
+        if (!xhci_has_keyboard() && !xhci_has_storage()) print("nothing claimed");
+        print(" (");
+        print_dec(xhci_ports_connected());
+        print(" of ");
+        print_dec(xhci_port_count());
+        print_line(" ports in use)");
+    }
 }
 
 static void print_entry_line(const FAT_ENTRY* entry) {
@@ -1163,6 +1232,9 @@ static void execute(const char* input) {
     if (word_is(input, "TIME")) { command_time(); return; }
     if (word_is(input, "VER")) { command_ver(); return; }
     if (word_is(input, "HELP")) { command_help(); return; }
+    /* `echo.` prints a blank line - the DOS idiom for one, since a bare
+       `echo` prints the on/off state instead. */
+    if (word_is(input, "ECHO.")) { print_line(""); return; }
     if (word_is(input, "ECHO")) { print_line(arguments.tail); return; }
     if (word_is(input, "MD") || word_is(input, "MKDIR")) {
         command_mkdir(&arguments);

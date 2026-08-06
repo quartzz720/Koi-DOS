@@ -21,10 +21,14 @@
 
 static boot_uint64_t* pml4;
 static boot_uint64_t mapped_bytes;
+static boot_uint64_t table_bytes;
 
 static boot_uint64_t* alloc_table(void) {
     boot_uint64_t* table = (boot_uint64_t*)alloc_page();
-    if (table) memset(table, 0, PAGE_SIZE);
+    if (table) {
+        memset(table, 0, PAGE_SIZE);
+        table_bytes += PAGE_SIZE;
+    }
     return table;
 }
 
@@ -68,9 +72,10 @@ static int map_range(boot_uint64_t start, boot_uint64_t size, boot_uint64_t flag
 }
 
 int paging_init(const BOOT_INFO* info) {
+    mapped_bytes = 0;
+    table_bytes = 0;
     pml4 = alloc_table();
     if (!pml4) return 0;
-    mapped_bytes = 0;
 
     /* The whole first 4 GiB unconditionally: PCI device windows, the local
        APIC and the HPET all sit in holes below 4 GiB that the memory map does
@@ -109,6 +114,26 @@ int paging_init(const BOOT_INFO* info) {
     return 1;
 }
 
+int paging_map_device(boot_uint64_t base, boot_uint64_t size) {
+    if (!pml4) return 0;      /* still on the firmware's tables; nothing to do */
+    if (!size) return 0;
+    if (!map_range(base, size, PAGE_CACHE_DISABLE)) return 0;
+
+    /* Reload CR3 to drop anything the TLB cached about these addresses. A
+       not-present entry can be remembered as such on some processors, and an
+       MMIO window that faults once would keep faulting. */
+    {
+        boot_uint64_t cr3;
+        __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+        __asm__ volatile ("mov %0, %%cr3" : : "r"(cr3) : "memory");
+    }
+    return 1;
+}
+
 boot_uint64_t paging_mapped_bytes(void) {
     return mapped_bytes;
+}
+
+boot_uint64_t paging_table_bytes(void) {
+    return table_bytes;
 }

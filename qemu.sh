@@ -10,6 +10,12 @@ cd "$(dirname "$0")"
 
 IMAGE=esp.img
 IMAGE_MB=64
+# A second FAT32 volume presented as a USB stick, so the mass storage driver
+# has something to enumerate and the drive-letter code has more than one volume
+# to hand out. 64 MiB because a smaller image does not have enough clusters to
+# be a legal FAT32 volume.
+STICK=stick.img
+STICK_MB=64
 VARS=/tmp/koi-vars.fd
 
 # OVMF lives in a different place on every distribution. Probe the known
@@ -47,13 +53,15 @@ export MTOOLS_SKIP_CHECK=1
 # The image is rebuilt from scratch every run, so a test always starts from a
 # known state. Set KEEP_IMAGE=1 to boot the existing one instead - that is how
 # you check whether something the guest wrote actually survives a reboot.
-if [ "${KEEP_IMAGE:-0}" = "1" ] && [ -f "$IMAGE" ]; then
-    echo "Reusing existing $IMAGE"
+if [ "${KEEP_IMAGE:-0}" = "1" ] && [ -f "$IMAGE" ] && [ -f "$STICK" ]; then
+    echo "Reusing existing $IMAGE and $STICK"
 else
     # FAT32 needs enough clusters to be a legal FAT32 volume; 64 MiB clears it.
-    rm -f "$IMAGE"
+    rm -f "$IMAGE" "$STICK"
     dd if=/dev/zero of="$IMAGE" bs=1M count="$IMAGE_MB" status=none
     mkfs.vfat -F 32 -n KOI-DOS "$IMAGE" >/dev/null
+    dd if=/dev/zero of="$STICK" bs=1M count="$STICK_MB" status=none
+    mkfs.vfat -F 32 -n KOI-STICK "$STICK" >/dev/null
     populate=1
 fi
 
@@ -76,6 +84,14 @@ mcopy -i "$IMAGE" ARCHITECTURE.md "::/Architecture Notes.md"
 # rather than only when someone remembers to write one.
 printf '@rem Koi-DOS startup\r\n@echo Welcome to Koi-DOS.\r\nver\r\n' \
   | mcopy -i "$IMAGE" - ::/AUTOEXEC.BAT
+
+# The stick gets its own files, named so that a `dir` on it cannot be confused
+# with a `dir` on the system volume.
+mmd -i "$STICK" ::/STICK
+printf 'this file lives on the usb stick\r\n' \
+  | mcopy -i "$STICK" - ::/STICK/README.TXT
+printf 'and so does this one, with a long name\r\n' \
+  | mcopy -i "$STICK" - "::/STICK/carried on a usb stick.txt"
 fi
 
 # The bootloader, kernel and programs are refreshed even when the image is
@@ -101,6 +117,10 @@ exec qemu-system-x86_64 \
   -device ich9-ahci,id=ahci \
   -drive id=disk,format=raw,file="$IMAGE",if=none \
   -device ide-hd,drive=disk,bus=ahci.0 \
+  -device qemu-xhci,id=xhci \
+  -device usb-kbd,bus=xhci.0 \
+  -drive id=stick,format=raw,file="$STICK",if=none \
+  -device usb-storage,bus=xhci.0,drive=stick \
   -serial stdio \
   -net none \
   "$@"

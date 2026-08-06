@@ -16,6 +16,8 @@
 #include "config.h"
 #include "pci.h"
 #include "ahci.h"
+#include "build.h"
+#include "xhci.h"
 #include "timer.h"
 
 /* Everything the kernel reports goes to both the framebuffer and COM1. If a
@@ -34,7 +36,10 @@ static void report_dec(boot_uint64_t value) {
 __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
     cpu_disable_interrupts();
     serial_init();
-    serial_write("\n=== KOI DOS ===\n");
+    /* The build stamp goes out before anything else can fail, so a log that
+       ends in a panic still says which kernel produced it. */
+    serial_write("\n=== KOI DOS build " KOI_BUILD_DATE
+                 " (" KOI_BUILD_COMMIT ") ===\n");
     /* memory_init first: console_init allocates its back buffer. */
     memory_init(info);
     console_init(info);
@@ -103,6 +108,21 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
             report(" MB\n");
         } else {
             report("AHCI: NOT FOUND\n");
+        }
+
+        controller = pci_find(PCI_CLASS_SERIAL_BUS, PCI_SUBCLASS_USB,
+                              PCI_PROGIF_XHCI, 0);
+        if (controller && xhci_init(controller)) {
+            report("XHCI: ");
+            report_dec(xhci_ports_connected());
+            report(" OF ");
+            report_dec(xhci_port_count());
+            report(" PORTS IN USE");
+            if (xhci_has_keyboard()) report(", KEYBOARD");
+            if (xhci_has_storage()) report(", STORAGE");
+            report("\n");
+        } else {
+            report("XHCI: NOT FOUND\n");
         }
     }
 
