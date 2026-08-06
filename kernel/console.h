@@ -59,6 +59,9 @@ void console_write_hex(boot_uint64_t value);
 void console_set_cursor(boot_uint32_t column, boot_uint32_t row);
 boot_uint32_t console_column(void);
 boot_uint32_t console_row(void);
+/* The framebuffer's size in pixels, and the console's in characters. */
+boot_uint32_t console_width(void);
+boot_uint32_t console_height(void);
 boot_uint32_t console_columns(void);
 boot_uint32_t console_rows(void);
 

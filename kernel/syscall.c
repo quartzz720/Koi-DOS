@@ -8,6 +8,12 @@
 #include "program.h"
 #include "string.h"
 #include "heap.h"
+#include "memory.h"
+#include "block.h"
+#include "timer.h"
+#include "pci.h"
+#include "xhci.h"
+#include "build.h"
 #include "string.h"
 
 /* Open files belonging to the running program. Small and fixed: one program
@@ -164,6 +170,113 @@ static OPEN_FILE* handle_of(long handle) {
 
 /* Called from the vector 0x40 stub. Four arguments, matching the ABI in
    include/syscall.h; `d` is unused so far but is part of the contract. */
+/* What the system knows about itself, as numbers.
+ *
+ * Everything here is already printed by `mem` or the boot log; the point of
+ * the call is that a program can ask instead of a person reading it off the
+ * screen. An unknown item is an error rather than zero, so a program built
+ * against a newer header can tell the two apart. */
+static long system_info(long item, long index) {
+    switch (item) {
+    case KOI_INFO_MEMORY_TOTAL:
+        return (long)(memory_physical_pages() * PAGE_SIZE / 1024U);
+    case KOI_INFO_MEMORY_FREE:
+        return (long)(memory_free_pages() * PAGE_SIZE / 1024U);
+    case KOI_INFO_KERNEL_SIZE:
+        return (long)(memory_kernel_bytes() / 1024U);
+    case KOI_INFO_HEAP_TOTAL:
+        return (long)(heap_total() / 1024U);
+    case KOI_INFO_HEAP_FREE:
+        return (long)((heap_total() - heap_used()) / 1024U);
+    case KOI_INFO_UPTIME_MS:
+        return (long)timer_ticks();
+    case KOI_INFO_BUILD_NUMBER:
+        return KOI_BUILD_NUMBER;
+    case KOI_INFO_SCREEN_WIDTH:
+        return (long)console_width();
+    case KOI_INFO_SCREEN_HEIGHT:
+        return (long)console_height();
+    case KOI_INFO_TEXT_COLUMNS:
+        return (long)console_columns();
+    case KOI_INFO_TEXT_ROWS:
+        return (long)console_rows();
+    case KOI_INFO_PCI_DEVICES:
+        return (long)pci_device_count();
+    case KOI_INFO_DISK_COUNT:
+        return (long)block_device_count();
+    case KOI_INFO_VOLUME_COUNT:
+        return (long)volume_count();
+    case KOI_INFO_USB_PORTS:
+        return (long)xhci_port_count();
+    case KOI_INFO_USB_PORTS_USED:
+        return (long)xhci_ports_connected();
+    case KOI_INFO_TIMER_HZ:
+        return TIMER_HZ;
+    case KOI_INFO_TIMER_IS_INTERRUPT:
+        return timer_is_interrupt_driven();
+
+    case KOI_INFO_DISK_SECTORS: {
+        BLOCK_DEVICE* device = block_device((boot_uint32_t)index);
+        return device ? (long)device->sector_count : SYSCALL_ERROR;
+    }
+    case KOI_INFO_DISK_SECTOR_SIZE: {
+        BLOCK_DEVICE* device = block_device((boot_uint32_t)index);
+        return device ? (long)device->sector_size : SYSCALL_ERROR;
+    }
+    case KOI_INFO_VOLUME_LETTER: {
+        VOLUME* volume = volume_at((boot_uint32_t)index);
+        return volume ? (long)(unsigned char)volume->letter : SYSCALL_ERROR;
+    }
+    case KOI_INFO_VOLUME_IS_BOOT: {
+        VOLUME* volume = volume_at((boot_uint32_t)index);
+        return volume ? volume->is_boot_volume : SYSCALL_ERROR;
+    }
+
+    default:
+        return SYSCALL_ERROR;
+    }
+}
+
+/* The same, as text. Always terminated; returns the length written. */
+static long system_text(long item, long index, char* buffer, long size) {
+    const char* source = 0;
+
+    if (!buffer || size <= 0) return SYSCALL_ERROR;
+
+    switch (item) {
+    case KOI_TEXT_BUILD_DATE:
+        source = KOI_BUILD_DATE;
+        break;
+    case KOI_TEXT_BUILD_COMMIT:
+        source = KOI_BUILD_COMMIT;
+        break;
+    case KOI_TEXT_DISK_NAME: {
+        BLOCK_DEVICE* device = block_device((boot_uint32_t)index);
+        if (!device) return SYSCALL_ERROR;
+        source = device->name;
+        break;
+    }
+    case KOI_TEXT_VOLUME_LABEL: {
+        VOLUME* volume = volume_at((boot_uint32_t)index);
+        if (!volume) return SYSCALL_ERROR;
+        source = volume->label;
+        break;
+    }
+    default:
+        return SYSCALL_ERROR;
+    }
+
+    {
+        long length = 0;
+        while (source[length] && length + 1 < size) {
+            buffer[length] = source[length];
+            length++;
+        }
+        buffer[length] = 0;
+        return length;
+    }
+}
+
 long syscall_dispatch(long function, long a, long b, long c, long d);
 
 long syscall_dispatch(long function, long a, long b, long c, long d) {
@@ -260,6 +373,12 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
            `ver` command prints - two versions for one system would be one
            too many. */
         return KOI_DOS_VERSION;
+
+    case SYS_SYSINFO:
+        return system_info(a, b);
+
+    case SYS_SYSTEXT:
+        return system_text(a, b, (char*)c, d);
 
     default:
         return SYSCALL_ERROR;

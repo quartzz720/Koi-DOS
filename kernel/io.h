@@ -17,6 +17,16 @@ static inline boot_uint8_t inb(boot_uint16_t port) {
     return value;
 }
 
+static inline void outw(boot_uint16_t port, boot_uint16_t value) {
+    __asm__ volatile ("outw %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static inline boot_uint16_t inw(boot_uint16_t port) {
+    boot_uint16_t value;
+    __asm__ volatile ("inw %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
+}
+
 static inline void outl(boot_uint16_t port, boot_uint32_t value) {
     __asm__ volatile ("outl %0, %1" : : "a"(value), "Nd"(port));
 }

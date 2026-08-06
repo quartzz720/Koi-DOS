@@ -6,6 +6,7 @@ boot/efi/boot/*.efi
 kernel/kernel.elf
 kernel/build.h
 build/
+sdk/*.EXE
 *.o
 *.obj
 *.a
@@ -32,7 +33,11 @@ PLAN.md
 Thumbs.db
 
 # IDE and tool settings
-.vscode/
+.vscode/*
+# ...except the include paths, so an editor resolves what the compiler does.
+# Only this one file: settings.json and launch.json routinely accumulate local
+# paths and tokens, and those stay out.
+!.vscode/c_cpp_properties.json
 .idea/
 *.code-workspace
 .claude/settings.local.json

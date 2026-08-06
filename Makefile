@@ -30,7 +30,7 @@ KERNEL_SOURCES = kernel/kernel.c kernel/console.c kernel/font.c kernel/serial.c 
                  kernel/heap.c kernel/paging.c kernel/rtc.c kernel/block.c \
                  kernel/partition.c kernel/fat32.c kernel/command.c \
                  kernel/syscall.c kernel/program.c kernel/config.c kernel/xhci.c \
-                 kernel/timer.c kernel/pci.c kernel/ahci.c
+                 kernel/timer.c kernel/pci.c kernel/ahci.c kernel/nvme.c kernel/hpet.c kernel/apic.c
 KERNEL_HEADERS = kernel/kernel.h kernel/console.h kernel/font.h kernel/serial.h \
                  kernel/string.h kernel/io.h kernel/memory.h kernel/cpu.h \
                  kernel/idt.h kernel/pic.h kernel/acpi.h kernel/keyboard.h \
@@ -38,7 +38,8 @@ KERNEL_HEADERS = kernel/kernel.h kernel/console.h kernel/font.h kernel/serial.h 
                  kernel/partition.h kernel/fat32.h kernel/command.h \
                  kernel/syscall.h kernel/program.h kernel/config.h kernel/xhci.h \
                  include/syscall.h $(BUILD_HEADER) \
-                 kernel/timer.h kernel/pci.h kernel/ahci.h include/bootinfo.h
+                 kernel/timer.h kernel/pci.h kernel/ahci.h kernel/nvme.h kernel/hpet.h kernel/apic.h \
+                 include/bootinfo.h
 
 # Programs are built with the same compiler as the kernel but their own linker
 # script, and end up as .EXE files on the disk image. The format underneath is
@@ -46,7 +47,7 @@ KERNEL_HEADERS = kernel/kernel.h kernel/console.h kernel/font.h kernel/serial.h 
 PROGRAM_CFLAGS = -ffreestanding -fno-stack-protector -fno-stack-check \
                  -fno-builtin -fno-pie -mno-red-zone -mgeneral-regs-only \
                  -fno-asynchronous-unwind-tables \
-                 -Wall -Wextra -Werror -std=c11 -I .
+                 -Wall -Wextra -Werror -std=c11 -I . -I include
 PROGRAM_LDFLAGS = -nostdlib -no-pie -Wl,-T,programs/program.ld \
                   -Wl,--build-id=none -Wl,-z,max-page-size=0x1000 \
                   -Wl,-z,noexecstack
@@ -55,7 +56,7 @@ PROGRAM_SOURCES = $(wildcard programs/*.c)
 PROGRAMS = $(patsubst programs/%.c,build/%.EXE,\
              $(filter-out programs/start.c,$(PROGRAM_SOURCES)))
 
-all: $(EFI_DIR)/BOOTX64.EFI $(KERNEL_IMAGE) $(PROGRAMS)
+all: $(EFI_DIR)/BOOTX64.EFI $(KERNEL_IMAGE) $(PROGRAMS) sdk
 
 # The build stamp: commit count as a build number, the date, and the commit
 # itself with a `+` when the tree is dirty. Generated rather than checked in,
@@ -98,9 +99,21 @@ check: $(KERNEL_ELF)
 	@echo "--- program headers ---"
 	@readelf -lW $(KERNEL_ELF)
 
+# The SDK is a copy of the four files a third-party program needs, kept where
+# it can be handed to someone without the kernel source.
+#
+# Part of `all` on purpose. Kept as a manual step it drifted within a day - the
+# linker script gained a section, the copy did not, and programs built with the
+# SDK were quietly missing it. Copying four files on every build costs nothing
+# and makes that impossible.
+sdk:
+	cp programs/koi.h programs/start.c programs/program.ld sdk/
+	cp include/syscall.h sdk/syscall.h
+	@echo "sdk/ refreshed"
+
 clean:
 	rm -f $(EFI_DIR)/BOOTX64.EFI $(KERNEL_IMAGE) $(EFI_DIR)/KERNEL.BIN $(KERNEL_ELF)
 	rm -f $(BUILD_HEADER)
 	rm -rf build
 
-.PHONY: all check clean FORCE
+.PHONY: all check clean sdk FORCE

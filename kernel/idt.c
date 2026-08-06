@@ -1,6 +1,7 @@
 #include "idt.h"
 #include "cpu.h"
 #include "pic.h"
+#include "apic.h"
 #include "console.h"
 #include "serial.h"
 #include "string.h"
@@ -139,7 +140,12 @@ void interrupt_dispatch(INTERRUPT_FRAME* frame) {
     if (frame->vector < IRQ_BASE + IRQ_COUNT) {
         boot_uint8_t irq = (boot_uint8_t)(frame->vector - IRQ_BASE);
         if (irq_handlers[irq]) irq_handlers[irq](frame);
-        pic_send_eoi(irq);
+        /* The acknowledgement goes to whichever controller delivered it.
+           Sending it to the 8259 while the APIC is doing the delivering
+           leaves the APIC believing the interrupt is still in service, and
+           nothing of that priority is ever delivered again. */
+        if (apic_available()) apic_end_of_interrupt();
+        else pic_send_eoi(irq);
     }
 }
 

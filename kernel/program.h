@@ -1,6 +1,12 @@
 #ifndef KERNEL_PROGRAM_H
 #define KERNEL_PROGRAM_H
 
+/* program_run() returns the program's exit code, or one of these.
+   PROGRAM_REFUSED means the reason has already been printed - the caller
+   should not add a second, vaguer message on top of it. */
+#define PROGRAM_NOT_LOADABLE (-1)
+#define PROGRAM_REFUSED (-2)
+
 #include "partition.h"
 
 /* Where a program is loaded, and how much room it gets.

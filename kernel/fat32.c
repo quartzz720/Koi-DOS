@@ -98,6 +98,10 @@ static boot_uint32_t next_cluster(FAT_VOLUME* fat, boot_uint32_t cluster) {
     return value;
 }
 
+void fat32_unmount_all(void) {
+    memset(mounts, 0, sizeof(mounts));
+}
+
 int fat32_mount(VOLUME* volume) {
     boot_uint8_t* sector;
     FAT_VOLUME* fat = (FAT_VOLUME*)0;
@@ -1244,6 +1248,199 @@ int fat32_set_attributes(VOLUME* volume, const FAT_ENTRY* entry,
     }
     sector[entry->entry_offset + 11] = attributes;
     ok = write_volume_sector(fat, entry->entry_sector, sector);
+    free_page(sector);
+    return ok;
+}
+
+/* ---- Making a filesystem ------------------------------------------------ */
+
+#define FORMAT_RESERVED_SECTORS 32
+#define FORMAT_FAT_COPIES 2
+#define FORMAT_BACKUP_BOOT_SECTOR 6
+#define FORMAT_ROOT_CLUSTER 2
+#define FORMAT_MEDIA_DESCRIPTOR 0xF8
+
+/* The bounds that make a filesystem FAT32 rather than FAT16 or nothing.
+ *
+ * The lower one is not a preference: a volume with fewer clusters than this is
+ * FAT16 by definition, whatever the boot sector claims, and every other
+ * implementation will read it as FAT16 and see rubbish. */
+#define FAT32_MINIMUM_CLUSTERS 65525U
+#define FAT32_MAXIMUM_CLUSTERS 268435445U
+
+/* How large the table has to be to describe every cluster it creates - which
+   is circular, because the table's own size reduces the space left for
+   clusters. This is the closed form from the specification rather than a
+   loop that converges. */
+static boot_uint32_t format_fat_size(boot_uint64_t total_sectors,
+                                     boot_uint32_t sectors_per_cluster) {
+    boot_uint64_t usable = total_sectors - FORMAT_RESERVED_SECTORS;
+    boot_uint64_t denominator =
+        ((256ULL * sectors_per_cluster) + FORMAT_FAT_COPIES) / 2ULL;
+
+    if (!denominator) return 0;
+    return (boot_uint32_t)((usable + denominator - 1ULL) / denominator);
+}
+
+static boot_uint32_t format_cluster_count(boot_uint64_t total_sectors,
+                                          boot_uint32_t sectors_per_cluster,
+                                          boot_uint32_t fat_size) {
+    boot_uint64_t data = total_sectors - FORMAT_RESERVED_SECTORS -
+                         (boot_uint64_t)fat_size * FORMAT_FAT_COPIES;
+    if (data > total_sectors) return 0;      /* underflowed: nothing left */
+    return (boot_uint32_t)(data / sectors_per_cluster);
+}
+
+/* Pick the smallest cluster that still yields a legal FAT32 count.
+ *
+ * Smallest rather than largest because a small cluster wastes less on short
+ * files, and the only reason to grow it is a volume so large that the table
+ * would otherwise describe more clusters than FAT32 can address. */
+static boot_uint32_t format_choose_cluster(boot_uint64_t total_sectors) {
+    for (boot_uint32_t sectors_per_cluster = 1;
+         sectors_per_cluster <= 128; sectors_per_cluster *= 2) {
+        boot_uint32_t fat_size = format_fat_size(total_sectors, sectors_per_cluster);
+        boot_uint32_t clusters =
+            format_cluster_count(total_sectors, sectors_per_cluster, fat_size);
+
+        if (!fat_size || !clusters) continue;
+        if (clusters < FAT32_MINIMUM_CLUSTERS) continue;
+        if (clusters > FAT32_MAXIMUM_CLUSTERS) continue;
+        return sectors_per_cluster;
+    }
+    return 0;
+}
+
+/* Write `count` identical sectors, which is how the tables and the root
+   directory are cleared. */
+static int format_fill(BLOCK_DEVICE* device, boot_uint64_t first,
+                       boot_uint64_t count, const boot_uint8_t* sector) {
+    for (boot_uint64_t index = 0; index < count; index++)
+        if (!block_write(device, first + index, 1, sector)) return 0;
+    return 1;
+}
+
+int fat32_format(BLOCK_DEVICE* device, boot_uint64_t first_sector,
+                 boot_uint64_t sector_count, const char* label,
+                 boot_uint32_t serial) {
+    boot_uint8_t* sector;
+    boot_uint32_t sectors_per_cluster;
+    boot_uint32_t fat_size;
+    boot_uint32_t clusters;
+    int ok = 0;
+
+    if (!device || device->sector_size != SECTOR_SIZE) return 0;
+    if (sector_count < FORMAT_RESERVED_SECTORS + 4) return 0;
+
+    sectors_per_cluster = format_choose_cluster(sector_count);
+    if (!sectors_per_cluster) return 0;      /* too small to be legal FAT32 */
+    fat_size = format_fat_size(sector_count, sectors_per_cluster);
+    clusters = format_cluster_count(sector_count, sectors_per_cluster, fat_size);
+
+    sector = (boot_uint8_t*)alloc_page();
+    if (!sector) return 0;
+
+    /* The boot sector, and its backup at sector 6. Both are written because a
+       reader that finds the first one damaged looks for the second, and a
+       volume with only one is a volume with no spare. */
+    memset(sector, 0, SECTOR_SIZE);
+    sector[0] = 0xEB; sector[1] = 0x58; sector[2] = 0x90;   /* jump, then nop */
+    memcpy(sector + 3, "MSWIN4.1", 8);   /* what every implementation expects */
+    write16(sector + 11, SECTOR_SIZE);
+    sector[13] = (boot_uint8_t)sectors_per_cluster;
+    write16(sector + 14, FORMAT_RESERVED_SECTORS);
+    sector[16] = FORMAT_FAT_COPIES;
+    write16(sector + 17, 0);             /* no fixed root directory on FAT32 */
+    write16(sector + 19, 0);             /* the 16-bit total is unused here */
+    sector[21] = FORMAT_MEDIA_DESCRIPTOR;
+    write16(sector + 22, 0);             /* nor the 16-bit FAT size */
+    write16(sector + 24, 63);            /* geometry nothing reads any more, */
+    write16(sector + 26, 255);           /* but tools complain when it is 0 */
+    write32(sector + 28, (boot_uint32_t)first_sector);
+    write32(sector + 32, (boot_uint32_t)sector_count);
+    write32(sector + 36, fat_size);
+    write16(sector + 40, 0);             /* both FATs live, first is active */
+    write16(sector + 42, 0);             /* filesystem version 0.0 */
+    write32(sector + 44, FORMAT_ROOT_CLUSTER);
+    write16(sector + 48, FSINFO_SECTOR);
+    write16(sector + 50, FORMAT_BACKUP_BOOT_SECTOR);
+    sector[64] = 0x80;                   /* drive number, by convention */
+    sector[66] = 0x29;                   /* says the three fields below exist */
+    write32(sector + 67, serial);
+    {
+        /* Eleven bytes, space padded, never terminated. */
+        int index = 0;
+        for (; index < 11 && label && label[index]; index++)
+            sector[71 + index] = (boot_uint8_t)label[index];
+        for (; index < 11; index++) sector[71 + index] = ' ';
+    }
+    memcpy(sector + 82, "FAT32   ", 8);
+    sector[510] = 0x55;
+    sector[511] = 0xAA;
+
+    if (!block_write(device, first_sector, 1, sector)) goto done;
+    if (!block_write(device, first_sector + FORMAT_BACKUP_BOOT_SECTOR, 1, sector))
+        goto done;
+
+    /* FSInfo, and its backup alongside the backup boot sector. The free count
+       is what makes `dir` able to report free space without walking the whole
+       table on every call. */
+    memset(sector, 0, SECTOR_SIZE);
+    write32(sector + 0, FSINFO_LEAD_SIGNATURE);
+    write32(sector + 484, FSINFO_STRUCT_SIGNATURE);
+    write32(sector + FSINFO_FREE_COUNT_OFFSET, clusters - 1);  /* root took one */
+    write32(sector + FSINFO_NEXT_FREE_OFFSET, FORMAT_ROOT_CLUSTER + 1);
+    write32(sector + 508, FSINFO_TRAIL_SIGNATURE);
+
+    if (!block_write(device, first_sector + FSINFO_SECTOR, 1, sector)) goto done;
+    if (!block_write(device, first_sector + FORMAT_BACKUP_BOOT_SECTOR + FSINFO_SECTOR,
+                     1, sector)) goto done;
+
+    /* Clear both allocation tables. Every cluster free, before the first three
+       entries are given their fixed meanings. */
+    memset(sector, 0, SECTOR_SIZE);
+    for (boot_uint32_t copy = 0; copy < FORMAT_FAT_COPIES; copy++) {
+        boot_uint64_t start = first_sector + FORMAT_RESERVED_SECTORS +
+                              (boot_uint64_t)copy * fat_size;
+        if (!format_fill(device, start, fat_size, sector)) goto done;
+    }
+
+    /* Entry 0 carries the media descriptor, entry 1 is reserved, and entry 2
+       is the root directory: one cluster, already at the end of its chain. */
+    write32(sector + 0, 0x0FFFFF00U | FORMAT_MEDIA_DESCRIPTOR);
+    write32(sector + 4, 0x0FFFFFFFU);
+    write32(sector + 8, 0x0FFFFFFFU);
+    for (boot_uint32_t copy = 0; copy < FORMAT_FAT_COPIES; copy++) {
+        boot_uint64_t start = first_sector + FORMAT_RESERVED_SECTORS +
+                              (boot_uint64_t)copy * fat_size;
+        if (!block_write(device, start, 1, sector)) goto done;
+    }
+
+    /* And an empty root directory. Zeroed rather than left as it was: a stale
+       byte here reads as a directory entry. */
+    memset(sector, 0, SECTOR_SIZE);
+    {
+        boot_uint64_t root = first_sector + FORMAT_RESERVED_SECTORS +
+                             (boot_uint64_t)fat_size * FORMAT_FAT_COPIES;
+        if (!format_fill(device, root, sectors_per_cluster, sector)) goto done;
+
+        /* The label goes in twice, and both are needed. The copy in the boot
+           sector is what this driver reads; the one here, as a directory entry
+           with the volume-label attribute, is what mtools, Windows and every
+           other implementation read. A volume with only the first reports
+           itself as unlabelled everywhere except at home. */
+        if (label && label[0]) {
+            int index = 0;
+            for (; index < 11 && label[index]; index++)
+                sector[index] = (boot_uint8_t)label[index];
+            for (; index < 11; index++) sector[index] = ' ';
+            sector[11] = FAT_ATTRIBUTE_VOLUME_LABEL;
+            if (!block_write(device, root, 1, sector)) goto done;
+        }
+    }
+
+    ok = 1;
+done:
     free_page(sector);
     return ok;
 }

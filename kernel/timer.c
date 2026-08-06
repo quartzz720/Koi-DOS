@@ -9,7 +9,8 @@
 static boot_uint16_t pit_divisor;
 static boot_uint16_t last_counter;
 static boot_uint32_t subticks;
-static boot_uint64_t elapsed_ticks;
+static volatile boot_uint64_t elapsed_ticks;
+static int interrupt_driven;
 
 static boot_uint16_t pit_counter(void) {
     boot_uint8_t low;
@@ -32,8 +33,30 @@ void timer_init(void) {
     elapsed_ticks = 0;
 }
 
+void timer_use_interrupt(void) {
+    interrupt_driven = 1;
+}
+
+int timer_is_interrupt_driven(void) {
+    return interrupt_driven;
+}
+
+void timer_tick(void) {
+    elapsed_ticks++;
+}
+
 void timer_poll(void) {
-    boot_uint16_t current = pit_counter();
+    boot_uint16_t current;
+
+    /* Once a timer interrupt is keeping the count, polling is not merely
+       unnecessary - reading the PIT here would add ticks the interrupt has
+       already counted. */
+    if (interrupt_driven) return;
+
+    current = pit_counter();
+    /* Only movement within one reload period is visible here: the counter
+       wraps every millisecond, so a gap longer than that is lost rather than
+       merely imprecise. That is the defect the timer interrupt removes. */
     boot_uint16_t elapsed = (current <= last_counter)
         ? (boot_uint16_t)(last_counter - current)
         : (boot_uint16_t)(last_counter + pit_divisor - current);
@@ -48,4 +71,17 @@ void timer_poll(void) {
 
 boot_uint64_t timer_ticks(void) {
     return elapsed_ticks;
+}
+
+int timer_expired(boot_uint64_t start, boot_uint64_t milliseconds) {
+    /* Polling here as well as returning the answer: a caller's loop is
+       typically `while (!ready && !timer_expired(...))`, and on a polled
+       source nothing else would advance the clock. */
+    timer_poll();
+    return timer_ticks() - start >= milliseconds;
+}
+
+void timer_wait(boot_uint64_t milliseconds) {
+    boot_uint64_t start = timer_ticks();
+    while (!timer_expired(start, milliseconds)) { }
 }

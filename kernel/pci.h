@@ -3,7 +3,11 @@
 
 #include "../include/bootinfo.h"
 
-#define PCI_MAX_DEVICES 32
+/* A desktop board with several NVMe slots, two or three USB controllers, audio,
+   network and a GPU passes thirty functions without trying. The table used to
+   hold 32 and drop the rest in silence, which presents as a driver simply not
+   finding its device. */
+#define PCI_MAX_DEVICES 64
 
 /* Class codes the kernel cares about, now and soon. */
 #define PCI_CLASS_STORAGE 0x01
@@ -36,6 +40,11 @@ void pci_scan(void);
 
 boot_uint32_t pci_device_count(void);
 const PCI_DEVICE* pci_device(boot_uint32_t index);
+
+/* How many functions the scan actually saw. Larger than pci_device_count()
+   means the table filled up and devices were dropped - which is worth saying
+   out loud rather than leaving a driver to report "not found". */
+boot_uint32_t pci_devices_seen(void);
 
 /* First device matching class/subclass/programming interface at or after
    index `from`, or NULL. PCI_ANY in a field accepts any value. */

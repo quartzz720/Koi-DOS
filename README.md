@@ -66,6 +66,10 @@ Z:\> dir *.exe
 | `md`/`mkdir`, `rd`/`rmdir` | directories |
 | `vol`, `date`, `time` | volume label and the clock |
 | `mem` | memory, and what the drivers actually found |
+| `pci` | every function on the PCI bus, with its class |
+| `disk` | disks and partitions, whether or not they have a drive letter |
+| `format <part>` | make a new filesystem — destroys everything on it |
+| `part <disk>` | replace the partition table — destroys the whole disk |
 | `echo`, `ver`, `cls`, `help` | the usual |
 | `Z:` | change drive |
 
@@ -130,12 +134,33 @@ arguments. Five ship in [programs/](programs/):
 enough to write a listing with no privilege the shell does not also lack, and that a program can
 change how the system looks and make it stick without reaching into kernel state.
 
+A third proof lives outside this repository on purpose. **DOSFETCH** — a system summary in the
+spirit of neofetch — is built with nothing but the SDK, in its own project. If it stops building,
+the SDK is broken for everybody, rather than only for programs that happen to sit in this tree.
+
 ```
 Z:\> color                 show the presets and the palette
 Z:\> color amber           a preset: dos, mono, amber, green, paper, night
 Z:\> color /b black        just the background
 Z:\> color yellow blue     text and background
 ```
+
+### Writing programs without the kernel source
+
+[sdk/](sdk/) holds the four files a program needs — the header, the entry stub,
+the linker script and the system call definitions — plus a one-line build
+script, so a program can be written and built by someone who does not have the
+kernel checked out:
+
+```bash
+cd sdk && ./koicc mytool.c        # produces MYTOOL.EXE
+```
+
+No special compiler: a Koi-DOS program is a freestanding ELF64 binary, and an
+ordinary x86-64 GCC produces one. `sdk/README.md` documents the ABI.
+
+**Programs you write are yours.** Including these headers does not place your
+program under this project's licence; see the LICENSE.
 
 ### Configuration
 
@@ -155,8 +180,9 @@ Programs write that file; the kernel reads it. Neither reaches into the other.
 ### System calls
 
 Programs call the kernel with `int 0x40`, in the spirit of DOS's INT 21h. `RAX` holds the
-function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Eighteen calls cover
-console I/O, files, directory enumeration, the command line and exit codes; they are listed in
+function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Twenty calls cover
+console I/O, files, directory enumeration, the command line, exit codes, and what the system
+knows about itself; they are listed in
 [include/syscall.h](include/syscall.h), which the kernel and every program include from the same
 copy so the two cannot drift apart.
 
@@ -208,15 +234,25 @@ keystroke that arrives during a disk read is delivered rather than swallowed. Bo
 stick with an internal disk also present puts `Z:` on the stick and the internal EFI System
 Partition on `Y:`.
 
-Missing: **NVMe**, then graphics, audio and networking. There is no `edit` — the line editor is
+**NVMe works**, registered through the same block interface as AHCI and USB storage, so the
+filesystem never learns which of the three it is reading.
+
+**Time is interrupt-driven.** The Local APIC timer keeps the millisecond tick — on-die and
+per-CPU, so it stays cheap and needs no locking if this ever grows a second processor — and the
+HPET is the monotonic clock it was calibrated against. IRQs come through the I/O APIC, honouring
+whatever the firmware's MADT says about where a legacy IRQ actually arrives, and the 8259 is
+masked once that is standing.
+
+Missing: **graphics**, then audio and networking. There is no `edit` — the line editor is
 the one command from the old shell not carried over, and it belongs as a program now that
 programs exist. `chkdsk` does not exist, so an interrupted write has to be repaired from another
 system. The xHCI interrupt is not routed anywhere, so waiting for a USB key spins rather than
-sleeps, and USB devices are enumerated once at boot: plugging a stick in afterwards does nothing
-until a reboot.
+sleeps; USB devices are enumerated once at boot, so plugging a stick in afterwards does nothing
+until a reboot; and anything behind a USB hub is invisible.
 
-**Nothing has been run on physical hardware yet — QEMU only.** See
-[Running on real hardware](#running-on-real-hardware).
+**It has now run on physical hardware** — two machines, once each. Confirmed there: the boot
+chain, the framebuffer console, AHCI, USB mass storage, the USB keyboard, and drive letters
+across two FAT volumes. See [Running on real hardware](#running-on-real-hardware).
 
 Writes are verified from outside the guest, because a filesystem that satisfies only its own
 reader proves nothing:
@@ -311,9 +347,14 @@ KEEP_IMAGE=1 ./qemu.sh      # reuse the existing images instead of rebuilding th
 ```
 
 Two images, because one device of a kind never exercises the code that handles two. `esp.img` is
-the system volume on an emulated SATA disk; `stick.img` is presented as a USB stick alongside a
-USB keyboard, so the mass storage driver has something to enumerate and the drive-letter code has
-more than one volume to hand out.
+the system volume on an emulated SATA disk; `stick.img` is presented as a USB stick, so the mass
+storage driver has something to enumerate and the drive-letter code has more than one volume to
+hand out.
+
+For the same reason there are **two xHCI controllers**, with the keyboard on one and the stick on
+the other. That is what the first real machine turned out to look like — a chipset controller and
+a processor one — and a single controller made every event unambiguous by accident, hiding the
+bug completely.
 
 The boot log appears **in your terminal** as well as in the QEMU window, because `-serial stdio`
 is always on. `Ctrl+C` in the terminal quits.
@@ -338,12 +379,18 @@ finds is the **internal drive's EFI System Partition**, and `Z:` would have poin
 system's boot files — with `del` and `copy` aimed there.
 
 With mass storage working, the stick itself is enumerated, the serial matches, and `Z:` is the
-stick. The internal ESP still shows up, as `Y:`, where it can be looked at but is not where
-anything lands by default. If no volume matches, none is assigned: the prompt reads `?:\>` and
-the log says `BOOT VOLUME: NOT FOUND`, which is the only safe answer.
+stick. This is not theory: on a laptop with Windows on a SATA SSD, `Z:` came up as the stick and
+Windows' EFI System Partition as `Y:` — reachable if you go looking, but not where anything lands
+by default. If no volume matches, none is assigned: the prompt reads `?:\>` and the log says
+`BOOT VOLUME: NOT FOUND`, which is the only safe answer.
 
 Booting from a SATA disk the AHCI driver can see works too. Either way, putting Koi-DOS on the
 EFI partition of a system you care about is not recommended, since it can write.
+
+Two commands earn their keep here, because a machine that misbehaves in the field has no serial
+cable attached. `mem` says what each driver actually found; `pci` lists every function on the
+bus with its class, which is how you tell "no driver for this" apart from "the device was never
+enumerated". The second real machine was diagnosed from those two screens alone.
 
 A note on keyboards, since the obvious guess is backwards — though with USB working, either kind
 now does. A **laptop's internal keyboard is usually PS/2** — it hangs off the embedded controller, which presents itself as an 8042 — so it
@@ -392,6 +439,8 @@ kernel/
   timer.c              PIT, polled
   pci.c                PCI enumeration
   ahci.c               SATA/AHCI disk I/O
+  nvme.c               NVMe queues, Identify, read/write
+  hpet.c               the HPET, as a monotonic clock
   xhci.c               USB 3 controller, HID boot keyboard and mass storage
   block.c              sector-device abstraction over any controller
   partition.c          GPT / MBR / whole device, and drive letters

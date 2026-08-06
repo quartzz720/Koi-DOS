@@ -5,6 +5,7 @@
 #include "io.h"
 #include "pic.h"
 #include "xhci.h"
+#include "timer.h"
 
 #define PS2_DATA 0x60U
 #define PS2_STATUS 0x64U
@@ -24,6 +25,7 @@
 /* Device-level commands, sent to the keyboard rather than the controller. */
 #define DEVICE_RESET 0xFFU
 #define DEVICE_ACK 0xFAU
+#define DEVICE_RESEND 0xFEU   /* the keyboard asking for the command again */
 #define DEVICE_SELF_TEST_PASSED 0xAAU
 
 #define CONFIG_PORT1_INTERRUPT 0x01U
@@ -185,6 +187,22 @@ static void keyboard_interrupt(INTERRUPT_FRAME* frame) {
         handle_scancode(inb(PS2_DATA));
 }
 
+/* Read bytes until one of them is `wanted`, or patience runs out.
+ *
+ * The 8042 has one byte of output buffer and no notion of whose byte it is.
+ * Anything the keyboard sent before we asked it a question is still sitting
+ * there, and a person pressing a key while the system boots is not an unusual
+ * event - it is what someone checking whether the keyboard has come alive does
+ * every time. Judging a reply by the first byte read therefore mistakes a
+ * scancode for an answer. */
+static int read_until(boot_uint8_t wanted, int attempts) {
+    boot_uint8_t reply;
+
+    for (int attempt = 0; attempt < attempts; attempt++)
+        if (controller_read_data(&reply) && reply == wanted) return 1;
+    return 0;
+}
+
 /* Reset the device on port 1 and see whether anything answers.
  *
  * A keyboard replies 0xFA to acknowledge and then 0xAA when its own power-on
@@ -195,22 +213,29 @@ static void keyboard_interrupt(INTERRUPT_FRAME* frame) {
  * Run before IRQ1 is unmasked, so the replies arrive here rather than at the
  * interrupt handler. */
 static int keyboard_present_on_port(void) {
-    boot_uint8_t reply;
+    /* Immediately before the reset, not several milliseconds earlier during
+       the self-test: the window in between is enough for a keystroke. */
+    while (inb(PS2_STATUS) & STATUS_OUTPUT_FULL) (void)inb(PS2_DATA);
 
-    controller_write_data(DEVICE_RESET);
-    if (!controller_read_data(&reply)) return 0;
-    /* Some keyboards resend rather than acknowledge if the line was noisy. */
-    if (reply == 0xFE) {
+    for (int attempt = 0; attempt < 2; attempt++) {
+        boot_uint8_t reply;
+        int resend = 0;
+
         controller_write_data(DEVICE_RESET);
-        if (!controller_read_data(&reply)) return 0;
+        for (int byte = 0; byte < 4; byte++) {
+            if (!controller_read_data(&reply)) break;
+            if (reply == DEVICE_ACK) {
+                /* The power-on test takes hundreds of milliseconds on real
+                   hardware, far longer than the ordinary read timeout, so it
+                   gets its own patience. */
+                return read_until(DEVICE_SELF_TEST_PASSED, 20);
+            }
+            /* Not an answer to us - a scancode from a key pressed while the
+               system was loading. Step over it. */
+            if (reply == DEVICE_RESEND) { resend = 1; break; }
+        }
+        if (!resend) return 0;
     }
-    if (reply != DEVICE_ACK) return 0;
-
-    /* The power-on test takes hundreds of milliseconds on real hardware, far
-       longer than the ordinary read timeout, so it gets its own patience. */
-    for (int attempt = 0; attempt < 20; attempt++)
-        if (controller_read_data(&reply))
-            return reply == DEVICE_SELF_TEST_PASSED;
     return 0;
 }
 
@@ -257,6 +282,14 @@ void keyboard_submit(int key) {
     if (key) buffer_push((boot_uint16_t)key);
 }
 
+int keyboard_available(void) {
+    return keyboard_present || xhci_has_keyboard();
+}
+
+int keyboard_present_ps2(void) {
+    return keyboard_present;
+}
+
 int keyboard_poll(void) {
     boot_uint16_t key;
     if (buffer_tail == buffer_head) return 0;
@@ -274,14 +307,17 @@ int keyboard_getchar(void) {
     for (;;) {
         if ((key = keyboard_poll())) break;
         if (usb) {
-            /* The controller's interrupt is not routed anywhere yet, so USB
-               keystrokes have to be collected rather than waited for. That
-               rules out hlt: nothing would wake us.
-               `pause` costs nothing and tells the processor this is a spin
-               loop, which matters on anything with hyperthreading. Routing
-               the controller's interrupt is the real fix. */
+            /* The controller's interrupt is still not routed anywhere, so USB
+               keystrokes have to be collected rather than waited for.
+               What changed is that something else now wakes us: with the timer
+               interrupt running, `hlt` returns a thousand times a second,
+               which is far more often than anyone types and enormously kinder
+               than spinning. Without it there is nothing to wake on, and the
+               loop falls back to `pause` - which at least tells the processor
+               this is a spin loop. */
             xhci_poll();
-            __asm__ volatile ("pause");
+            if (timer_is_interrupt_driven()) __asm__ volatile ("hlt");
+            else __asm__ volatile ("pause");
             continue;
         }
         /* PS/2 raises IRQ1, so sleeping until the next interrupt is both

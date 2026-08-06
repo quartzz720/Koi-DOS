@@ -36,6 +36,24 @@ static inline void cpu_enable_interrupts(void) {
 }
 
 /* Stop for good: mask interrupts and park the core. Used by the panic screen. */
+/* Restart the machine, by the crudest method that always works.
+ *
+ * An empty interrupt descriptor table means the next interrupt cannot be
+ * delivered, nor can the fault about not delivering it, nor the fault about
+ * that - and three deep the processor stops trying and resets. The polite
+ * routes are ACPI's reset register and pulsing the 8042, and neither is
+ * universal: the first is optional and the second needs a controller this
+ * machine may not have. This one needs nothing. */
+__attribute__((noreturn)) static inline void cpu_reset(void) {
+    struct __attribute__((packed)) { boot_uint16_t limit; boot_uint64_t base; }
+        nothing = { 0, 0 };
+
+    __asm__ volatile ("cli");
+    __asm__ volatile ("lidt %0" : : "m"(nothing));
+    __asm__ volatile ("int $3");
+    for (;;) __asm__ volatile ("hlt");
+}
+
 __attribute__((noreturn)) static inline void cpu_hang(void) {
     for (;;) {
         __asm__ volatile ("cli; hlt");

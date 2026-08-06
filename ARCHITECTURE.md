@@ -123,6 +123,9 @@ the whole span is what initialises `.bss`, which has no presence in the file at 
 | [kernel/rtc.c](kernel/rtc.c) | CMOS wall clock, and FAT timestamp packing |
 | [kernel/pci.c](kernel/pci.c) | PCI enumeration; drivers look themselves up |
 | [kernel/ahci.c](kernel/ahci.c) | SATA/AHCI, IDENTIFY, `disk_read` / `disk_write` |
+| [kernel/nvme.c](kernel/nvme.c) | NVMe admin and I/O queues, Identify, read/write |
+| [kernel/hpet.c](kernel/hpet.c) | The HPET, as a monotonic clock rather than a source of events |
+| [kernel/apic.c](kernel/apic.c) | Local APIC timer and I/O APIC interrupt routing |
 | [kernel/xhci.c](kernel/xhci.c) | USB 3 host controller, the HID boot keyboard and mass storage |
 | [kernel/block.c](kernel/block.c) | Sector-device abstraction over any controller |
 | [kernel/partition.c](kernel/partition.c) | GPT, MBR and whole-device volumes; drive letters |
@@ -174,12 +177,22 @@ report and not the previous one, which is also how repeat is avoided without any
 Keys go into the same ring buffer `keyboard.c` fills from IRQ1, so the shell cannot tell which
 kind of keyboard produced them.
 
-**Devices are a table, not a singleton.** A real machine has a keyboard and a stick plugged in at
-once, so slots, rings and endpoint state belong to a device rather than to the driver. That
-distinction is what makes the event ring workable: every event carries the slot and endpoint it
-came from, and a wait for one endpoint steps over — and *services* — everything else. A keystroke
-arriving in the middle of a disk read is handed to the keyboard driver and the read carries on
-waiting. Without that, one would swallow the other.
+**Three levels of state, each with its own lifetime.** A machine has several controllers; a
+controller has several devices; a device has several endpoints. Every one of those was a
+file-scope variable at some point in this driver's life, and every one of them was proved wrong
+by hardware rather than by reasoning:
+
+- One device at a time failed the moment a keyboard and a stick were plugged in together.
+- One controller at a time failed on the first real machine, which has two — one in the chipset
+  and one in the processor — with the keyboard on one and the stick on the other. Which socket a
+  device is plugged into is not something the OS has any say in.
+
+That layering is what makes the shared event ring workable. Every event carries the slot and
+endpoint it came from, and a wait for one endpoint steps over — and *services* — everything else,
+so a keystroke arriving in the middle of a disk read is handed to the keyboard driver and the
+read carries on waiting. The controller has to be part of the match as well: slot numbers are
+per-controller, and on the two-controller test bench both devices are slot 1, so comparing slot
+alone would read a disk completion as a keypress.
 
 **Endpoint zero starts at a guessed size.** Every speed but full has exactly one legal packet size
 for the control endpoint; a full-speed device may use 8, 16, 32 or 64 and only says which in the
@@ -234,11 +247,22 @@ block.c          block_read(device, lba, count, buffer)
    ↓
 ahci.c           SATA command FIS, DMA
 xhci.c           SCSI over bulk-only transport
+nvme.c           submission and completion queues
 ```
 
-`block.c` is why NVMe will not require touching the filesystem: it registers through the same
-interface and everything above it is unchanged. USB mass storage is the proof that this works —
-it arrived as a second driver under the same interface, and nothing above `block.c` changed. It also range-checks against the sector count
+`block.c` earned itself twice over: USB mass storage and then NVMe both arrived as new drivers
+under the same interface, and nothing above it changed either time.
+
+NVMe was the quickest of the three, because its shape was already familiar — a ring of 64-byte
+commands, a doorbell saying how far it has been filled, and a completion ring with a **phase
+bit** marking whose entries are whose, which is the xHCI cycle bit under another name. Identify
+Controller is its checkpoint, the role `INQUIRY` plays for USB storage: a model string coming
+back proves queues, doorbells and phase bit together before a sector is at stake.
+
+Two details that bite. A read or write command carries its block count **one less than it is**,
+so zero means one block and a command can never ask for nothing. And a namespace's block size is
+a base-two logarithm inside whichever of several declared formats it is currently using — read
+the wrong format's entry and the number is plausible and wrong by a factor of eight. It also range-checks against the sector count
 IDENTIFY reported — reading past the end of a disk returns garbage rather than an error on some
 controllers, which becomes a baffling filesystem bug three layers up.
 
@@ -555,13 +579,37 @@ condition under which truncated DMA addresses stay invisible.
 
 ## What comes next
 
-NVMe, then graphics, audio and networking.
+Graphics, then audio and networking.
 
-Four things the current code is honest about not having: the xHCI interrupt is not routed
-anywhere, so waiting for a USB key spins rather than sleeps; the timer is still polled through
-the PIT rather than driven by the APIC; USB devices are enumerated once at boot, so plugging a
-stick in afterwards does nothing until a reboot; and nothing has been run on physical hardware
-yet.
+### Time, and which timer does what
+
+Two clocks, with a deliberate division of labour that is the standard one. The **Local APIC timer
+is the source of events**: on the processor die, so programming and reading it is cheap, and
+per-CPU, which means its tick would need no locking if this ever grew a second processor. The
+**HPET is the source of time**: out on the chipset, so every counter read is a slow bus round
+trip, but monotonic and independent of the processor's clock — exactly what is needed to measure
+how fast the APIC timer actually runs, since that frequency is not discoverable on AMD hardware.
+
+Neither is trusted blindly. The HPET is refused if its declared tick period is implausible or its
+counter is not advancing — a stopped counter is worse than no counter, because every delay
+written against it hangs forever. And the two clocks are checked against each other at boot: a
+tick period misread by a factor of a thousand looks perfectly reasonable in isolation and is
+obvious the moment it is compared.
+
+**The polled PIT was losing time, and the comparison is what found it.** A 16-bit counter
+reloading every millisecond can only show movement inside one period, so any stretch of work that
+did not stop to poll subtracted itself from the clock — 100 ms once read back as 0. The
+interrupt-driven tick is the fix, and the same measurement now reads 100.
+
+Switching over has to happen all at once. The end-of-interrupt must follow the delivery, or the
+APIC believes an interrupt is still in service and stops delivering that priority; the keyboard
+IRQ has to move to the I/O APIC in the same breath or it silently stops arriving; and the 8259 is
+masked entirely rather than left half-live.
+
+Three things the current code is honest about not having: the xHCI interrupt is not routed, so a
+USB keystroke is collected on the timer tick rather than delivered; USB devices are enumerated
+once at boot, so plugging a stick in afterwards does nothing until a reboot; and devices behind a
+**hub** are invisible, because the route string is hardcoded to zero.
 
 ## Historical
 

@@ -57,6 +57,32 @@ typedef struct {
    FAT32 filesystem this driver understands. */
 int fat32_mount(VOLUME* volume);
 
+/* Forget every mounted filesystem.
+ *
+ * Required before the volume table is rebuilt, and not merely tidy. The table
+ * is a static array, so a rescan refills the same addresses with different
+ * partitions. A mount record left behind still points at one of those
+ * addresses and still holds the previous filesystem's geometry - so the next
+ * write computes where to put a directory entry using one filesystem's layout
+ * and sends it to another filesystem's device. That is not a stale read. It is
+ * one volume's metadata written into the middle of another volume. */
+void fat32_unmount_all(void);
+
+/* Write a fresh, empty FAT32 filesystem over a region of a block device.
+ *
+ * Everything already on it is gone. This is the most destructive thing the
+ * system can do, so the decision to call it belongs to the caller and the
+ * caller alone - nothing here asks for confirmation, and nothing here knows
+ * whether the region is the one the user meant.
+ *
+ * `label` may be empty. `serial` is the volume serial that identifies a volume
+ * afterwards; the boot volume is matched by it, so two volumes sharing one
+ * would be a genuine problem. Returns 0 when the region cannot hold a legal
+ * FAT32 filesystem, or when a write fails. */
+int fat32_format(BLOCK_DEVICE* device, boot_uint64_t first_sector,
+                 boot_uint64_t sector_count, const char* label,
+                 boot_uint32_t serial);
+
 /* Total and free bytes, for `dir` and `mem`. Counting free space walks the
    whole FAT, so the result is cached after the first call. */
 boot_uint64_t fat32_total_bytes(VOLUME* volume);

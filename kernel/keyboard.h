@@ -33,6 +33,18 @@ int keyboard_init(void);
 void keyboard_submit(int key);
 
 /* Non-blocking: returns 0 when nothing is buffered. */
+/* Is there any way at all to read a keystroke - PS/2 or USB?
+ *
+ * The shell has to ask before it starts, because `keyboard_read_line` returns
+ * an empty line both when the user pressed Enter and when nothing can ever
+ * arrive. Without this distinction a machine with no keyboard fills the screen
+ * with prompts instead of saying what is wrong. */
+int keyboard_available(void);
+
+/* Specifically whether a PS/2 keyboard came up, as opposed to any keyboard.
+   The interrupt routing has to know: a USB one has no IRQ to move. */
+int keyboard_present_ps2(void);
+
 int keyboard_poll(void);
 
 /* Blocking: waits for a key. Shows the console caret while waiting. */

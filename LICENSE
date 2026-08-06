@@ -1,4 +1,4 @@
-Koi-DOS Non-Commercial License (KNCL) v1.0
+Koi-DOS Non-Commercial License (KNCL) v1.1
 
 Copyright (c) 2026 Koi Ayame
 
@@ -9,6 +9,8 @@ of this software and associated documentation files (the "Software") to:
     • study the source code;
     • modify the Software;
     • distribute original or modified copies of the Software;
+    • use the Software and its source code for Artificial Intelligence (AI) and
+      Machine Learning (ML) model training, analysis, and research;
 
 provided that:
 
@@ -23,12 +25,26 @@ provided that:
 Commercial use is prohibited.
 
 For the purposes of this license, "commercial use" means use primarily intended
-for commercial advantage or monetary compensation, including selling the
-Software, incorporating substantial portions of it into commercial products,
-or offering commercial services based on it.
+for commercial advantage or monetary compensation, including but not limited to:
+
+    • selling, reselling, or sublicensing the Software or its derivatives;
+    • incorporating substantial portions of the Software into commercial
+      products;
+    • offering paid services or paid support based on the Software;
+    • redistributing the Software under a different name, or repackaged with
+      only superficial changes, in any of the above ways.
 
 Commercial use may be permitted only with prior written permission from the
 copyright holder.
+
+PROGRAMS WRITTEN FOR KOI-DOS
+
+Programs written to run on Koi-DOS are not derived works of the Software, and
+this license places no conditions on them. Including the interface headers that
+the Software provides for that purpose - the system call definitions and the
+program header they are used through - does not bring a program under this
+license. Their authors may license their own work however they wish, including
+commercially.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,

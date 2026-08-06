@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Build a Koi-DOS program from a single C file.
+#
+#   ./koicc hello.c            -> HELLO.EXE
+#   ./koicc hello.c mytool     -> MYTOOL.EXE
+#
+# Nothing here is Koi-DOS-specific tooling: it is an ordinary x86-64 GCC with
+# the flags that make its output run without an operating system underneath it.
+# Any compiler that can produce a freestanding ELF64 binary will do.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+if [ $# -lt 1 ]; then
+    echo "usage: koicc <source.c> [output-name]" >&2
+    exit 1
+fi
+
+SOURCE=$1
+NAME=${2:-$(basename "$SOURCE" .c)}
+OUTPUT=$(echo "$NAME" | tr 'a-z' 'A-Z').EXE
+
+CC=${CC:-gcc}
+
+# -ffreestanding    there is no C library and no hosted environment
+# -fno-pie -no-pie  programs load at a fixed address; see program.ld
+# -mno-red-zone     the red zone is not safe when interrupts run on this stack
+# -mgeneral-regs-only
+#                   forbid GCC from emitting SSE of its own accord: nothing has
+#                   set up SSE state, so a compiler-generated XMM copy faults
+# -nostdlib         no startup files, no libc; start.c is the entry point
+"$CC" \
+    -ffreestanding -fno-stack-protector -fno-stack-check -fno-builtin \
+    -fno-pie -mno-red-zone -mgeneral-regs-only \
+    -fno-asynchronous-unwind-tables \
+    -Wall -Wextra -std=c11 -I . \
+    -nostdlib -no-pie -Wl,-T,program.ld -Wl,--build-id=none \
+    -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
+    -o "$OUTPUT" "$SOURCE" start.c
+
+ABI=$(sed -n 's/^#define KOI_ABI_VERSION \([0-9]*\).*/\1/p' syscall.h)
+ALPHA=$(sed -n 's/^#define KOI_ABI_IS_ALPHA \([0-9]*\).*/\1/p' syscall.h)
+
+echo "$OUTPUT  (interface version $ABI)"
+if [ "${ALPHA:-0}" = "1" ]; then
+    echo
+    echo "NOTE: the interface is ALPHA. Function numbers can still change, and"
+    echo "      a kernel with a different interface version will refuse to run"
+    echo "      this binary rather than misinterpret it. Rebuild after updating."
+fi
+echo
+echo "Copy it to the root of a Koi-DOS drive and type its name at the prompt."
+echo "With mtools, and the disk image at esp.img:"
+echo
+echo "    mcopy -o -i esp.img $OUTPUT ::/"

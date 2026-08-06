@@ -4,6 +4,9 @@
 #include "string.h"
 #include "heap.h"
 #include "../include/elf.h"
+#include "../include/syscall.h"
+#include "console.h"
+#include "serial.h"
 
 /* Loading and running a program.
  *
@@ -151,6 +154,39 @@ static int load_segments(const boot_uint8_t* contents, boot_uint32_t length,
     return 1;
 }
 
+/* Is this program built against an interface this kernel can honour?
+ *
+ * Checked after loading and before entering, because the header is part of the
+ * loaded image - and checked in both directions. A program built for a newer
+ * interface would call functions that do not exist here. A program built for
+ * an older one is refused too, while the numbering is still alpha: a call
+ * whose number has since changed meaning does not fail, it quietly does
+ * something else, and that is far worse than refusing to start.
+ *
+ * Fills `reason` with something a person can act on. */
+static int abi_is_acceptable(const char** reason) {
+    const KOI_PROGRAM_HEADER* header =
+        (const KOI_PROGRAM_HEADER*)(unsigned long long)PROGRAM_BASE;
+
+    if (header->magic != KOI_PROGRAM_MAGIC) {
+        *reason = "not a Koi-DOS program, or built before programs carried a "
+                  "version";
+        return 0;
+    }
+    if (header->abi_version > KOI_ABI_VERSION) {
+        *reason = "built for a newer Koi-DOS than this one";
+        return 0;
+    }
+    if (header->abi_version < KOI_ABI_MINIMUM) {
+        *reason = KOI_ABI_IS_ALPHA
+            ? "built for an older Koi-DOS, and the interface has changed since"
+            : "built for an interface this kernel no longer supports";
+        return 0;
+    }
+    *reason = 0;
+    return 1;
+}
+
 /* Enter the program on its own stack. A runaway program will wreck that one
    rather than the kernel's - and with the double-fault stack in place, even
    that gets reported instead of rebooting the machine. */
@@ -183,6 +219,22 @@ int program_run(VOLUME* volume, const char* path, const char* arguments) {
         return -1;
     }
     kfree(contents);
+
+    {
+        const char* reason;
+        if (!abi_is_acceptable(&reason)) {
+            /* Said here rather than by the caller, because only this function
+               knows which of the reasons it was, and "will not run" without
+               "why" is the least useful message a system can give. */
+            console_write("Cannot run this program: ");
+            console_write(reason);
+            console_write(".\n");
+            serial_write("PROGRAM: refused - ");
+            serial_write(reason);
+            serial_write("\n");
+            return PROGRAM_REFUSED;
+        }
+    }
 
     current_arguments = arguments ? arguments : "";
     exit_code = 0;

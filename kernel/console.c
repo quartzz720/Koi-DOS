@@ -274,5 +274,7 @@ void console_set_cursor(boot_uint32_t column, boot_uint32_t row) {
 
 boot_uint32_t console_column(void) { return cursor_column; }
 boot_uint32_t console_row(void) { return cursor_row; }
+boot_uint32_t console_width(void) { return screen_width; }
+boot_uint32_t console_height(void) { return screen_height; }
 boot_uint32_t console_columns(void) { return columns; }
 boot_uint32_t console_rows(void) { return rows; }

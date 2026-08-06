@@ -15,6 +15,8 @@
 #include "program.h"
 #include "syscall.h"
 #include "build.h"
+#include "cpu.h"
+#include "acpi.h"
 #include "../include/syscall.h"
 
 /* The command semantics follow legacy/shell.c and legacy/fs.c, which worked
@@ -268,12 +270,26 @@ static void path_up(void) {
     current_path[length] = 0;
 }
 
-/* Build a path to a program: either in the current directory or at the root
-   of the current drive. */
-static void build_program_path(const char* name, char* result, int at_root) {
+/* Where a program is looked for, in order.
+ *
+ * The current directory first, so a program sitting next to your files wins;
+ * then the root; then \BIN, which is where the system's own utilities live.
+ * Giving them a directory of their own is not cosmetic - the root of the
+ * system volume is where the user's files go, and a dozen .EXE files sitting
+ * in it turns `dir` into a search. */
+#define PROGRAM_SEARCH_CURRENT 0
+#define PROGRAM_SEARCH_ROOT 1
+#define PROGRAM_SEARCH_BIN 2
+#define PROGRAM_SEARCH_PLACES 3
+
+static void build_program_path(const char* name, char* result, int place) {
     boot_uint64_t length;
 
-    if (at_root) {
+    if (place == PROGRAM_SEARCH_BIN) {
+        const char* bin = "\\BIN\\";
+        length = 0;
+        while (bin[length]) { result[length] = bin[length]; length++; }
+    } else if (place == PROGRAM_SEARCH_ROOT) {
         result[0] = '\\';
         length = 1;
     } else {
@@ -335,6 +351,13 @@ static void command_help(void) {
     print_line("attrib [+-RHSA] file   show or change attributes");
     print_line("vol            show the volume label");
     print_line("mem            memory, devices and volumes");
+    print_line("pci            every function on the PCI bus");
+    print_line("disk           disks and partitions, letters or not");
+    print_line("format <part>  make a new filesystem - destroys everything on it");
+    print_line("part <disk>    replace the partition table - destroys the whole disk");
+    print_line("setup          install Koi-DOS onto a disk");
+    print_line("shutdown       turn the machine off");
+    print_line("reboot         restart the machine");
     print_line("date           show the date");
     print_line("time           show the time");
     print_line("echo [text]    print text");
@@ -441,6 +464,912 @@ static void command_mem(void) {
         print_dec(xhci_port_count());
         print_line(" ports in use)");
     }
+}
+
+static void print_hex(boot_uint64_t value, int digits) {
+    const char* digit = "0123456789ABCDEF";
+    for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
+        put(digit[(value >> shift) & 0xF]);
+}
+
+/* Enough of the class list to name what a DOS-like system might ever drive,
+   and honest about the rest. USB is broken out by programming interface
+   because that is the field that separates xHCI from the older controllers. */
+static const char* class_name(const PCI_DEVICE* device) {
+    switch (device->class_code) {
+    case 0x01:
+        switch (device->subclass) {
+        case 0x01: return "IDE";
+        case PCI_SUBCLASS_SATA: return "SATA";
+        case PCI_SUBCLASS_NVM: return "NVMe";
+        default: return "storage";
+        }
+    case 0x02: return "network";
+    case 0x03: return "display";
+    case 0x04: return "multimedia";
+    case 0x06: return "bridge";
+    case 0x08: return "system";
+    case 0x09: return "input";
+    case 0x0C:
+        if (device->subclass != PCI_SUBCLASS_USB) return "serial bus";
+        switch (device->programming_interface) {
+        case 0x00: return "USB UHCI";
+        case 0x10: return "USB OHCI";
+        case 0x20: return "USB EHCI";
+        case PCI_PROGIF_XHCI: return "USB xHCI";
+        default: return "USB";
+        }
+    default: return "other";
+    }
+}
+
+/* Sizes a person can compare at a glance, which means the largest unit that
+   still leaves a whole number rather than everything in sectors. */
+static void print_size(boot_uint64_t sectors, boot_uint32_t sector_size) {
+    boot_uint64_t kib = sectors / (1024U / sector_size ? 1024U / sector_size : 1);
+
+    if (!sector_size) { print("?"); return; }
+    if (kib >= 1024U * 1024U) {
+        print_dec(kib / (1024U * 1024U));
+        print(" GB");
+    } else if (kib >= 1024U) {
+        print_dec(kib / 1024U);
+        print(" MB");
+    } else {
+        print_dec(kib);
+        print(" KB");
+    }
+}
+
+/* What is on the disks, as opposed to what has a drive letter.
+ *
+ * The two are deliberately different views. `mem` and `dir` show the shell's
+ * world: volumes it can read. This shows the disk's world, including regions
+ * with no filesystem we understand - because anything that formats or
+ * repartitions has to address those, and because a partition nobody mentions
+ * is exactly the one somebody erases by accident. */
+static void command_disk(void) {
+    print_line("DEVICE  SIZE        PARTITIONS");
+
+    for (boot_uint32_t index = 0; index < block_device_count(); index++) {
+        BLOCK_DEVICE* device = block_device(index);
+        int listed = 0;
+
+        if (!device) continue;
+        print(device->name);
+        for (boot_uint64_t pad = strlen(device->name); pad < 8; pad++) put(' ');
+        print_size(device->sector_count, device->sector_size);
+        print_line("");
+
+        for (boot_uint32_t p = 0; p < partition_count(); p++) {
+            PARTITION* partition = partition_at(p);
+            if (!partition || partition->device != device) continue;
+            listed++;
+
+            print("  ");
+            print(device->name);
+            put('p');
+            print_dec(partition->number);
+            print("  ");
+            print_size(partition->sector_count, device->sector_size);
+            print("  at sector ");
+            print_dec(partition->first_sector);
+            print("  ");
+
+            if (partition->letter) {
+                put(partition->letter);
+                print(":");
+            } else {
+                print("--");
+            }
+            if (partition->is_efi_system) print("  EFI System");
+            else if (partition->is_fat) print("  FAT");
+            else if (partition->scheme == PARTITION_SCHEME_MBR) {
+                print("  type ");
+                print_dec(partition->type);
+            } else {
+                print("  unknown");
+            }
+            print_line("");
+        }
+        if (!listed) print_line("  no partition table, and nothing we can read");
+    }
+    print_line("");
+    print_line("A partition with no drive letter has no filesystem this system");
+    print_line("understands. That does not mean it is empty.");
+}
+
+/* Find a partition by the name `disk` prints for it, e.g. "nvme0p2". */
+static PARTITION* partition_by_name(const char* name) {
+    for (boot_uint32_t index = 0; index < partition_count(); index++) {
+        PARTITION* partition = partition_at(index);
+        const char* cursor = name;
+        const char* device_name;
+        boot_uint32_t number = 0;
+
+        if (!partition || !partition->device) continue;
+        device_name = partition->device->name;
+
+        while (*device_name && upper(*cursor) == upper(*device_name)) {
+            cursor++;
+            device_name++;
+        }
+        if (*device_name) continue;
+        if (upper(*cursor) != 'P') continue;
+        cursor++;
+        if (!*cursor) continue;
+        while (*cursor >= '0' && *cursor <= '9')
+            number = number * 10U + (boot_uint32_t)(*cursor++ - '0');
+        if (*cursor) continue;
+        if (number == partition->number) return partition;
+    }
+    return (PARTITION*)0;
+}
+
+/* Rebuild the volume table after the disks changed underneath it, and put the
+   shell somewhere that certainly still exists. Every VOLUME pointer taken
+   before this - including the one the user was standing on - is stale. */
+static void remount_everything(void) {
+    boot_uint32_t volumes;
+
+    /* Before the rescan, not after: the volume table is a static array, so the
+       rescan refills the same addresses and any mount record still pointing at
+       one of them would carry the old filesystem's geometry into the new
+       filesystem's device. */
+    fat32_unmount_all();
+    volumes = partition_rescan();
+
+    for (boot_uint32_t index = 0; index < volumes; index++) {
+        VOLUME* volume = volume_at(index);
+        if (volume) (void)fat32_mount(volume);
+    }
+    current_volume = volume_boot();
+    current_path[0] = '\\';
+    current_path[1] = 0;
+}
+
+/* ---- The installer ------------------------------------------------------- */
+
+/* Setup paints its own headings rather than using the console theme, so that
+   it looks like a thing you are running rather than a command that scrolled
+   past. The text-mode installers this is modelled on did the same. */
+#define KOI_SETUP_TITLE_FOREGROUND COLOR_WHITE
+#define KEY_F8 (KEY_F1 + 7)
+#define KEY_F3 (KEY_F1 + 2)
+
+static int copy_one(VOLUME* from_volume, const char* from,
+                    VOLUME* to_volume, const char* to, boot_uint32_t* copied);
+
+/* Which volume on the boot device holds a given file. The installation media
+   may be a single volume or a two-partition layout where the loader's
+   partition has no drive letter at all, so it cannot be named - only found. */
+static VOLUME* volume_holding(const char* path) {
+    VOLUME* boot = volume_boot();
+    FAT_ENTRY entry;
+
+    if (boot && fat32_stat(boot, path, &entry)) return boot;
+    for (boot_uint32_t index = 0; index < volume_count(); index++) {
+        VOLUME* volume = volume_at(index);
+        if (!volume || !boot || volume->device != boot->device) continue;
+        if (fat32_stat(volume, path, &entry)) return volume;
+    }
+    return (VOLUME*)0;
+}
+
+static void setup_banner(const char* title) {
+    console_clear();
+    console_set_color(KOI_SETUP_TITLE_FOREGROUND, console_theme()->background);
+    print_line("");
+    print("  Koi-DOS Setup - ");
+    print_line(title);
+    console_use_theme();
+    print_line("");
+}
+
+/* Show a file a screenful at a time, the way the licence has to be read
+   before it can be agreed to. Returns 1 when the reader accepted. */
+static int setup_show_licence(VOLUME* volume) {
+    FAT_ENTRY entry;
+    char* buffer;
+    boot_uint32_t offset = 0;
+    boot_uint32_t lines = 0;
+    boot_uint32_t rows = console_rows() > 6 ? console_rows() - 6 : 10;
+    int accepted = 0;
+
+    setup_banner("Licence");
+    if (!fat32_stat(volume, "\\LICENSE", &entry)) {
+        print_line("The licence file is missing from this media.");
+        print_line("Setup will not continue without it.");
+        print_line("");
+        print("Press a key. ");
+        (void)keyboard_getchar();
+        return 0;
+    }
+
+    buffer = (char*)kmalloc(1024);
+    if (!buffer) return 0;
+
+    while (offset < entry.size) {
+        boot_uint32_t got = fat32_read(volume, &entry, offset, buffer, 1023);
+        if (!got) break;
+        buffer[got] = 0;
+        for (boot_uint32_t index = 0; index < got; index++) {
+            if (buffer[index] == '\r') continue;
+            put(buffer[index]);
+            if (buffer[index] != '\n') continue;
+            if (++lines < rows) continue;
+            lines = 0;
+            console_set_color(console_theme()->prompt, console_theme()->background);
+            print("  -- more -- ");
+            console_use_theme();
+            (void)keyboard_getchar();
+            print_line("");
+        }
+        offset += got;
+    }
+    kfree(buffer);
+
+    print_line("");
+    console_set_color(KOI_SETUP_TITLE_FOREGROUND, console_theme()->background);
+    print_line("  F8 to accept and continue, any other key to stop.");
+    console_use_theme();
+    accepted = keyboard_getchar() == KEY_F8;
+    return accepted;
+}
+
+/* Copy one file, saying so, and stop the whole install if it fails. A missing
+   file here means the installed system would not start. */
+static int setup_copy(VOLUME* from, const char* source,
+                      VOLUME* to, const char* target) {
+    boot_uint32_t copied = 0;
+
+    print("    ");
+    print(target);
+    if (!copy_one(from, source, to, target, &copied)) {
+        console_set_color(console_theme()->error, console_theme()->background);
+        print_line("  FAILED");
+        console_use_theme();
+        return 0;
+    }
+    print("  ");
+    print_dec(copied);
+    print_line(" bytes");
+    return 1;
+}
+
+/* Find a partition on `device` by its number. */
+static PARTITION* setup_partition(BLOCK_DEVICE* device, boot_uint32_t number) {
+    for (boot_uint32_t index = 0; index < partition_count(); index++) {
+        PARTITION* partition = partition_at(index);
+        if (partition && partition->device == device &&
+            partition->number == number) return partition;
+    }
+    return (PARTITION*)0;
+}
+
+/* Find a block device by the name `disk` prints for it. */
+static BLOCK_DEVICE* device_by_name(const char* name) {
+    for (boot_uint32_t index = 0; index < block_device_count(); index++) {
+        BLOCK_DEVICE* device = block_device(index);
+        const char* a;
+        const char* b;
+
+        if (!device) continue;
+        a = name;
+        b = device->name;
+        while (*a && *b && upper(*a) == upper(*b)) { a++; b++; }
+        if (!*a && !*b) return device;
+    }
+    return (BLOCK_DEVICE*)0;
+}
+
+/* Lay a fresh partition table over a whole disk.
+ *
+ * The layout is fixed rather than asked about, and that is the DOS answer to
+ * the question: a boot partition the firmware can find, and a system partition
+ * for everything else. Keeping the loader on a partition of its own is not
+ * security - any other operating system sees an ordinary partition - but it
+ * does mean a stray `del` cannot reach the files the machine needs to start,
+ * which is the accident worth preventing. */
+static void command_part(const ARGUMENTS* arguments) {
+    BLOCK_DEVICE* device;
+    char name[PATH_MAX];
+    char answer[PATH_MAX];
+    boot_uint64_t boot_sectors;
+    GPT_REQUEST layout[2];
+
+    if (!arguments->operand_count) {
+        print_line("part <device>");
+        print_line("");
+        print_line("Replaces the partition table on a whole disk with a boot");
+        print_line("partition and a system partition. Device names are the");
+        print_line("ones `disk` prints, like nvme0.");
+        return;
+    }
+    memcpy(name, arguments->operand[0], strlen(arguments->operand[0]) + 1);
+
+    device = device_by_name(name);
+    if (!device) {
+        console_set_color(console_theme()->error, console_theme()->background);
+        print("No disk called ");
+        print_line(name);
+        console_use_theme();
+        return;
+    }
+
+    /* Absolutely not the disk we are running from. Rewriting its table while
+       the system reads its own files off it is not recoverable. */
+    {
+        VOLUME* boot = volume_boot();
+        if (boot && boot->device == device) {
+            console_set_color(console_theme()->error, console_theme()->background);
+            print_line("That is the disk this system booted from. Refusing.");
+            console_use_theme();
+            return;
+        }
+    }
+
+    /* Big enough for the loader with room to grow, without eating a small
+       disk alive. */
+    boot_sectors = device->sector_count >= 2048ULL * 1024ULL
+                 ? 256ULL * 2048ULL : 64ULL * 2048ULL;
+
+    console_set_color(console_theme()->error, console_theme()->background);
+    print_line("");
+    print("EVERY PARTITION ON ");
+    print(name);
+    print_line(" WILL BE DESTROYED.");
+    console_use_theme();
+
+    print("  size       ");
+    print_size(device->sector_count, device->sector_size);
+    print_line("");
+    print_line("  currently:");
+    {
+        int any = 0;
+        for (boot_uint32_t index = 0; index < partition_count(); index++) {
+            PARTITION* partition = partition_at(index);
+            if (!partition || partition->device != device) continue;
+            any = 1;
+            print("    ");
+            print(device->name);
+            put('p');
+            print_dec(partition->number);
+            print("  ");
+            print_size(partition->sector_count, device->sector_size);
+            if (partition->letter) {
+                print("  drive ");
+                put(partition->letter);
+                print(":");
+            }
+            print_line("");
+        }
+        if (!any) print_line("    nothing this system recognises");
+    }
+    print_line("");
+    print_line("  afterwards:");
+    print("    ");
+    print(name);
+    print("p1  ");
+    print_size(boot_sectors, device->sector_size);
+    print_line("  EFI System - the loader and the kernel");
+    print("    ");
+    print(name);
+    print_line("p2  the rest    the system volume");
+    print_line("");
+    print_line("This replaces the table only. The sectors themselves are not");
+    print_line("touched, so a partition that happens to start where an old one");
+    print_line("did will still have the old filesystem on it. Format them.");
+
+    print_line("");
+    print("Type the disk name to confirm, anything else to stop: ");
+    keyboard_read_line(answer, sizeof(answer));
+    serial_write(answer);
+    serial_write("\n");
+    {
+        const char* a = answer;
+        const char* b = name;
+        while (*a && *b && upper(*a) == upper(*b)) { a++; b++; }
+        if (*a || *b) {
+            print_line("Stopped. Nothing was written.");
+            return;
+        }
+    }
+
+    memset(layout, 0, sizeof(layout));
+    layout[0].sector_count = boot_sectors;
+    layout[0].is_efi_system = 1;
+    layout[0].name = "KOI-BOOT";
+    layout[1].sector_count = 0;              /* the rest */
+    layout[1].name = "KOI-SYSTEM";
+
+    print_line("Writing...");
+    if (!partition_write_gpt(device, layout, 2)) {
+        console_set_color(console_theme()->error, console_theme()->background);
+        print_line("Could not write the partition table. The disk may be too");
+        print_line("small, or it rejected a write.");
+        console_use_theme();
+        return;
+    }
+    remount_everything();
+    print_line("Done. Run `disk` to see it, then `format` each partition.");
+}
+
+/* Turn the machine off, or restart it.
+ *
+ * Neither existed in MS-DOS, and for a good reason: a machine of that era had
+ * a switch that physically cut the power, so there was nothing for software to
+ * do. On anything since, the button is a request the firmware interprets, and
+ * ACPI is how software makes the same request. Reaching behind a desk to hold
+ * a power button is not a design decision anyone made on purpose.
+ *
+ * Both flush nothing, because nothing is buffered: every write in this system
+ * has already reached the device by the time the command returns. If that ever
+ * stops being true, this is where the flush belongs. */
+static void command_shutdown(void) {
+    print_line("Shutting down.");
+    console_show_cursor(0);
+
+    if (acpi_power_off()) return;    /* it does not return on success */
+
+    console_set_color(console_theme()->error, console_theme()->background);
+    print_line("");
+    print_line("This machine did not turn off. Its firmware did not describe a");
+    print_line("way to, or refused. Use the power button.");
+    console_use_theme();
+}
+
+static void command_reboot(void) {
+    print_line("Restarting.");
+    console_show_cursor(0);
+
+    /* ACPI first because it is the machine's own answer. The fallback needs
+       nothing at all: an empty interrupt table and one interrupt, so the fault
+       about the fault about the fault resets the processor. Crude, universal,
+       and the only thing left when the tables say nothing. */
+    (void)acpi_reset();
+    cpu_reset();
+}
+
+/* Install Koi-DOS onto a disk.
+ *
+ * The shape follows the text-mode installers this is descended from, and the
+ * order is the point: say what this is, show the licence, let a disk be chosen,
+ * warn plainly, and only then touch anything. Nothing is written until the last
+ * confirmation, and the disk the system is running from is never offered.
+ *
+ * It lays down two partitions. The loader gets one of its own so that a
+ * mistaken `del` in the system volume cannot take away the machine's ability
+ * to start - not protection against anything deliberate, but the accident
+ * worth preventing. */
+static void command_setup(void) {
+    BLOCK_DEVICE* targets[BLOCK_MAX_DEVICES];
+    boot_uint32_t target_count = 0;
+    BLOCK_DEVICE* target;
+    VOLUME* loader_source;
+    VOLUME* system_source;
+    VOLUME* boot_target = 0;
+    VOLUME* system_target = 0;
+    char answer[PATH_MAX];
+    boot_uint64_t boot_sectors;
+    GPT_REQUEST layout[2];
+    int key;
+
+    setup_banner("Welcome");
+    print_line("  This installs Koi-DOS onto a disk in this machine.");
+    print_line("");
+    print_line("  The disk you choose will be erased completely. Everything on");
+    print_line("  it - every partition, every file, any other operating system");
+    print_line("  - will be gone and will not be recoverable.");
+    print_line("");
+    print_line("  The disk this system is running from is never offered.");
+    print_line("");
+    console_set_color(KOI_SETUP_TITLE_FOREGROUND, console_theme()->background);
+    print_line("  ENTER to continue, any other key to quit.");
+    console_use_theme();
+    if (keyboard_getchar() != '\n') return;
+
+    /* The licence, from whichever volume of the media carries it. */
+    {
+        VOLUME* licence = volume_holding("\\LICENSE");
+        if (!licence || !setup_show_licence(licence)) {
+            setup_banner("Stopped");
+            print_line("  The licence was not accepted. Nothing has been changed.");
+            print_line("");
+            return;
+        }
+    }
+
+    /* Where the pieces are copied from. On single-volume media both are the
+       same volume; on a two-partition one they are not. */
+    loader_source = volume_holding("\\EFI\\BOOT\\BOOTX64.EFI");
+    system_source = volume_holding("\\BIN");
+    if (!system_source) system_source = volume_boot();
+    if (!loader_source || !system_source) {
+        setup_banner("Stopped");
+        print_line("  This media is missing the loader or the utilities.");
+        print_line("  Setup cannot continue.");
+        print_line("");
+        return;
+    }
+
+    /* Every disk except the one we are running from. */
+    setup_banner("Choose a disk");
+    {
+        VOLUME* boot = volume_boot();
+        for (boot_uint32_t index = 0; index < block_device_count(); index++) {
+            BLOCK_DEVICE* device = block_device(index);
+            if (!device) continue;
+            if (boot && device == boot->device) continue;
+            if (target_count >= BLOCK_MAX_DEVICES) break;
+            targets[target_count] = device;
+
+            print("   ");
+            print_dec(target_count + 1);
+            print(". ");
+            print(device->name);
+            print("   ");
+            print_size(device->sector_count, device->sector_size);
+            print_line("");
+            for (boot_uint32_t p = 0; p < partition_count(); p++) {
+                PARTITION* partition = partition_at(p);
+                if (!partition || partition->device != device) continue;
+                print("        contains ");
+                print_size(partition->sector_count, device->sector_size);
+                if (partition->letter) {
+                    print(" as drive ");
+                    put(partition->letter);
+                    print(":");
+                } else if (partition->is_efi_system) {
+                    print(" EFI System");
+                } else {
+                    print(" of a kind this system does not read");
+                }
+                print_line("");
+            }
+            target_count++;
+        }
+    }
+    if (!target_count) {
+        print_line("  There is no disk to install to - only the one this");
+        print_line("  system is running from.");
+        print_line("");
+        print("  Press a key. ");
+        (void)keyboard_getchar();
+        return;
+    }
+
+    print_line("");
+    console_set_color(KOI_SETUP_TITLE_FOREGROUND, console_theme()->background);
+    print("  Press the number of a disk, or any other key to quit: ");
+    console_use_theme();
+    key = keyboard_getchar();
+    print_line("");
+    if (key < '1' || key >= '1' + (int)target_count) return;
+    target = targets[key - '1'];
+
+    /* The last warning, and the only place a mistake still costs nothing. */
+    setup_banner("Last chance");
+    console_set_color(console_theme()->error, console_theme()->background);
+    print("  EVERYTHING ON ");
+    print(target->name);
+    print_line(" IS ABOUT TO BE DESTROYED.");
+    console_use_theme();
+    print_line("");
+    print("  disk    ");
+    print(target->name);
+    print("   ");
+    print_size(target->sector_count, target->sector_size);
+    print_line("");
+    print_line("  layout  a boot partition for the loader, and the rest as");
+    print_line("          the system volume");
+    print_line("");
+    print_line("  After this, remove the installation media and restart.");
+    print_line("");
+    print("  Type the disk name to begin, anything else to stop: ");
+    keyboard_read_line(answer, sizeof(answer));
+    serial_write(answer);
+    serial_write("\n");
+    {
+        const char* a = answer;
+        const char* b = target->name;
+        while (*a && *b && upper(*a) == upper(*b)) { a++; b++; }
+        if (*a || *b) {
+            print_line("  Stopped. Nothing was written.");
+            return;
+        }
+    }
+
+    setup_banner("Installing");
+    boot_sectors = target->sector_count >= 2048ULL * 1024ULL
+                 ? 256ULL * 2048ULL : 64ULL * 2048ULL;
+
+    print_line("  Writing the partition table");
+    memset(layout, 0, sizeof(layout));
+    layout[0].sector_count = boot_sectors;
+    layout[0].is_efi_system = 1;
+    layout[0].name = "KOI-BOOT";
+    layout[1].sector_count = 0;
+    layout[1].name = "KOI-SYSTEM";
+    if (!partition_write_gpt(target, layout, 2)) {
+        console_set_color(console_theme()->error, console_theme()->background);
+        print_line("  Failed. The disk may be too small.");
+        console_use_theme();
+        return;
+    }
+    remount_everything();
+
+    print_line("  Making the filesystems");
+    {
+        RTC_TIME now;
+        boot_uint32_t serial;
+        PARTITION* first = setup_partition(target, 1);
+        PARTITION* second = setup_partition(target, 2);
+
+        rtc_read(&now);
+        serial = ((boot_uint32_t)rtc_fat_date(&now) << 16) | rtc_fat_time(&now);
+
+        if (!first || !second ||
+            !fat32_format(target, first->first_sector, first->sector_count,
+                          "KOI-BOOT", serial ^ 0x4B4F4901U) ||
+            !fat32_format(target, second->first_sector, second->sector_count,
+                          "KOI-DOS", serial ^ 0x4B4F4902U)) {
+            console_set_color(console_theme()->error, console_theme()->background);
+            print_line("  Failed.");
+            console_use_theme();
+            remount_everything();
+            return;
+        }
+    }
+    remount_everything();
+
+    /* The volumes have letters now - or in the loader partition's case, do
+       not - so they are found by which partition they sit on rather than by
+       name. */
+    {
+        PARTITION* first = setup_partition(target, 1);
+        PARTITION* second = setup_partition(target, 2);
+        for (boot_uint32_t index = 0; index < volume_count(); index++) {
+            VOLUME* volume = volume_at(index);
+            if (!volume || volume->device != target) continue;
+            if (first && volume->first_sector == first->first_sector)
+                boot_target = volume;
+            if (second && volume->first_sector == second->first_sector)
+                system_target = volume;
+        }
+    }
+    if (!boot_target || !system_target) {
+        console_set_color(console_theme()->error, console_theme()->background);
+        print_line("  The new filesystems could not be mounted.");
+        console_use_theme();
+        return;
+    }
+
+    print_line("  Copying the loader");
+    if (!fat32_create(boot_target, "\\EFI", 1, &(FAT_ENTRY){0}) ||
+        !fat32_create(boot_target, "\\EFI\\BOOT", 1, &(FAT_ENTRY){0}) ||
+        !fat32_create(boot_target, "\\BOOT", 1, &(FAT_ENTRY){0})) {
+        console_set_color(console_theme()->error, console_theme()->background);
+        print_line("  Could not create the directories.");
+        console_use_theme();
+        return;
+    }
+    if (!setup_copy(loader_source, "\\EFI\\BOOT\\BOOTX64.EFI",
+                    boot_target, "\\EFI\\BOOT\\BOOTX64.EFI")) return;
+    if (!setup_copy(loader_source, "\\BOOT\\KERNEL.ELF",
+                    boot_target, "\\BOOT\\KERNEL.ELF")) return;
+
+    print_line("  Copying the system");
+    (void)fat32_create(system_target, "\\BIN", 1, &(FAT_ENTRY){0});
+    (void)fat32_create(system_target, "\\BOOT", 1, &(FAT_ENTRY){0});
+    {
+        FAT_DIRECTORY directory;
+        FAT_ENTRY entry;
+        if (fat32_opendir(system_source, "\\BIN", &directory)) {
+            while (fat32_readdir(&directory, &entry)) {
+                char from[PATH_MAX];
+                char to[PATH_MAX];
+                boot_uint64_t length;
+
+                if (entry.attributes & FAT_ATTRIBUTE_DIRECTORY) continue;
+                length = strlen(entry.name);
+                if (length + 6 >= PATH_MAX) continue;
+                memcpy(from, "\\BIN\\", 5);
+                memcpy(from + 5, entry.name, length + 1);
+                memcpy(to, from, length + 6);
+                if (!setup_copy(system_source, from, system_target, to)) return;
+            }
+        }
+    }
+    (void)setup_copy(system_source, "\\LICENSE", system_target, "\\LICENSE");
+
+    /* The marker last, because it is what makes the installation real: it is
+       how the kernel decides which volume is the system one, and until it
+       exists the install is not one. */
+    print_line("  Marking the system volume");
+    {
+        FAT_ENTRY marker;
+        const char* text = "Koi-DOS system volume.\r\n";
+        if (!fat32_create(system_target, SYSTEM_VOLUME_MARKER, 0, &marker) ||
+            fat32_write(system_target, &marker, 0, text,
+                        (boot_uint32_t)strlen(text)) == 0) {
+            console_set_color(console_theme()->error, console_theme()->background);
+            print_line("  Failed. The installed system would not find itself.");
+            console_use_theme();
+            return;
+        }
+    }
+
+    setup_banner("Done");
+    print_line("  Koi-DOS is installed.");
+    print_line("");
+    print_line("  Remove the installation media before restarting, or the");
+    print_line("  machine will simply start it again.");
+    print_line("");
+    console_set_color(KOI_SETUP_TITLE_FOREGROUND, console_theme()->background);
+    print_line("  ENTER to restart, any other key to return to the prompt.");
+    console_use_theme();
+    if (keyboard_getchar() == '\n') cpu_reset();
+    console_clear();
+}
+
+/* Make a filesystem, having first made very sure of what is about to be lost.
+ *
+ * The confirmation asks for the partition's name rather than a yes, because a
+ * yes is what someone types without reading. Writing out "nvme0p2" requires
+ * having looked at which partition this is. */
+static void command_format(const ARGUMENTS* arguments) {
+    PARTITION* partition;
+    char name[PATH_MAX];
+    char answer[PATH_MAX];
+    const char* label;
+
+    if (!arguments->operand_count) {
+        print_line("format <partition> [label]");
+        print_line("");
+        print_line("Partition names are the ones `disk` prints, like nvme0p2.");
+        return;
+    }
+    memcpy(name, arguments->operand[0], strlen(arguments->operand[0]) + 1);
+    label = arguments->operand_count > 1 ? arguments->operand[1] : "";
+
+    partition = partition_by_name(name);
+    if (!partition) {
+        console_set_color(console_theme()->error, console_theme()->background);
+        print("No partition called ");
+        print_line(name);
+        console_use_theme();
+        print_line("Run `disk` to see what there is.");
+        return;
+    }
+
+    /* The one refusal with no override. Formatting the volume we are running
+       from destroys the running system mid-write, and there is no version of
+       that which ends well. */
+    {
+        VOLUME* boot = volume_boot();
+        if (boot && boot->device == partition->device &&
+            boot->first_sector == partition->first_sector) {
+            console_set_color(console_theme()->error, console_theme()->background);
+            print_line("That is the volume this system booted from. Refusing.");
+            console_use_theme();
+            return;
+        }
+    }
+
+    console_set_color(console_theme()->error, console_theme()->background);
+    print_line("");
+    print("EVERYTHING ON ");
+    print(name);
+    print_line(" WILL BE DESTROYED.");
+    console_use_theme();
+
+    print("  device     ");
+    print_line(partition->device->name);
+    print("  size       ");
+    print_size(partition->sector_count, partition->device->sector_size);
+    print_line("");
+    print("  at sector  ");
+    print_dec(partition->first_sector);
+    print_line("");
+    print("  currently  ");
+    if (partition->letter) {
+        print("drive ");
+        put(partition->letter);
+        print_line(": - a filesystem with files on it");
+    } else if (partition->is_fat) {
+        print_line("a FAT filesystem this system did not mount");
+    } else {
+        print_line("not a filesystem this system understands - which does");
+        print_line("             not mean it is empty");
+    }
+
+    print_line("");
+    print("Type the partition name to confirm, anything else to stop: ");
+    keyboard_read_line(answer, sizeof(answer));
+    serial_write(answer);
+    serial_write("\n");
+
+    {
+        const char* a = answer;
+        const char* b = name;
+        while (*a && *b && upper(*a) == upper(*b)) { a++; b++; }
+        if (*a || *b) {
+            print_line("Stopped. Nothing was written.");
+            return;
+        }
+    }
+
+    print_line("Writing...");
+    {
+        RTC_TIME now;
+        boot_uint32_t serial;
+
+        rtc_read(&now);
+        /* A serial that differs from every other volume, because the boot
+           volume is identified by exactly this number. Date and time together
+           are enough - two volumes formatted in the same second on the same
+           machine is not a case worth engineering for. */
+        serial = ((boot_uint32_t)rtc_fat_date(&now) << 16) | rtc_fat_time(&now);
+        serial ^= (boot_uint32_t)partition->first_sector;
+
+        if (!fat32_format(partition->device, partition->first_sector,
+                          partition->sector_count, label, serial)) {
+            console_set_color(console_theme()->error, console_theme()->background);
+            print_line("Format failed. The partition may be too small for FAT32,");
+            print_line("or the device rejected a write.");
+            console_use_theme();
+            remount_everything();
+            return;
+        }
+    }
+
+    remount_everything();
+    print_line("Done.");
+    print_line("Run `disk` to see the result; the drive letters may have moved.");
+}
+
+/* Every function on the bus, as the kernel sees it.
+ *
+ * This exists because a driver that reports "not found" says nothing about
+ * why: the device may be absent, behind a bridge nobody walked, past the end
+ * of a table that silently filled up, or simply of a kind we do not drive. On
+ * real hardware, with no serial cable attached, this is the only way to tell
+ * those apart. */
+static void command_pci(void) {
+    print_line("BUS:DEV.F  VENDOR:DEVICE  CLASS");
+    for (boot_uint32_t index = 0; index < pci_device_count(); index++) {
+        const PCI_DEVICE* device = pci_device(index);
+        if (!device) continue;
+        print_hex(device->bus, 2);
+        put(':');
+        print_hex(device->device, 2);
+        put('.');
+        print_hex(device->function, 1);
+        print("     ");
+        print_hex(device->vendor_id, 4);
+        put(':');
+        print_hex(device->device_id, 4);
+        print("     ");
+        print(class_name(device));
+        /* The raw triple, for anything the table above does not name. */
+        print("  [");
+        print_hex(device->class_code, 2);
+        put('/');
+        print_hex(device->subclass, 2);
+        put('/');
+        print_hex(device->programming_interface, 2);
+        print_line("]");
+    }
+    print("");
+    print_dec(pci_device_count());
+    print(" device(s)");
+    if (pci_devices_seen() > pci_device_count()) {
+        print(" - ");
+        print_dec(pci_devices_seen() - pci_device_count());
+        print(" MORE WERE DROPPED, the table is full");
+    }
+    print_line("");
 }
 
 static void print_entry_line(const FAT_ENTRY* entry) {
@@ -1082,11 +2011,14 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
     }
     name[length] = 0;
 
-    /* Current directory first, then the root. */
-    build_program_path(name, path, 0);
-    if (!fat32_stat(current_volume, path, &entry)) {
-        build_program_path(name, path, 1);
-        if (!fat32_stat(current_volume, path, &entry)) {
+    /* The current directory, then the root, then \BIN. */
+    {
+        int found = 0;
+        for (int place = 0; place < PROGRAM_SEARCH_PLACES && !found; place++) {
+            build_program_path(name, path, place);
+            found = fat32_stat(current_volume, path, &entry);
+        }
+        if (!found) {
             /* Nothing by that name as a program; try it as a batch file. */
             if (has_extension) return 0;
             name[length - 4] = 0;
@@ -1094,11 +2026,11 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
                 const char* batch = ".BAT";
                 for (int index = 0; index < 4; index++) name[length - 4 + index] = batch[index];
             }
-            build_program_path(name, path, 0);
-            if (!fat32_stat(current_volume, path, &entry)) {
-                build_program_path(name, path, 1);
-                if (!fat32_stat(current_volume, path, &entry)) return 0;
+            for (int place = 0; place < PROGRAM_SEARCH_PLACES && !found; place++) {
+                build_program_path(name, path, place);
+                found = fat32_stat(current_volume, path, &entry);
             }
+            if (!found) return 0;
             run_batch(current_volume, path);
             return 1;
         }
@@ -1117,10 +2049,12 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
     code = program_run(current_volume, path, arguments->tail);
     syscall_close_all();
 
-    if (code < 0) {
+    if (code == PROGRAM_NOT_LOADABLE) {
         console_set_color(console_theme()->error, console_theme()->background);
         print_line("Not a valid Koi-DOS program.");
         console_use_theme();
+    } else if (code == PROGRAM_REFUSED) {
+        /* program_run() has already said why, in more detail than this could. */
     } else if (code != 0) {
         /* DOS reported a non-zero exit only through ERRORLEVEL in batch files;
            printing it is more use at an interactive prompt. */
@@ -1228,6 +2162,13 @@ static void execute(const char* input) {
     if (word_is(input, "TYPE")) { command_type(&arguments); return; }
     if (word_is(input, "VOL")) { command_vol(); return; }
     if (word_is(input, "MEM")) { command_mem(); return; }
+    if (word_is(input, "PCI")) { command_pci(); return; }
+    if (word_is(input, "DISK")) { command_disk(); return; }
+    if (word_is(input, "FORMAT")) { command_format(&arguments); return; }
+    if (word_is(input, "PART")) { command_part(&arguments); return; }
+    if (word_is(input, "SETUP")) { command_setup(); return; }
+    if (word_is(input, "SHUTDOWN")) { command_shutdown(); return; }
+    if (word_is(input, "REBOOT")) { command_reboot(); return; }
     if (word_is(input, "DATE")) { command_date(); return; }
     if (word_is(input, "TIME")) { command_time(); return; }
     if (word_is(input, "VER")) { command_ver(); return; }
@@ -1273,11 +2214,30 @@ __attribute__((noreturn)) void command_run(void) {
     command_ver();
     print("\n");
 
-    /* AUTOEXEC.BAT at the root of the boot drive, if there is one. */
+    /* AUTOEXEC.BAT at the root of the boot drive, if there is one. It runs
+       before the check below, because on a machine with no keyboard whatever
+       it prints is the only thing the system will ever say. */
     if (current_volume) {
         FAT_ENTRY entry;
         if (fat32_stat(current_volume, "\\AUTOEXEC.BAT", &entry))
             run_batch(current_volume, "\\AUTOEXEC.BAT");
+    }
+
+    /* Refusing to start the loop is the whole point.
+     *
+     * `keyboard_read_line` cannot distinguish "the user pressed Enter on an
+     * empty line" from "there is no way to read a key", so with no input
+     * device it returns an empty line immediately and the loop below prints
+     * the prompt again - forever, as fast as the console can draw. Seen on
+     * real hardware, and it presents as nonsense rather than as a failure.
+     * Same principle as a missing boot volume: say it once, loudly. */
+    if (!keyboard_available()) {
+        console_set_color(console_theme()->error, console_theme()->background);
+        print_line("");
+        print_line("No keyboard found - neither PS/2 nor USB.");
+        print_line("Nothing can be typed, so the shell is not starting.");
+        console_use_theme();
+        for (;;) __asm__ volatile ("hlt");
     }
 
     for (;;) {

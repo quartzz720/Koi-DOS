@@ -10,6 +10,7 @@
 
 static PCI_DEVICE devices[PCI_MAX_DEVICES];
 static boot_uint32_t device_count;
+static boot_uint32_t devices_seen;
 
 static boot_uint32_t pci_read32(boot_uint8_t bus, boot_uint8_t device,
                                 boot_uint8_t function, boot_uint8_t offset) {
@@ -34,6 +35,7 @@ static void record(boot_uint8_t bus, boot_uint8_t device, boot_uint8_t function,
                    boot_uint32_t id, boot_uint32_t class_info) {
     PCI_DEVICE* entry;
 
+    devices_seen++;
     if (device_count >= PCI_MAX_DEVICES) return;
     entry = &devices[device_count++];
     entry->bus = bus;
@@ -51,6 +53,7 @@ static void record(boot_uint8_t bus, boot_uint8_t device, boot_uint8_t function,
 
 void pci_scan(void) {
     device_count = 0;
+    devices_seen = 0;
     for (boot_uint16_t bus = 0; bus < 256; bus++) {
         for (boot_uint8_t device = 0; device < 32; device++) {
             boot_uint32_t id = pci_read32((boot_uint8_t)bus, device, 0, 0x00);
@@ -76,6 +79,10 @@ void pci_scan(void) {
 
 boot_uint32_t pci_device_count(void) {
     return device_count;
+}
+
+boot_uint32_t pci_devices_seen(void) {
+    return devices_seen;
 }
 
 const PCI_DEVICE* pci_device(boot_uint32_t index) {
