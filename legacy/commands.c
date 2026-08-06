@@ -1,6 +1,7 @@
 #include "../include/efi.h"
 #include "console.h"
 #include "commands.h"
+#include "hal.h"
 
 void cmd_help(void) {
     set_color(EFI_YELLOW, EFI_BGBLACK);
@@ -57,6 +58,7 @@ void cmd_color(CHAR16* input) {
 }
 
 // Heh, I forgot about this one
-void cmd_quit(CHAR16*) {
+void cmd_quit(CHAR16* input) {
+    (void)input;
     hal_quit();
 }

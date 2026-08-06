@@ -221,10 +221,20 @@ void cmd_ren(CHAR16* input) {
         set_color(EFI_WHITE, EFI_BGBLACK); file->Close(file); root->Close(root); return;
     }
     EFI_FILE_INFO* info = (EFI_FILE_INFO*)infobuf;
+    // Compute the real offset of FileName[] within EFI_FILE_INFO (80 bytes:
+    // Size+FileSize+PhysicalSize (24) + 3 timestamps (48) + Attribute (8)),
+    // and cap the copy to what actually fits in infobuf[512] - a long
+    // enough new name would otherwise overflow this stack buffer.
+    UINTN name_offset = (UINTN)((UINT8*)&info->FileName[0] - (UINT8*)info);
+    UINTN max_chars = (sizeof(infobuf) - name_offset) / sizeof(CHAR16) - 1;
     UINTN j = 0;
-    while (p[j]) { info->FileName[j] = p[j]; j++; }
+    while (p[j] && j < max_chars) { info->FileName[j] = p[j]; j++; }
     info->FileName[j] = 0;
-    info->Size = 56 + (j + 1) * 2;
+    if (p[j] != 0) {
+        set_color(EFI_RED, EFI_BGBLACK); println(L"Error: new name too long");
+        set_color(EFI_WHITE, EFI_BGBLACK); file->Close(file); root->Close(root); return;
+    }
+    info->Size = name_offset + (j + 1) * sizeof(CHAR16);
     s = file->SetInfo(file, &finfo_guid, info->Size, info);
     if (s == EFI_SUCCESS) { println(L"File renamed."); }
     else {
@@ -398,8 +408,8 @@ void cmd_more(CHAR16* input) {
     int lines = 0;
     while (1) {
         UINTN size = sizeof(buf);
-        file->Read(file, &size, buf);
-        if (size == 0) break;
+        EFI_STATUS rs = file->Read(file, &size, buf);
+        if (rs != EFI_SUCCESS || size == 0) break;
         for (UINTN i = 0; i < size; i++) {
             if (buf[i] == '\n') { 
                 println(L""); lines++;
@@ -472,23 +482,50 @@ void cmd_edit(CHAR16* input) {
         EFI_FILE_PROTOCOL* file = NULL;
         EFI_STATUS s = root->Open(root, &file, fullpath, EFI_FILE_MODE_READ, 0);
         if (s == EFI_SUCCESS) {
-            UINTN size = sizeof(buf);
-            file->Read(file, &size, buf);
+            // Read the whole file into buf, chunk by chunk, instead of a
+            // single Read() call - a single call was silently truncating
+            // (and risking data loss on save) any file bigger than one
+            // UEFI read chunk.
+            UINTN total = 0;
+            while (total < sizeof(buf)) {
+                UINTN chunk = sizeof(buf) - total;
+                s = file->Read(file, &chunk, buf + total);
+                if (s != EFI_SUCCESS || chunk == 0) break;
+                total += chunk;
+            }
+            
+            // If we filled the whole buffer, the file is probably bigger
+            // than what the line editor can hold - warn instead of
+            // silently truncating and letting a later save eat the rest.
+            int truncated = (total >= sizeof(buf));
+            
             int pos = 0;
-            for (UINTN i = 0; i < size && linecount < 32; i++) {
+            for (UINTN i = 0; i < total && linecount < 32; i++) {
                 if (buf[i] == '\n' || buf[i] == '\r') {
                     lines[linecount][pos] = 0;
                     linecount++;
                     pos = 0;
-                    if (buf[i] == '\r' && i + 1 < size && buf[i+1] == '\n') i++;
+                    if (buf[i] == '\r' && i + 1 < total && buf[i+1] == '\n') i++;
                 } else if (pos < 63) {
                     lines[linecount][pos++] = (CHAR16)buf[i];
                 }
             }
             if (pos > 0 && linecount < 32) { lines[linecount][pos] = 0; linecount++; }
             file->Close(file);
+            root->Close(root);
+            
+            if (truncated || linecount >= 32) {
+                set_color(EFI_RED, EFI_BGBLACK);
+                println(L"WARNING: file is too large for the editor.");
+                println(L"Saving now WILL cut off the rest of the file.");
+                println(L"Press any key to continue (then 'q' to abort without saving)...");
+                set_color(EFI_WHITE, EFI_BGBLACK);
+                EFI_INPUT_KEY key;
+                hal_console_read_key(&key);
+            }
+        } else {
+            root->Close(root);
         }
-        root->Close(root);
     }
 
     while (1) {

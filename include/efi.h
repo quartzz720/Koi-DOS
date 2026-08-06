@@ -12,6 +12,7 @@ typedef long long          EFI_STATUS;
 typedef void*              EFI_HANDLE;
 typedef UINT8              BOOLEAN;
 typedef UINT64             EFI_LBA;
+typedef UINT64             EFI_PHYSICAL_ADDRESS;
 
 #define NULL  ((void*)0)
 #define TRUE  1
@@ -31,8 +32,30 @@ typedef UINT64             EFI_LBA;
 #define EFI_BGBLUE       0x10
 
 #define EFI_SUCCESS      0
+#define EFI_BUFFER_TOO_SMALL ((EFI_STATUS)(1ULL << 63 | 5))
 #define EFI_NOT_READY    ((EFI_STATUS)(1ULL << 63 | 6))
 #define EFI_NOT_FOUND    ((EFI_STATUS)(1ULL << 63 | 14))
+#define EFI_OUT_OF_RESOURCES ((EFI_STATUS)(1ULL << 63 | 9))
+#define EFI_INVALID_PARAMETER ((EFI_STATUS)(1ULL << 63 | 2))
+
+#define EfiReservedMemoryType       0
+#define EfiLoaderCode               1
+#define EfiLoaderData               2
+#define EfiBootServicesCode         3
+#define EfiBootServicesData         4
+#define EfiRuntimeServicesCode      5
+#define EfiRuntimeServicesData      6
+#define EfiConventionalMemory       7
+#define EfiUnusableMemory           8
+#define EfiACPIReclaimMemory        9
+#define EfiACPIMemoryNVS            10
+#define EfiMemoryMappedIO           11
+#define EfiMemoryMappedIOPortSpace  12
+#define EfiPalCode                  13
+#define EfiPersistentMemory         14
+
+#define AllocateAnyPages            0
+#define AllocateAddress             2
 
 #define EFI_FILE_MODE_READ    0x0000000000000001ULL
 #define EFI_FILE_MODE_WRITE   0x0000000000000002ULL
@@ -79,6 +102,37 @@ typedef struct {
     UINT64 Signature; UINT32 Revision; UINT32 HeaderSize;
     UINT32 CRC32; UINT32 Reserved;
 } EFI_TABLE_HEADER;
+
+typedef struct {
+    UINT32 Type;
+    UINT32 Pad;
+    EFI_PHYSICAL_ADDRESS PhysicalStart;
+    EFI_PHYSICAL_ADDRESS VirtualStart;
+    UINT64 NumberOfPages;
+    UINT64 Attribute;
+} EFI_MEMORY_DESCRIPTOR;
+
+typedef struct {
+    EFI_GUID VendorGuid;
+    void* VendorTable;
+} EFI_CONFIGURATION_TABLE;
+
+typedef EFI_STATUS (*EFI_GET_MEMORY_MAP)(UINTN* MemoryMapSize,
+                                         EFI_MEMORY_DESCRIPTOR* MemoryMap,
+                                         UINTN* MapKey,
+                                         UINTN* DescriptorSize,
+                                         UINT32* DescriptorVersion);
+typedef EFI_STATUS (*EFI_ALLOCATE_POOL)(UINT32 PoolType, UINTN Size,
+                                        void** Buffer);
+typedef EFI_STATUS (*EFI_FREE_POOL)(void* Buffer);
+typedef EFI_STATUS (*EFI_ALLOCATE_PAGES)(UINTN Type, UINT32 MemoryType,
+                                         UINTN Pages,
+                                         EFI_PHYSICAL_ADDRESS* Memory);
+typedef EFI_STATUS (*EFI_EXIT_BOOT_SERVICES)(EFI_HANDLE ImageHandle,
+                                             UINTN MapKey);
+typedef EFI_STATUS (*EFI_LOCATE_PROTOCOL)(EFI_GUID* Protocol,
+                                          void* Registration,
+                                          void** Interface);
 
 typedef struct EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
     void*      Reset;
@@ -128,6 +182,41 @@ typedef struct EFI_SIMPLE_FILE_SYSTEM_PROTOCOL {
 } EFI_SIMPLE_FILE_SYSTEM_PROTOCOL;
 
 typedef struct {
+    UINT32 RedMask;
+    UINT32 GreenMask;
+    UINT32 BlueMask;
+    UINT32 ReservedMask;
+} EFI_PIXEL_BITMASK;
+
+typedef struct {
+    UINT32 Version;
+    UINT32 HorizontalResolution;
+    UINT32 VerticalResolution;
+    UINT32 PixelFormat;
+    EFI_PIXEL_BITMASK PixelInformation;
+    UINT32 PixelsPerScanLine;
+} EFI_GRAPHICS_OUTPUT_MODE_INFORMATION;
+
+typedef struct {
+    UINT32 MaxMode;
+    UINT32 Mode;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION* Info;
+    UINTN SizeOfInfo;
+    EFI_PHYSICAL_ADDRESS FrameBufferBase;
+    UINTN FrameBufferSize;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
+
+typedef struct EFI_GRAPHICS_OUTPUT_PROTOCOL {
+    void* QueryMode;
+    void* SetMode;
+    void* Blt;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE* Mode;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+#define EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID \
+    { 0x9042A9DE, 0x23DC, 0x4A38, { 0x96, 0xFB, 0x7A, 0xDE, 0xD0, 0x80, 0x51, 0x6A } }
+
+typedef struct {
     UINT32 Revision; EFI_HANDLE ParentHandle; void* SystemTable;
     EFI_HANDLE DeviceHandle; void* FilePath; void* Reserved;
     UINT32 LoadOptionsSize; void* LoadOptions; void* ImageBase;
@@ -137,8 +226,8 @@ typedef struct {
 typedef struct {
     EFI_TABLE_HEADER Hdr;
     void* RaiseTPL; void* RestoreTPL;
-    void* AllocatePages; void* FreePages; void* GetMemoryMap;
-    void* AllocatePool; void* FreePool;
+    EFI_ALLOCATE_PAGES AllocatePages; void* FreePages; EFI_GET_MEMORY_MAP GetMemoryMap;
+    EFI_ALLOCATE_POOL AllocatePool; EFI_FREE_POOL FreePool;
     void* CreateEvent; void* SetTimer; void* WaitForEvent;
     void* SignalEvent; void* CloseEvent; void* CheckEvent;
     void* InstallProtocolInterface; void* ReinstallProtocolInterface;
@@ -147,7 +236,11 @@ typedef struct {
     void* Reserved; void* RegisterProtocolNotify; void* LocateHandle;
     void* LocateDevicePath; void* InstallConfigurationTable;
     void* LoadImage; void* StartImage; void* Exit;
-    void* UnloadImage; void* ExitBootServices;
+    void* UnloadImage; EFI_EXIT_BOOT_SERVICES ExitBootServices;
+    void* GetNextMonotonicCount; void* Stall; void* SetWatchdogTimer;
+    void* ConnectController; void* DisconnectController; void* OpenProtocol;
+    void* CloseProtocol; void* OpenProtocolInformation; void* ProtocolsPerHandle;
+    void* LocateHandleBuffer; EFI_LOCATE_PROTOCOL LocateProtocol;
 } EFI_BOOT_SERVICES;
 
 // Warning: runtime services are vibe-coded, subject to change (probably)
@@ -174,7 +267,7 @@ typedef struct {
     EFI_RUNTIME_SERVICES*            RuntimeServices;
     EFI_BOOT_SERVICES*               BootServices;
     UINTN                            NumberOfTableEntries;
-    void*                            ConfigurationTable;
+    EFI_CONFIGURATION_TABLE*         ConfigurationTable;
 } EFI_SYSTEM_TABLE;
 
 #endif

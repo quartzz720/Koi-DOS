@@ -1,0 +1,3 @@
+Hello world!
+If you can read this, text editor works fine! 
+(Although it needs an update to be user-friendly)

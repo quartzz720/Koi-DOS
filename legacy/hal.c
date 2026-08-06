@@ -17,10 +17,23 @@ void hal_init(EFI_SYSTEM_TABLE* ST, EFI_HANDLE IH) {
     hal_st = ST;
     hal_ih = IH;
     
-    // Try to locate BlockIO protocol for disk access
-    EFI_GUID block_io_guid = EFI_BLOCK_IO_PROTOCOL_GUID;
+    // Try to locate BlockIO protocol for disk access.
+    // NOTE: BlockIO lives on the underlying DEVICE handle, not on the
+    // loaded-image handle itself - same reasoning as open_root() in fs.c.
+    // We have to go through LoadedImageProtocol->DeviceHandle first.
+    EFI_GUID lip_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+    EFI_LOADED_IMAGE_PROTOCOL* lip = NULL;
     EFI_STATUS status = ST->BootServices->HandleProtocol(
-        IH, &block_io_guid, (void**)&hal_block_io);
+        IH, &lip_guid, (void**)&lip);
+    
+    if (status != EFI_SUCCESS || !lip) {
+        hal_block_io = NULL;
+        return;
+    }
+    
+    EFI_GUID block_io_guid = EFI_BLOCK_IO_PROTOCOL_GUID;
+    status = ST->BootServices->HandleProtocol(
+        lip->DeviceHandle, &block_io_guid, (void**)&hal_block_io);
     
     if (status != EFI_SUCCESS) {
         hal_block_io = NULL;
@@ -89,6 +102,12 @@ void hal_memset(void* dst, UINT8 value, UINTN size) {
     for (UINTN i = 0; i < size; i++) {
         d[i] = value;
     }
+}
+
+/* GCC may emit this symbol for zero-initialized local aggregates. */
+void* memset(void* dst, int value, UINTN size) {
+    hal_memset(dst, (UINT8)value, size);
+    return dst;
 }
 
 // ============================================================================

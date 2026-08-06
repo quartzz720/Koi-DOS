@@ -1,0 +1,1 @@
+make clean && make && nm -u kernel/kernel.elf && readelf -r kernel/kernel.elf && rg -n 'EFI_|OutputString|ConOut' kernel/kernel.c kernel/console.c kernel/memory.c kernel/timer.c kernel/*.h || true && ls -lh boot/efi/boot/BOOTX64.EFI boot/efi/boot/KERNEL.BIN

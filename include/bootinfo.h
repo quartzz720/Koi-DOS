@@ -1,0 +1,65 @@
+#ifndef BOOTINFO_H
+#define BOOTINFO_H
+
+/* This is the bootloader-to-kernel ABI. It deliberately has no UEFI types. */
+typedef unsigned char boot_uint8_t;
+typedef unsigned short boot_uint16_t;
+typedef unsigned int boot_uint32_t;
+typedef unsigned long long boot_uint64_t;
+
+#define BOOT_MEMORY_USABLE 7U
+
+typedef struct {
+    boot_uint32_t type;
+    boot_uint32_t reserved;
+    boot_uint64_t physical_start;
+    boot_uint64_t virtual_start;
+    boot_uint64_t page_count;
+    boot_uint64_t attributes;
+} BOOT_MEMORY_DESCRIPTOR;
+
+typedef struct {
+    boot_uint64_t framebuffer_base;
+    boot_uint64_t framebuffer_size;
+    boot_uint32_t framebuffer_width;
+    boot_uint32_t framebuffer_height;
+    boot_uint32_t framebuffer_pixels_per_scan_line;
+    boot_uint32_t framebuffer_pixel_format;
+
+    boot_uint64_t memory_map;
+    boot_uint64_t memory_map_size;
+    boot_uint64_t memory_map_descriptor_size;
+    boot_uint32_t memory_map_descriptor_version;
+
+    boot_uint64_t acpi_rsdp;
+
+    /* The full span the kernel occupies in physical memory: lowest p_paddr of
+       any PT_LOAD segment through the highest p_paddr + p_memsz. This covers
+       .bss, which is not present in the file at all. The allocator must
+       reserve this range, not the file size - see memory_init(). */
+    boot_uint64_t kernel_image_base;
+    boot_uint64_t kernel_image_size;
+
+    boot_uint64_t kernel_stack_base;
+    boot_uint64_t kernel_stack_size;
+
+    /* Identifies the volume the bootloader was loaded from.
+     *
+     * The kernel cannot work this out for itself: it sees block devices
+     * through its own drivers, which have no idea which of them the firmware
+     * used. Guessing "the first FAT volume found" is right in a one-disk
+     * virtual machine and badly wrong on a real one - booted from a USB stick,
+     * the first FAT volume the AHCI driver can see is the internal drive's EFI
+     * System Partition, and the shell would be pointed at the real system's
+     * boot files.
+     *
+     * The FAT volume serial number is the identifier because it is written at
+     * format time, is already on the volume, and needs no agreement between
+     * the two sides beyond where it sits in the BPB. `boot_volume_known` is
+     * zero when the bootloader could not read it, in which case the kernel
+     * must not fall back to guessing. */
+    boot_uint32_t boot_volume_serial;
+    boot_uint32_t boot_volume_known;
+} BOOT_INFO;
+
+#endif

@@ -1,29 +1,37 @@
-# Build artifacts
+# Build output
+boot/efi/boot/BOOTX64.EFI
+boot/efi/boot/KERNEL.ELF
+boot/efi/boot/KERNEL.BIN
+boot/efi/boot/*.efi
+kernel/kernel.elf
+build/
 *.o
 *.obj
 *.a
 *.so
-*.dylib
 *.dll
+
+# Disk images and firmware variable stores
 *.img
+*.fd
 
-# EFI bootloader
-boot/efi/boot/BOOTX64.EFI
-boot/efi/boot/*.efi
+# Working notes, kept out of the repo on purpose
+PLAN.md
 
-# Temporary files
-*.tmp
+# Editor and OS leftovers
+*.save
 *.swp
 *.swo
-*~
+*.kate-swp
+*.tmp
 *.bak
+*~
+.*.swp
+.DS_Store
+Thumbs.db
 
-# IDE files
+# IDE and tool settings
 .vscode/
 .idea/
 *.code-workspace
-*.swp
-
-# OS files
-.DS_Store
-Thumbs.db
+.claude/settings.local.json

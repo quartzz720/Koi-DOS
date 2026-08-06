@@ -6,6 +6,8 @@
 // Called after HAL initialization
 // ============================================================================
 
-void kernel_main(void);
+#include "../include/bootinfo.h"
+
+void kernel_main(BOOT_INFO* info);
 
 #endif
