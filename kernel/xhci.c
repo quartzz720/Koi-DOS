@@ -1925,6 +1925,222 @@ const char* xhci_storage_error(void) {
     return sense_meaning(storage_last_sense);
 }
 
+/* ---- USB networking, the part that comes before any protocol -------------
+ *
+ * A phone sharing its connection over USB presents one of a small number of
+ * shapes, and they differ in the protocol rather than in the plumbing: every
+ * one of them is a control endpoint for setup, two bulk endpoints for frames,
+ * and usually an interrupt endpoint the device uses to say the link came up.
+ *
+ * This is the plumbing. It finds the interfaces, opens the endpoints and says
+ * what it found - which is the first thing worth being sure of, because
+ * "networking does not work" and "the phone is in charging mode" look
+ * identical from here and only one of them is a bug.
+ */
+
+/* The classes worth recognising. RNDIS is Microsoft's, and is what an Android
+   phone offers first because it is what Windows accepts without a driver; it
+   is declared as a vendor-specific wireless controller rather than as
+   networking, which is why it needs naming rather than deducing. */
+#define USB_CLASS_COMMUNICATIONS 0x02
+#define USB_CLASS_CDC_DATA 0x0A
+#define USB_CLASS_WIRELESS 0xE0
+#define USB_CLASS_MISCELLANEOUS 0xEF
+
+#define CDC_SUBCLASS_ACM 0x02
+#define CDC_SUBCLASS_ETHERNET 0x06
+#define CDC_SUBCLASS_NCM 0x0D
+#define CDC_PROTOCOL_VENDOR 0xFF
+#define WIRELESS_SUBCLASS_RNDIS 0x01
+#define WIRELESS_PROTOCOL_RNDIS 0x03
+#define MISC_SUBCLASS_RNDIS 0x04
+#define MISC_PROTOCOL_RNDIS 0x01
+
+/* RNDIS is declared three different ways, and a device picks one.
+ *
+ * It is Microsoft's protocol and was never given a class of its own, so it
+ * arrives disguised as something else: as a modem whose protocol field says
+ * "vendor" - which is what QEMU's usb-net and most desktop dongles do - or as
+ * a wireless controller, which is what Android phones do, or through the
+ * miscellaneous class with an interface association. Matching only the one you
+ * happen to have in front of you is how a driver works on the bench and not on
+ * the thing it was written for. */
+static int is_rndis(boot_uint8_t class_code, boot_uint8_t subclass,
+                    boot_uint8_t protocol) {
+    if (class_code == USB_CLASS_COMMUNICATIONS &&
+        subclass == CDC_SUBCLASS_ACM && protocol == CDC_PROTOCOL_VENDOR)
+        return 1;
+    if (class_code == USB_CLASS_WIRELESS &&
+        subclass == WIRELESS_SUBCLASS_RNDIS &&
+        protocol == WIRELESS_PROTOCOL_RNDIS)
+        return 1;
+    if (class_code == USB_CLASS_MISCELLANEOUS &&
+        subclass == MISC_SUBCLASS_RNDIS && protocol == MISC_PROTOCOL_RNDIS)
+        return 1;
+    return 0;
+}
+
+#define NETWORK_NONE 0
+#define NETWORK_RNDIS 1
+#define NETWORK_ECM 2
+
+typedef struct {
+    int kind;                    /* NETWORK_* */
+    boot_uint8_t control;        /* the interface that takes the commands */
+    boot_uint8_t data;           /* the one the frames go over */
+    boot_uint8_t data_alternate;  /* which of its settings carries endpoints */
+    boot_uint8_t in_address;
+    boot_uint8_t out_address;
+    boot_uint8_t notify_address; /* 0 when the device has no interrupt pipe */
+    boot_uint16_t in_packet;
+    boot_uint16_t out_packet;
+    boot_uint16_t notify_packet;
+} USB_NETWORK;
+
+/* Walk the configuration once, collecting the pieces a network device is made
+   of. Written as one pass rather than one pass per question because the
+   descriptors only mean anything in order: an endpoint belongs to whichever
+   interface was named last. */
+static int find_network(const boot_uint8_t* configuration, boot_uint32_t length,
+                        USB_NETWORK* found) {
+    boot_uint32_t offset = 0;
+    boot_uint8_t current = 0xFF;
+    boot_uint8_t data_alternate = 0;
+    int in_control = 0;
+    int in_data = 0;
+
+    memset(found, 0, sizeof(*found));
+
+    while (offset + 2 <= length) {
+        boot_uint8_t size = configuration[offset];
+        boot_uint8_t type = configuration[offset + 1];
+
+        if (!size || offset + size > length) break;
+
+        if (type == USB_DESCRIPTOR_INTERFACE && size >= 9) {
+            boot_uint8_t number = configuration[offset + 2];
+            boot_uint8_t alternate = configuration[offset + 3];
+
+            data_alternate = alternate;
+            boot_uint8_t class_code = configuration[offset + 5];
+            boot_uint8_t subclass = configuration[offset + 6];
+            boot_uint8_t protocol = configuration[offset + 7];
+
+            current = number;
+            in_control = 0;
+            in_data = 0;
+
+            /* Alternate settings are not noise here, and skipping them is how
+               this missed a device it was looking straight at.
+             *
+             * A CDC Ethernet data interface is *required* to offer setting 0
+             * with no endpoints at all - that is how the standard says "idle,
+             * using no bandwidth" - and to put the two bulk endpoints in
+             * setting 1. Take only setting 0 and the device appears to have
+             * described a network with no way to carry a frame. RNDIS puts
+             * them in setting 0, so both have to be allowed and the one that
+             * actually has endpoints remembered, because the interface has to
+             * be switched to it before anything will move. */
+            if (alternate && class_code != USB_CLASS_CDC_DATA) {
+                offset += size;
+                continue;
+            }
+
+            if (is_rndis(class_code, subclass, protocol)) {
+                found->kind = NETWORK_RNDIS;
+                found->control = number;
+                in_control = 1;
+            } else if (class_code == USB_CLASS_COMMUNICATIONS &&
+                       (subclass == CDC_SUBCLASS_ETHERNET ||
+                        subclass == CDC_SUBCLASS_NCM)) {
+                if (!found->kind) found->kind = NETWORK_ECM;
+                found->control = number;
+                in_control = 1;
+            } else if (class_code == USB_CLASS_CDC_DATA) {
+                found->data = number;
+                in_data = 1;
+                /* Provisional: overwritten by whichever setting turns out to
+                   carry the endpoints, which is the one below. */
+                if (!found->in_address && !found->out_address)
+                    found->data_alternate = alternate;
+            }
+        } else if (type == USB_DESCRIPTOR_ENDPOINT && size >= 7) {
+            boot_uint8_t address = configuration[offset + 2];
+            boot_uint8_t attributes = configuration[offset + 3];
+            boot_uint16_t packet =
+                (boot_uint16_t)(configuration[offset + 4] |
+                                (configuration[offset + 5] << 8));
+
+            (void)current;
+            if (in_control && (attributes & 0x03) == ENDPOINT_TRANSFER_INTERRUPT) {
+                found->notify_address = address;
+                found->notify_packet = packet;
+            } else if (in_data && (attributes & 0x03) == ENDPOINT_TRANSFER_BULK) {
+                found->data_alternate = data_alternate;
+                if (address & 0x80) {
+                    found->in_address = address;
+                    found->in_packet = packet;
+                } else {
+                    found->out_address = address;
+                    found->out_packet = packet;
+                }
+            }
+        }
+        offset += size;
+    }
+
+    /* A device with no data endpoints is one that has described a network
+       interface and offered no way to move a frame over it - which is exactly
+       what a phone looks like before the user taps "USB tethering". */
+    if (!found->kind) return 0;
+    return found->in_address && found->out_address;
+}
+
+static const char* network_kind_name(int kind) {
+    switch (kind) {
+    case NETWORK_RNDIS: return "RNDIS";
+    case NETWORK_ECM: return "CDC Ethernet";
+    default: return "unknown";
+    }
+}
+
+/* Report what is on the other end of the cable. Opening the endpoints and
+   speaking the protocol come next; being certain which shape this device is,
+   and that it has agreed to be a network at all, comes first. */
+static int configure_network(USB_DEVICE* device,
+                             const boot_uint8_t* configuration,
+                             boot_uint32_t length) {
+    XHCI_CONTROLLER* self = device->controller;
+    USB_NETWORK network;
+
+    if (!find_network(configuration, length, &network)) return 0;
+
+    log_controller(self);
+    log(network_kind_name(network.kind));
+    log(" network device: control interface ");
+    log_dec(network.control);
+    log(", data interface ");
+    log_dec(network.data);
+    log(", endpoints in ");
+    log_dec(network.in_address & 0x0F);
+    log(" out ");
+    log_dec(network.out_address & 0x0F);
+    if (network.data_alternate) {
+        log(" (setting ");
+        log_dec(network.data_alternate);
+        log(")");
+    }
+    if (network.notify_address) {
+        log(", notify ");
+        log_dec(network.notify_address & 0x0F);
+    }
+    log("\n");
+    log_controller(self);
+    log("no protocol for it yet - found, not driven\n");
+    return 0;
+}
+
+
 /* ---- Bringing devices up ------------------------------------------------ */
 
 /* Enumerate whatever is plugged into one port and hand it to a class driver.
@@ -1966,7 +2182,8 @@ static void attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
     self->device_count++;
 
     if (!configure_keyboard(device, configuration, length) &&
-        !configure_storage(device, configuration, length)) {
+        !configure_storage(device, configuration, length) &&
+        !configure_network(device, configuration, length)) {
         log_controller(self);
         log("no driver for this device\n");
     }
