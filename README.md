@@ -11,8 +11,12 @@ library.
 > **[Games](https://github.com/quartzz720/Games)** — Snake, Tetris, Pong, Breakout, Reversi and
 > Minesweeper, in one program with a menu.
 >
-> Both are built with nothing but [sdk/](sdk/), in their own repositories. That is the point of
-> them: if either stops building, the SDK is broken for everybody rather than only for programs
+> **[K-DOOM](https://github.com/quartzz720/K-DOOM)** — id Software's DOOM, on Koi-DOS. Four files
+> replace the Unix layer and the game code is id's, unchanged. Bring your own WAD: the source is
+> GPL, the game data is not.
+>
+> All three are built with nothing but [sdk/](sdk/), in their own repositories. That is the point
+> of them: if one stops building, the SDK is broken for everybody rather than only for programs
 > that happen to live in this tree.
 
 "DOS-like" means the look and the character, not binary compatibility: drive letters, FAT32, a
@@ -173,12 +177,17 @@ in [programs/](programs/):
 enough to write a listing with no privilege the shell does not also lack, and that a program can
 change how the system looks and make it stick without reaching into kernel state.
 
-Two more proofs live outside this repository on purpose, each built with nothing but the SDK:
+Three more proofs live outside this repository on purpose, each built with nothing but the SDK:
 **[DOSFETCH](https://github.com/quartzz720/DOSFETCH)**, a system summary in the spirit of
-neofetch, and **[Games](https://github.com/quartzz720/Games)**, six of them in one program with a
-menu. If either stops building, the SDK is broken for everybody rather than only for programs
-that happen to sit in this tree — and Games is the one that proves the graphics calls, because it
-is the only thing that draws sixty times a second.
+neofetch; **[Games](https://github.com/quartzz720/Games)**, six of them in one program with a
+menu; and **[K-DOOM](https://github.com/quartzz720/K-DOOM)**, id Software's DOOM with its Unix
+layer replaced. If one stops building, the SDK is broken for everybody rather than only for
+programs that happen to sit in this tree.
+
+Games proves the graphics calls, because it is the only thing here that draws sixty times a
+second. DOOM proved something less comfortable: it is the first program that kept a live value in
+a register across a system call, and it found that the stub had never preserved the registers
+this document promised it would.
 
 ```
 Z:\> color                 show the presets and the palette
