@@ -552,6 +552,18 @@ rather than by looking at them.
 IRQ1, scancode set 1, with shift, ctrl, alt and caps lock. `keyboard_getchar()` idles on `hlt`
 rather than spinning, so an idle guest stops burning a host core.
 
+**Two queues, not one.** Characters go in one; key-down and key-up events go in the other. The
+shell wants to know what was typed; a game wants to know what is being *held*, which a character
+stream cannot express at all — it has no idea a key is still down and no idea when it stopped
+being. Both drivers could always see releases and threw them away one line before delivering
+them.
+
+Mixing the two into a single stream with a flag would break both ends: line editing would find
+release events where it expected characters, and a game would find shifted characters that never
+match what it saw go down. So the event queue reports the *unshifted* identity, and a key reads
+the same in both directions — `a` is `a` whether or not shift was held. Draining one queue
+consumes nothing from the other, so the shell and a program can each have what they need.
+
 `keyboard_init()` reports three outcomes, not two, and the middle one is the interesting case:
 no controller, a controller with a keyboard that answered, or a controller with nothing attached.
 

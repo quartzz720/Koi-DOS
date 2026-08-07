@@ -49,8 +49,8 @@
  * ONCE THE INTERFACE IS FROZEN, FUNCTION NUMBERS ARE NEVER REUSED. A removed
  * call leaves a hole. This is the promise that makes old programs safe, and it
  * costs nothing to keep - there are 256 numbers and twenty are in use. */
-#define KOI_ABI_VERSION 4
-#define KOI_ABI_MINIMUM 4
+#define KOI_ABI_VERSION 5
+#define KOI_ABI_MINIMUM 5
 #define KOI_ABI_IS_ALPHA 1
 
 /* Every program begins with this, placed at its load address by the linker
@@ -80,6 +80,19 @@ typedef struct {
    processor between ticks. Any keystroke arriving meanwhile is still buffered
    and still there afterwards. */
 #define SYS_SLEEP 0x09       /* (milliseconds) */
+/* One key going down or coming up, rather than a character.
+ *
+ * SYS_GETCHAR answers "what did they type", which is what a prompt wants and
+ * is the wrong question for anything where a key is *held*: walking forward,
+ * steering, holding a button. A character stream cannot express that at all -
+ * it has no idea a key is still down, and no idea when it stopped being.
+ *
+ * The identity reported is the unshifted one, so a key gives the same value
+ * going down as coming up. `w` is 'w' whether or not shift was held; the
+ * arrows and modifiers are the KOI_KEY_* codes below. Returns 0 when nothing
+ * has happened. Reading these does not consume characters, so a program may
+ * use both. */
+#define SYS_KEYEVENT 0x0A    /* () -> key, or key | KOI_KEY_RELEASED, or 0 */
 
 /* Keys with no ASCII value, returned by SYS_GETCHAR above 0xFF so a caller can
    switch on them alongside ordinary characters.
@@ -98,7 +111,15 @@ typedef struct {
 #define KOI_KEY_PAGE_DOWN 0x107
 #define KOI_KEY_DELETE 0x108
 #define KOI_KEY_INSERT 0x109
+#define KOI_KEY_SHIFT 0x10A
+#define KOI_KEY_CONTROL 0x10B
+#define KOI_KEY_ALT 0x10C
 #define KOI_KEY_F1 0x110     /* F1..F12 are consecutive from here */
+
+/* Set in a SYS_KEYEVENT result when the key came up rather than went down. */
+#define KOI_KEY_RELEASED 0x8000
+#define KOI_KEY_CODE(event) ((int)((event) & 0x7FFF))
+#define KOI_KEY_IS_RELEASE(event) (((event) & KOI_KEY_RELEASED) != 0)
 
 #define KOI_KEY_ESCAPE 27
 #define KOI_KEY_ENTER '\n'
@@ -164,6 +185,19 @@ typedef struct {
  * newer header can tell "this kernel does not know" from "the answer is none". */
 #define SYS_SYSINFO 0x22     /* (item, index) -> value, or -1 */
 #define SYS_SYSTEXT 0x23     /* (item, index, buffer, size) -> length, or -1 */
+
+/* Memory, for programs that need more than their own image holds.
+ *
+ * Whole pages, because that is what the kernel has to give. This is not a
+ * malloc and is not meant to be one: a program that wants small objects takes
+ * one large block and manages it itself, which is what every program large
+ * enough to care already does.
+ *
+ * Everything a program took is released when it exits, whether or not it
+ * remembered to - a leak that outlives the program would be permanent, since
+ * nothing here reclaims memory later. */
+#define SYS_ALLOC 0x24       /* (bytes) -> address, or 0 */
+#define SYS_FREE 0x25        /* (address) */
 
 /* Numeric items. Sizes are in kibibytes unless said otherwise. */
 #define KOI_INFO_MEMORY_TOTAL 0

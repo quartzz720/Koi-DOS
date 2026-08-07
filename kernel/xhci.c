@@ -1113,24 +1113,74 @@ static void queue_report_request(void) {
                   keyboard_dci);
 }
 
-/* Turn one report into keystrokes.
+/* Which key a usage is, ignoring what it would type. The event queue reports
+   this so a key reads the same going down as coming up - see the note on
+   scancode_identity in keyboard.c, which faces the same problem. */
+static int hid_identity(boot_uint8_t usage) {
+    switch (usage) {
+    case 0x4F: return KOI_KEY_RIGHT;
+    case 0x50: return KOI_KEY_LEFT;
+    case 0x51: return KOI_KEY_DOWN;
+    case 0x52: return KOI_KEY_UP;
+    case 0x4A: return KOI_KEY_HOME;
+    case 0x4D: return KOI_KEY_END;
+    case 0x4B: return KOI_KEY_PAGE_UP;
+    case 0x4E: return KOI_KEY_PAGE_DOWN;
+    case 0x4C: return KOI_KEY_DELETE;
+    case 0x49: return KOI_KEY_INSERT;
+    default: break;
+    }
+    if (usage >= 0x3A && usage <= 0x45) return KOI_KEY_F1 + (usage - 0x3A);
+    if (usage >= sizeof(hid_plain)) return 0;
+    return (int)(unsigned char)hid_plain[usage];
+}
+
+/* Is a usage listed in a report? */
+static int report_holds(const boot_uint8_t* report, boot_uint8_t usage) {
+    for (int index = 2; index < 8; index++)
+        if (report[index] == usage) return 1;
+    return 0;
+}
+
+/* Turn one report into keystrokes and key events.
  *
  * A boot report is a set, not an event: it lists which keys are down right
  * now. A key counts as newly pressed when it is in this report and was not in
- * the last one, which is also how key repeat is avoided without any timing. */
+ * the last one, which is also how key repeat is avoided without any timing.
+ * Comparing the other way round gives the releases, which the same comparison
+ * has always been able to see and which used to be thrown away. */
 static void handle_report(const boot_uint8_t* report) {
     boot_uint8_t modifiers = report[0];
+    boot_uint8_t was = previous_report[0];
+    static const struct { boot_uint8_t mask; int key; } modifier_keys[] = {
+        { 0x22, KOI_KEY_SHIFT },     /* either shift */
+        { 0x11, KOI_KEY_CONTROL },   /* either control */
+        { 0x44, KOI_KEY_ALT }        /* either alt */
+    };
+
+    for (int index = 0; index < 3; index++) {
+        int now_down = (modifiers & modifier_keys[index].mask) != 0;
+        int was_down = (was & modifier_keys[index].mask) != 0;
+        if (now_down != was_down)
+            keyboard_submit_event(modifier_keys[index].key, !now_down);
+    }
 
     for (int index = 2; index < 8; index++) {
         boot_uint8_t usage = report[index];
-        int already_down = 0;
 
         if (!usage || usage == 1) continue;   /* 1 means too many keys at once */
-        for (int previous = 2; previous < 8; previous++)
-            if (previous_report[previous] == usage) { already_down = 1; break; }
-        if (already_down) continue;
+        if (report_holds(previous_report, usage)) continue;
 
+        keyboard_submit_event(hid_identity(usage), 0);
         keyboard_submit(hid_to_key(usage, modifiers));
+    }
+
+    for (int index = 2; index < 8; index++) {
+        boot_uint8_t usage = previous_report[index];
+
+        if (!usage || usage == 1) continue;
+        if (report_holds(report, usage)) continue;
+        keyboard_submit_event(hid_identity(usage), 1);
     }
     memcpy(previous_report, report, 8);
 }

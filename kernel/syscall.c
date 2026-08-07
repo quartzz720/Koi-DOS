@@ -93,9 +93,65 @@ static void resolve_working(const char* name, char* result) {
     result[length] = 0;
 }
 
+/* Memory a program asked for.
+ *
+ * Tracked rather than handed out and forgotten, because nothing here reclaims
+ * memory later: a block a program leaks would be gone until the machine is
+ * restarted. Eight blocks is generous - a program that needs more than a
+ * handful of large allocations should be taking one and dividing it itself,
+ * which is what a program large enough to care already does. */
+#define BLOCK_MAX 8
+
+typedef struct {
+    void* address;
+    boot_uint64_t pages;
+} PROGRAM_BLOCK;
+
+static PROGRAM_BLOCK blocks[BLOCK_MAX];
+
+static long do_alloc(long bytes) {
+    boot_uint64_t pages;
+    int slot;
+    void* address;
+
+    if (bytes <= 0) return 0;
+    pages = ((boot_uint64_t)bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+
+    for (slot = 0; slot < BLOCK_MAX; slot++) if (!blocks[slot].address) break;
+    if (slot == BLOCK_MAX) return 0;
+
+    address = alloc_pages(pages);
+    if (!address) return 0;
+
+    blocks[slot].address = address;
+    blocks[slot].pages = pages;
+    return (long)(unsigned long long)address;
+}
+
+static long do_free(long address) {
+    if (!address) return 0;
+    for (int slot = 0; slot < BLOCK_MAX; slot++) {
+        if ((long)(unsigned long long)blocks[slot].address != address) continue;
+        free_pages(blocks[slot].address, blocks[slot].pages);
+        blocks[slot].address = (void*)0;
+        blocks[slot].pages = 0;
+        return 0;
+    }
+    /* An address this never handed out. Refusing beats freeing whatever
+       happens to be there. */
+    return SYSCALL_ERROR;
+}
+
 void syscall_close_all(void) {
     memset(handles, 0, sizeof(handles));
     memset(searches, 0, sizeof(searches));
+    /* Anything the program still held goes back, whether or not it asked. */
+    for (int slot = 0; slot < BLOCK_MAX; slot++) {
+        if (!blocks[slot].address) continue;
+        free_pages(blocks[slot].address, blocks[slot].pages);
+        blocks[slot].address = (void*)0;
+        blocks[slot].pages = 0;
+    }
 }
 
 static long find_next(long search, KOI_FIND_DATA* data);
@@ -357,6 +413,9 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
     case SYS_KEYPRESSED:
         return keyboard_pending() ? 1 : 0;
 
+    case SYS_KEYEVENT:
+        return keyboard_next_event();
+
     case SYS_SLEEP:
         /* Clamped rather than trusted. A program that computes a delay wrongly
            should stutter, not hang the only thread the system has. */
@@ -434,6 +493,12 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
 
     case SYS_SYSTEXT:
         return system_text(a, b, (char*)c, d);
+
+    case SYS_ALLOC:
+        return do_alloc(a);
+
+    case SYS_FREE:
+        return do_free(a);
 
     /* Graphics. Every drawing call is silently ignored when the program has
        not entered the mode - the alternative is a program that forgot to enter

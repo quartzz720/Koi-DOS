@@ -84,6 +84,39 @@ static inline int koi_keypressed(void) {
     return (int)koi_call(SYS_KEYPRESSED, 0, 0, 0);
 }
 
+/* One key going down or coming up, rather than a character.
+ *
+ * A character stream cannot say a key is being *held* - it has no idea a key
+ * is still down and no idea when it stopped being. Anything where that matters
+ * needs this: walking forward, steering, holding a button.
+ *
+ *     int event = koi_keyevent();
+ *     if (event) {
+ *         int key = KOI_KEY_CODE(event);
+ *         if (KOI_KEY_IS_RELEASE(event)) ... else ...
+ *     }
+ *
+ * The identity is the unshifted one, so a key reads the same both ways.
+ * Returns 0 when nothing has happened. Draining this consumes no characters,
+ * so a program may use koi_getchar as well. */
+static inline int koi_keyevent(void) {
+    return (int)koi_call(SYS_KEYEVENT, 0, 0, 0);
+}
+
+/* Memory beyond what the program image holds, in whole pages.
+ *
+ * Not a malloc and not meant to be one. A program that wants small objects
+ * takes one large block and divides it itself - which is what every program
+ * large enough to care already does, and what DOOM's zone allocator is.
+ * Everything is released when the program exits, remembered or not. */
+static inline void* koi_alloc(long bytes) {
+    return (void*)koi_call(SYS_ALLOC, bytes, 0, 0);
+}
+
+static inline void koi_free(void* address) {
+    (void)koi_call(SYS_FREE, (long)address, 0, 0);
+}
+
 /* Wait, without spinning. Keystrokes arriving meanwhile are buffered and are
    still there when this returns. */
 static inline void koi_sleep(long milliseconds) {

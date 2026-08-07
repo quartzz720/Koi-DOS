@@ -68,6 +68,40 @@ static const char shift_map[0x59] = {
     0,    '*', 0,   ' ', 0
 };
 
+/* The event queue, alongside the character one and independent of it.
+ *
+ * Two queues rather than one stream with a flag, because the two answer
+ * different questions and mixing them breaks both: the shell reading a line
+ * would find release events where it expected characters, and a game reading
+ * events would find shifted characters that never match what it saw go down. */
+static volatile boot_uint16_t events[BUFFER_SIZE];
+static volatile boot_uint32_t event_head;
+static volatile boot_uint32_t event_tail;
+
+void keyboard_submit_event(int key, int released) {
+    boot_uint32_t next;
+
+    if (key <= 0 || key > 0x7FFF) return;
+    next = (event_head + 1) % BUFFER_SIZE;
+    /* Drop rather than overwrite, as with characters. A full queue means
+       nobody is draining it, and the oldest events are the meaningful ones. */
+    if (next == event_tail) return;
+    events[event_head] =
+        (boot_uint16_t)(released ? ((boot_uint16_t)key | KOI_KEY_RELEASED)
+                                 : (boot_uint16_t)key);
+    event_head = next;
+}
+
+int keyboard_next_event(void) {
+    boot_uint16_t event;
+
+    if (xhci_has_keyboard()) xhci_poll();
+    if (event_tail == event_head) return 0;
+    event = events[event_tail];
+    event_tail = (event_tail + 1) % BUFFER_SIZE;
+    return (int)event;
+}
+
 static void buffer_push(boot_uint16_t key) {
     boot_uint32_t next = (buffer_head + 1) % BUFFER_SIZE;
     /* Drop the key rather than overwrite unread ones: a full buffer means
@@ -120,6 +154,31 @@ static boot_uint16_t translate_escaped(boot_uint8_t code) {
     }
 }
 
+/* Which key a make code is, ignoring what it would type.
+ *
+ * The event queue reports this rather than the character, so that a key reads
+ * the same going down as coming up. Reporting the shifted character would mean
+ * a key pressed with shift and released without it looked like two different
+ * keys, and anything tracking what is held would never see it stop. */
+static int scancode_identity(boot_uint8_t code, int escaped) {
+    if (escaped) {
+        if (code == 0x1D) return KOI_KEY_CONTROL;
+        if (code == 0x38) return KOI_KEY_ALT;
+        return (int)translate_escaped(code);
+    }
+    switch (code) {
+    case 0x2A: case 0x36: return KOI_KEY_SHIFT;
+    case 0x1D: return KOI_KEY_CONTROL;
+    case 0x38: return KOI_KEY_ALT;
+    default: break;
+    }
+    if (code >= 0x3B && code <= 0x44) return KEY_F1 + (code - 0x3B);
+    if (code == 0x57) return KEY_F1 + 10;
+    if (code == 0x58) return KEY_F1 + 11;
+    if (code >= sizeof(plain_map)) return 0;
+    return (int)(unsigned char)plain_map[code];
+}
+
 static void handle_scancode(boot_uint8_t code) {
     int released;
     char character;
@@ -134,6 +193,7 @@ static void handle_scancode(boot_uint8_t code) {
 
     if (escape_pending) {
         escape_pending = 0;
+        keyboard_submit_event(scancode_identity(code, 1), released);
         /* The right-hand modifiers arrive escaped; treat them as their
            left-hand twins. */
         if (code == 0x1D) { control_held = !released; return; }
@@ -144,6 +204,8 @@ static void handle_scancode(boot_uint8_t code) {
         }
         return;
     }
+
+    keyboard_submit_event(scancode_identity(code, 0), released);
 
     switch (code) {
     case 0x2A: case 0x36: shift_held = !released; return;

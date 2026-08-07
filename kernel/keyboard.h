@@ -65,6 +65,22 @@ int keyboard_poll(void);
  * routed and its keystrokes only arrive when someone goes and looks. */
 int keyboard_pending(void);
 
+/* One key going down or coming up, as an event rather than a character.
+ *
+ * A character stream cannot say that a key is being *held*: it has no idea a
+ * key is still down and no idea when it stopped being. Anything where that
+ * matters - walking forward, steering, holding a button - needs this instead.
+ *
+ * The identity is the unshifted one, so a key reads the same going down as
+ * coming up. Returns 0 when nothing has happened. This queue is separate from
+ * the character one and draining it consumes no characters, so the shell and a
+ * game can both have what they need without either seeing the other's. */
+int keyboard_next_event(void);
+
+/* Record one. Called by the scancode handler and by the USB keyboard driver;
+   `released` distinguishes the two directions. */
+void keyboard_submit_event(int key, int released);
+
 /* Blocking: waits for a key. Shows the console caret while waiting. */
 int keyboard_getchar(void);
 

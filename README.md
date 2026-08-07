@@ -227,7 +227,7 @@ Programs write that file; the kernel reads it. Neither reaches into the other.
 ### System calls
 
 Programs call the kernel with `int 0x40`, in the spirit of DOS's INT 21h. `RAX` holds the
-function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Thirty-three calls cover
+function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Thirty-five calls cover
 console I/O, files, directory enumeration, the command line, exit codes, what the system knows
 about itself, and taking the screen; they are listed in
 [include/syscall.h](include/syscall.h), which the kernel and every program include from the same
@@ -240,10 +240,21 @@ between a game that runs and one that crawls: the screen is whatever size the fi
 often far larger than the area a program uses, and sending all of it sixty times a second costs
 more than everything else put together.
 
-Two of those calls exist for programs that cannot afford to stop. `SYS_GETCHAR` waits, which is
-right for a prompt and wrong for anything that has to keep moving; `SYS_KEYPRESSED` asks whether a
-key is waiting without taking it, and `SYS_SLEEP` waits without spinning. Nothing with a clock in
-it — a game, an animation, an interruptible operation — can be written without both.
+Three of those exist for programs that cannot afford to stop. `SYS_GETCHAR` waits, which is right
+for a prompt and wrong for anything that has to keep moving; `SYS_KEYPRESSED` asks whether a key
+is waiting without taking it, and `SYS_SLEEP` waits without spinning.
+
+`SYS_KEYEVENT` answers a different question again: **which key went down, and which came up**. A
+character stream cannot say that a key is being *held* — it has no idea a key is still down and no
+idea when it stopped being — so anything where that matters, walking forward or steering or
+holding a button, needs events rather than characters. Both drivers had the information all along
+and were discarding it one line before it could be delivered. The identity reported is the
+unshifted one, so a key reads the same going down as coming up.
+
+`SYS_ALLOC` and `SYS_FREE` give a program whole pages beyond its own image. Not a malloc and not
+meant to be one: a program that wants small objects takes one large block and divides it itself.
+Everything is released when the program exits, whether or not it remembered to — nothing here
+reclaims memory later, so a leak would otherwise be permanent.
 
 The vector is `0x40` rather than `0x21` because in protected mode `0x21` is the keyboard IRQ.
 `INT` rather than `SYSCALL`/`SYSRET` because the whole value of `SYSRET` is a fast ring 3 to
