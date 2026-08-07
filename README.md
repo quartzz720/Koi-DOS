@@ -22,35 +22,51 @@ still exist underneath every entry, but they are not what you see.
 ## What it does
 
 The kernel boots on bare metal, leaves UEFI Boot Services behind, installs its own GDT, IDT and
-page tables, brings up a keyboard, finds the disk over AHCI, parses the partition table, mounts
-FAT32, and runs a shell that loads programs off that disk.
+page tables, brings up a keyboard over PS/2 or USB, finds disks over AHCI, NVMe and USB storage,
+parses the partition table, mounts FAT32, and runs a shell that loads programs off that disk. It
+can install itself onto a disk, and it can hand the screen to a program that wants to draw.
 
 ```
 KOI DOS KERNEL
 MEMORY ALLOC FREE: OK
-MEMORY FREE: 1984 MB
+MEMORY FREE: 1970 MB
 CPU: GDT IDT PIC READY
 PAGING: IDENTITY MAP 16384 MB
 HEAP: 1023 KB, SELF TEST OK
 KEYBOARD: PS/2 READY
 TIMER: PIT POLLING 1000 HZ
-PCI: 6 DEVICES
-AHCI: DISK 64 MB
-VOLUMES: 1 FAT32 OF 1
+APIC: TIMER 62652 KHZ, CALIBRATED
+TIMER: LOCAL APIC, INTERRUPT DRIVEN
+TIMER: 100 HPET MS COUNTED AS 100 MS WITHOUT POLLING
+KEYBOARD: MOVED TO THE IO APIC
+PCI: 9 DEVICES
+AHCI: DISK 192 MB
+NVME: DISK 128 MB
+XHCI: 2 OF 2 CONTROLLERS
+XHCI: 2 OF 16 PORTS IN USE, KEYBOARD, STORAGE
+VOLUMES: 4 FAT32 OF 4
+SYSTEM VOLUME: KOI-DOS - the loader's partition has no drive letter
 
-Z:\> dir *.exe
+Z:\> dir \bin
  Volume in drive Z is KOI-DOS
- Directory of Z:\
+ Directory of Z:\BIN
 
-2026-08-06  03:24         9360  CAT.EXE
-2026-08-06  03:24        14024  COLOR.EXE
-2026-08-06  03:24         9224  HELLO.EXE
-2026-08-06  03:24         9280  LS.EXE
-2026-08-06  03:24         9360  SAVE.EXE
+2026-08-07  04:17        13576  CAT.EXE
+2026-08-07  04:17        18232  COLOR.EXE
+2026-08-07  04:17        14352  DEMO.EXE
+2026-08-07  04:17        13440  HELLO.EXE
+2026-08-07  04:17        13496  LS.EXE
+2026-08-07  04:17        13576  SAVE.EXE
+2026-08-07  04:17        47032  SHOW.EXE
 
-       5 file(s)           51248 bytes
-       0 dir(s)        65864192 bytes free
+       7 file(s)          133704 bytes
+       0 dir(s)        65536000 bytes free
 ```
+
+Most of those boot lines are a claim being checked rather than a step being announced. The memory
+figure comes from an allocate-and-free round trip, the heap from a self test, and the two timer
+lines are one clock measuring another — the second is the measurement the polled PIT could not
+make at all, because it used to read 100 ms as 0.
 
 ### Commands
 
@@ -70,8 +86,15 @@ Z:\> dir *.exe
 | `disk` | disks and partitions, whether or not they have a drive letter |
 | `format <part>` | make a new filesystem — destroys everything on it |
 | `part <disk>` | replace the partition table — destroys the whole disk |
+| `setup` | install Koi-DOS onto a disk |
+| `shutdown`, `reboot` | through ACPI, which is the only way there is |
 | `echo`, `ver`, `cls`, `help` | the usual |
 | `Z:` | change drive |
+
+The three destructive ones ask before they act, and none of them will touch the device the system
+is running from. `format` and `part` require the partition or disk to be typed back by name —
+`y` is too easy to press by reflex — and `setup` shows the licence and the layout it is about to
+write before it writes anything.
 
 `mem` doubles as the system's self-description, because the alternative to a line reading
 `USB : keyboard, storage` is rebooting with a serial cable attached to find out whether a driver
@@ -80,18 +103,18 @@ came up:
 ```
 Z:\> mem
 Physical memory : 2047 MB
-Available       : 1978 MB
+Available       : 1973 MB
 
-Kernel image    : 2152 KB
+Kernel image    : 2200 KB
 Page tables     : 80 KB
 Identity map    : 16386 MB (RAM and device windows)
 Heap            : 1023 KB
 Heap free       : 1023 KB
 
-PCI devices     : 7
-Disks           : 2  ahci0, usb0
-Volumes         : 2  Z:, Y:
-USB             : keyboard, storage (2 of 8 ports in use)
+PCI devices     : 9
+Disks           : 3  ahci0, nvme0, usb0
+Volumes         : 3  Z:, Y:, X:
+USB             : keyboard, storage (2 of 16 ports in use)
 ```
 
 `ver` carries a build number, which during development is worth more than the version — two
@@ -102,7 +125,7 @@ when that kernel was built:
 ```
 Z:\> ver
 Koi-DOS 0.5 Alpha
-Kernel 0.5.20, built 2026-08-06 (65230ca+)
+Kernel 0.5.23, built 2026-08-07 (18400fe)
 A DOS-like operating system for UEFI machines.
 ```
 
@@ -118,9 +141,11 @@ and `AUTOEXEC.BAT` at the root of the boot drive runs at startup.
 
 ### Programs
 
-Anything that is not a built-in command is looked up on disk as `NAME` or `NAME.EXE`, first in
-the current directory and then at the root of the drive, and given the rest of the line as its
-arguments. Seven ship in [programs/](programs/):
+Anything that is not a built-in command is looked up on disk as `NAME` or `NAME.EXE` — first in
+the current directory, then at the root of the drive, then in `\BIN` — and given the rest of the
+line as its arguments. `\BIN` is where an installation puts them, because the root of the system
+volume is for the user's files and a pile of `.EXE` in it turns `dir` into a search. Seven ship
+in [programs/](programs/):
 
 | | |
 |---|---|
@@ -182,15 +207,22 @@ Programs write that file; the kernel reads it. Neither reaches into the other.
 ### System calls
 
 Programs call the kernel with `int 0x40`, in the spirit of DOS's INT 21h. `RAX` holds the
-function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Twenty calls cover
-console I/O, files, directory enumeration, the command line, exit codes, and what the system
-knows about itself; they are listed in
+function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Thirty calls cover
+console I/O, files, directory enumeration, the command line, exit codes, what the system knows
+about itself, and taking the screen; they are listed in
 [include/syscall.h](include/syscall.h), which the kernel and every program include from the same
 copy so the two cannot drift apart.
 
 The vector is `0x40` rather than `0x21` because in protected mode `0x21` is the keyboard IRQ.
 `INT` rather than `SYSCALL`/`SYSRET` because the whole value of `SYSRET` is a fast ring 3 to
 ring 0 transition, which does not happen in a ring-0 monolith.
+
+**A program carries the interface version it was built against**, and the kernel checks it before
+running anything. Both directions are refused while the interface is ALPHA. Newer is obvious — it
+would call functions this kernel does not have. Older is the surprising half: function numbers
+may have been reused since, and a program calling a number that has changed meaning does not
+fail, it quietly does the wrong thing. Once the numbering is frozen that stops, and numbers are
+never reused again — a removed call leaves a hole.
 
 ### Writing a program
 
@@ -215,14 +247,42 @@ int main(const char* arguments) {
 [programs/koi.h](programs/koi.h) wraps every system call. There is no C library: a program gets
 those calls and whatever it writes itself.
 
+A program that draws has the same shape, with the screen taken and given back around it:
+
+```c
+#include "koi.h"
+
+int main(const char* arguments) {
+    KOI_SCREEN screen;
+    (void)arguments;
+
+    if (koi_gfx_enter(&screen) != 0) return 1;
+    koi_gfx_clear(koi_gfx_color(0, 0, 40));
+    koi_gfx_fill(10, 10, 100, 60, koi_gfx_color(255, 200, 0));
+    koi_gfx_text(10, 80, "hello", koi_gfx_color(255, 255, 255),
+                 KOI_TEXT_TRANSPARENT);
+    koi_gfx_present();
+    koi_getchar();
+    koi_gfx_leave();
+    return 0;
+}
+```
+
+Nothing appears until `koi_gfx_present` — that is not an optimisation, it is the difference
+between an image and a program being watched as it draws one. `screen.pixels` is the buffer
+itself and may be written directly, which is the fast path; the calls exist so that a program
+does not have to know how a pixel is laid out. Never assemble a colour by hand: the framebuffer's
+channel order differs between machines, and code that guesses draws in the wrong colours on half
+of them.
+
 ---
 
 ## Status
 
 Working: the boot chain, framebuffer console with an 8×16 CP437 font, exception handling with a
 register dump instead of a silent reboot, physical page allocator, `kmalloc` heap, own page
-tables, AHCI, GPT/MBR/whole-device partitioning, FAT32 read **and** write with long names, the
-command interpreter, programs and system calls.
+tables, AHCI, NVMe, USB, GPT/MBR/whole-device partitioning, FAT32 read **and** write with long
+names, the command interpreter, programs and system calls, graphics, and an installer.
 
 **Keyboards work over both PS/2 and USB.** The xHCI driver takes the controller from the
 firmware, resets the port, addresses the device, reads its descriptors and drives it in HID boot
@@ -254,12 +314,32 @@ before `ExitBootServices` and it cannot be changed afterwards, so "graphics mode
 console stops drawing and something else starts. The shell takes the screen back whether or not a
 program remembered to, which is the failure DOS programs were famous for.
 
+**It can install itself.** `setup` writes a GPT with an EFI System Partition for the loader and a
+system partition for everything else, makes both filesystems, copies the system across and marks
+the system volume. The loader's partition gets no drive letter at all — not security, since any
+other operating system sees an ordinary partition, but it does mean a stray `del` cannot reach
+the files the machine needs to start. Verified the only way that means anything: installing to a
+blank disk, removing the media, and booting the machine from what was written.
+
+**The filesystem is fast enough to install with**, which it was not at first, and the reasons are
+worth naming because none of them could show on a 64 MB test image. The cluster size was being
+chosen backwards — the smallest that was still legal FAT32, which gave a 223 GB partition 234
+million clusters and a 936 MiB allocation table. Free space was counted by walking that whole
+table, and the count was thrown away on every cluster allocation, which is also why `dir` used to
+freeze for a minute: it asks for the figure after printing the listing. FAT entries went to the
+disk one at a time although 128 of them share a sector. And data moved one sector per command
+although every driver underneath accepts a run. A 16 MB file from a USB stick to NVMe did not
+finish in three minutes before; it takes five seconds now.
+
 Missing: **audio and networking**. There is no `edit` — the line editor is
 the one command from the old shell not carried over, and it belongs as a program now that
 programs exist. `chkdsk` does not exist, so an interrupted write has to be repaired from another
 system. The xHCI interrupt is not routed anywhere, so waiting for a USB key spins rather than
 sleeps; USB devices are enumerated once at boot, so plugging a stick in afterwards does nothing
-until a reboot; and anything behind a USB hub is invisible.
+until a reboot; and anything behind a USB hub is invisible. `ahci_init()` stops at the first ATA
+disk it finds, so a machine with two SATA drives shows one. NVMe describes each transfer with a
+single PRP entry, which cannot cross a page boundary, so it moves 4 KiB per command where AHCI
+moves 128 KiB.
 
 **It has now run on physical hardware** — two machines, once each. Confirmed there: the boot
 chain, the framebuffer console, AHCI, USB mass storage, the USB keyboard, and drive letters
@@ -347,20 +427,28 @@ make check    # undefined symbols, relocations, program headers
 ./qemu.sh     # build a FAT32 image and boot it
 ```
 
-`qemu.sh` does the whole cycle: runs `make`, creates two 64 MiB FAT32 images with `mkfs.vfat`,
-populates them with `mtools`, copies a fresh OVMF variable store to `/tmp/koi-vars.fd`, and
-launches QEMU. Extra arguments pass straight through:
+`qemu.sh` does the whole cycle: runs `make`, creates the disk images with `mkfs.vfat`, populates
+them with `mtools`, copies a fresh OVMF variable store to `/tmp/koi-vars.fd`, and launches QEMU.
+Extra arguments pass straight through:
 
 ```bash
 ./qemu.sh -display none     # no window, serial log in the terminal only
 ./qemu.sh -s -S             # wait for gdb on :1234
 KEEP_IMAGE=1 ./qemu.sh      # reuse the existing images instead of rebuilding them
+KOI_SPLIT=1 ./qemu.sh       # boot the two-partition layout the installer writes
 ```
 
-Two images, because one device of a kind never exercises the code that handles two. `esp.img` is
-the system volume on an emulated SATA disk; `stick.img` is presented as a USB stick, so the mass
-storage driver has something to enumerate and the drive-letter code has more than one volume to
-hand out.
+Three images, on three different kinds of controller, because one device of a kind never
+exercises the code that handles two. `esp.img` is the system volume on an emulated SATA disk;
+`stick.img` is presented as a USB stick, so the mass storage driver has something to enumerate;
+and `nvme.img` is an NVMe drive carrying a real GPT with two partitions — one FAT, one
+deliberately left as raw bytes, so that "a partition we cannot read" is a case being tested
+rather than dead code that looks like it works.
+
+`KOI_SPLIT=1` builds the boot disk the way `setup` lays it out — the loader on its own EFI System
+Partition and the system on a second one, with the loader's getting no drive letter. Off by
+default, because a quick-formatted USB stick is a single volume and that is how this has actually
+been booted on real hardware. Both need testing; neither is "the" configuration.
 
 For the same reason there are **two xHCI controllers**, with the keyboard on one and the stick on
 the other. That is what the first real machine turned out to look like — a chipset controller and
@@ -397,6 +485,16 @@ by default. If no volume matches, none is assigned: the prompt reads `?:\>` and 
 
 Booting from a SATA disk the AHCI driver can see works too. Either way, putting Koi-DOS on the
 EFI partition of a system you care about is not recommended, since it can write.
+
+To install it, boot from the stick and run `setup`. It asks which disk, shows the licence and the
+layout it is about to write, and requires the disk to be typed back by name before it touches
+anything. **It replaces the whole partition table of the disk it is given** — there is no
+dual-boot install yet, so it takes the disk or nothing. It refuses outright to touch the device
+it is running from, which is the one mistake nothing could recover from.
+
+The media needs `EFI\BOOT\BOOTX64.EFI`, `BOOT\KERNEL.ELF`, the programs in `BIN\`, and `LICENSE`
+at the root — setup will not proceed without the last one, because agreeing to a licence it
+cannot show you would be theatre.
 
 Two commands earn their keep here, because a machine that misbehaves in the field has no serial
 cable attached. `mem` says what each driver actually found; `pci` lists every function on the
@@ -448,11 +546,12 @@ kernel/
   rtc.c                CMOS clock, and FAT timestamp packing
   string.c             mem*/str*, and the glob matcher
   io.h                 port I/O
-  timer.c              PIT, polled
+  timer.c              the millisecond tick: PIT while polling, Local APIC once it is up
   pci.c                PCI enumeration
   ahci.c               SATA/AHCI disk I/O
   nvme.c               NVMe queues, Identify, read/write
   hpet.c               the HPET, as a monotonic clock
+  apic.c               Local APIC timer and I/O APIC interrupt routing
   xhci.c               USB 3 controller, HID boot keyboard and mass storage
   block.c              sector-device abstraction over any controller
   partition.c          GPT / MBR / whole device, and drive letters
@@ -465,7 +564,8 @@ programs/
   koi.h                the interface programs are written against
   start.c              _start, calls main, turns its return into an exit
   program.ld           linker script, fixed at 16 MiB
-  hello.c cat.c save.c ls.c color.c
+  hello.c cat.c save.c ls.c color.c demo.c show.c
+sdk/                   the four files a program needs, plus koicc
 legacy/                the old UEFI Boot Services shell, kept for reference
 linker.ld              kernel layout, fixed at 1 MiB
 qemu.sh                image build + QEMU launch

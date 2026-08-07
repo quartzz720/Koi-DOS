@@ -19,15 +19,24 @@ runs programs loaded off that disk:
 ```
 KOI DOS KERNEL
 MEMORY ALLOC FREE: OK
-MEMORY FREE: 1992 MB
+MEMORY FREE: 1970 MB
 CPU: GDT IDT PIC READY
 PAGING: IDENTITY MAP 16384 MB
 HEAP: 1023 KB, SELF TEST OK
 KEYBOARD: PS/2 READY
 TIMER: PIT POLLING 1000 HZ
-PCI: 6 DEVICES
-AHCI: DISK 64 MB
-VOLUMES: 1 FAT32 OF 1
+APIC: LOCAL AT 0x00000000FEE00000, IO AT 0x00000000FEC00000
+APIC: TIMER 62652 KHZ, CALIBRATED
+TIMER: LOCAL APIC, INTERRUPT DRIVEN
+TIMER: 100 HPET MS COUNTED AS 100 MS WITHOUT POLLING
+KEYBOARD: MOVED TO THE IO APIC
+PCI: 9 DEVICES
+AHCI: DISK 192 MB
+NVME: DISK 128 MB
+XHCI: 2 OF 2 CONTROLLERS
+XHCI: 2 OF 16 PORTS IN USE, KEYBOARD, STORAGE
+VOLUMES: 4 FAT32 OF 4
+SYSTEM VOLUME: KOI-DOS - the loader's partition has no drive letter
 
 Z:\> hello
 Hello from a Koi-DOS program.
@@ -38,6 +47,11 @@ Z:\> save notes.txt written by a koi dos program
 28 bytes written to notes.txt
 ```
 
+Almost every line of that log is a claim being checked rather than a step being announced. The
+memory figure comes from an allocate-and-free round trip, the heap from a self test, and the two
+timer lines are one clock measuring another — the second of them is the measurement the polled
+PIT could not make at all.
+
 `dir` (with `/w`), `cd`, `type`, `more`, `tree`, `attrib`, `copy`, `del`, `ren`, `md`, `rd`,
 `vol`, `mem`, `date`, `time`, `echo`, `ver`, `cls` and `help` all work, plus `Z:` to change
 drive. Patterns work where they should: `dir *.exe`, `copy *.txt backup`, `del *.bak`.
@@ -47,6 +61,17 @@ driver found — PCI device count, block devices by name, volumes by letter, and
 drivers claimed something — because the alternative to reading that off the screen is rebooting
 with a serial cable attached. `ver` carries a build number taken from the commit count, with a
 `+` on the hash when the tree was dirty, so a screenshot identifies the kernel that produced it.
+
+The hardware and installation commands are `pci`, `disk`, `format`, `part`, `setup`, `shutdown`
+and `reboot`. `disk` lists every partition including the ones with no filesystem this system
+understands, because "no drive letter" and "empty" are not the same thing and an installer that
+confuses them destroys data. `part` writes a GPT, `format` writes FAT32, and `setup` ties them
+together into an installation the machine can boot on its own. The destructive ones require the
+partition or disk to be typed back by name before they proceed — `y` is too easy to press by
+reflex — and all of them refuse outright to touch the device the system is running from.
+
+`shutdown` and `reboot` go through ACPI. There is no other way: the power button is a request to
+the firmware rather than something software can press, and the APM calls are long gone.
 
 Counting installed memory needed an allowlist of EFI memory types rather than "everything that
 is not a device window". Firmware uses type 0 for both RAM held back and address space that is
@@ -75,11 +100,15 @@ ExitBootServices()          ← no UEFI call is legal past this point
     ↓
 kernel_main(BOOT_INFO*)     ← boot/bootloader.c: jump_to_kernel()
     ↓
-    serial → memory → console → GDT → IDT → PIC → sti
+    serial → memory → console → graphics → GDT → IDT → PIC → sti
     ↓
-    paging → heap → ACPI → keyboard → timer
+    paging → heap → ACPI → keyboard → PIT
     ↓
-    PCI scan → AHCI → block layer → partitions → FAT32 mount
+    HPET → Local APIC → interrupt-driven tick → IRQs onto the I/O APIC
+    ↓
+    PCI scan → AHCI → NVMe → every xHCI controller
+    ↓
+    block layer → partitions → FAT32 mount → find the system volume
     ↓
     command_run(): prompt, read a line, dispatch
 ```
@@ -115,11 +144,12 @@ the whole span is what initialises `.bss`, which has no presence in the file at 
 | [kernel/heap.c](kernel/heap.c) | `kmalloc`/`kfree` over the page allocator |
 | [kernel/console.c](kernel/console.c) | Framebuffer text console |
 | [kernel/font.c](kernel/font.c) | 8×16 font on the CP437 code page |
+| [kernel/graphics.c](kernel/graphics.c) | Drawing primitives, and the screen a program can take |
 | [kernel/keyboard.c](kernel/keyboard.c) | PS/2 keyboard on IRQ1 |
 | [kernel/acpi.c](kernel/acpi.c) | RSDP/XSDT walk, hardware-presence questions |
 | [kernel/string.c](kernel/string.c) | `memset`, `memcpy`, `memmove`, `memcmp`, `strlen`, `strcmp` |
 | [kernel/io.h](kernel/io.h) | Port I/O: `inb`/`outb`/`inl`/`outl` |
-| [kernel/timer.c](kernel/timer.c) | PIT channel 0, 1000 Hz, polled without interrupts |
+| [kernel/timer.c](kernel/timer.c) | The millisecond tick: PIT while polling, Local APIC once it is up |
 | [kernel/rtc.c](kernel/rtc.c) | CMOS wall clock, and FAT timestamp packing |
 | [kernel/pci.c](kernel/pci.c) | PCI enumeration; drivers look themselves up |
 | [kernel/ahci.c](kernel/ahci.c) | SATA/AHCI, IDENTIFY, `disk_read` / `disk_write` |
@@ -319,20 +349,58 @@ dropped, so two different long names cannot collapse onto the same short one.
 
 One invariant governs the write side: **every copy of the allocation table is written, always**.
 FAT32 keeps two by default, and a volume whose second copy disagrees with the first is one that
-`chkdsk` — or the next system to mount it — calls corrupt. `write_fat_entry()` is the only
-function that touches the table, and it loops over all copies. The top four bits of each entry
-are reserved and are preserved rather than zeroed.
+`chkdsk` — or the next system to mount it — calls corrupt. The held sector belongs to every copy
+at once and `fat_flush()` writes it to all of them, so the copies cannot drift apart by any route
+through this code. The top four bits of each entry are reserved and are preserved rather than
+zeroed.
 
-The FSInfo free-cluster hint is refreshed after every change. It is advisory, since the FAT is
-authoritative, but a stale value makes other systems report nonsense free space.
+The FSInfo free-cluster hint is refreshed whenever it actually moves. It is advisory, since the
+FAT is authoritative, but a stale value makes other systems report nonsense free space.
 
 Two ordering decisions worth knowing:
 
-- A newly allocated cluster is zeroed before use. It still holds whatever was there before, and
-  for a directory that would read as a screenful of garbage entries.
+- A newly allocated **directory** cluster is zeroed before use — it still holds whatever was
+  there before, and that would read as a screenful of garbage entries. A file's cluster is not:
+  nothing can read past a file's recorded size, and clearing every cluster before writing over it
+  would mean writing the whole volume twice.
 - `fat32_rename()` writes the new directory entry **before** erasing the old one. If the machine
   dies in between, the result is one file reachable by two names — recoverable. The other order
   would lose the data outright.
+
+### Speed, which turned out to be a correctness question
+
+Four things here were slow enough to look like faults, and none of them could show on a 64 MB
+test image. They are recorded because each is a shape worth recognising rather than a number
+worth tuning.
+
+**The cluster size was chosen backwards.** The old rule was "the smallest cluster that is still
+legal FAT32", on the argument that a small cluster wastes less on a short file. That argument
+stops holding somewhere around a gigabyte. A 223 GB partition came out with 1 KiB clusters — 234
+million of them, described by a table 936 MiB long, of which FAT32 keeps two. Nothing downstream
+recovers from that. It is now chosen from the volume's size the way every other formatter does
+it: 32 KiB above 32 GB, which turns those 234 million clusters into 7.3 million and that table
+into 55 MiB for the pair.
+
+**Free space was counted by walking the whole table, and the count was discarded constantly.**
+`write_fat_entry` invalidated it on every allocation while the FSInfo refresh asked for it after
+every write, so copying one file rescanned the entire table once per cluster. It is the same
+reason `dir` used to freeze for a minute: it prints the listing, *then* asks for the free figure.
+The count is now adjusted by one cluster when an entry changes, seeded from FSInfo at mount so
+the full count usually never runs, and the count that remains reads 64 KiB per command.
+
+**One sector of the allocation table is held in memory per volume.** 128 clusters share a
+512-byte sector, so a chain walks over the same sector again and again; going to the disk for
+each entry cost four commands per cluster for a sector that was about to be needed again. The
+cache is write-back, and every public operation that can dirty it flushes before returning — so
+the disk is only ever allowed to be behind *within* one operation, never between two.
+
+**Whole sectors go straight to and from the caller's buffer**, as many at a time as the cluster
+holds, rather than through a scratch sector one at a time. Only a partial sector at either end is
+bounced. Every driver underneath splits a long request itself, so the block layer was always
+willing; the filesystem simply never asked.
+
+Together: a 16 MB file from a USB stick to NVMe did not finish in three minutes before, and takes
+five seconds now.
 
 ### Verification
 
@@ -364,6 +432,36 @@ An unhandled exception paints a panic screen with the vector, error code, `CR2` 
 dump, and writes the same thing to COM1. Before this existed, any fault triple-faulted into a
 silent reboot.
 
+### Time, and which timer does what
+
+Two clocks, with a deliberate division of labour that is the standard one. The **Local APIC timer
+is the source of events**: on the processor die, so programming and reading it is cheap, and
+per-CPU, which means its tick would need no locking if this ever grew a second processor. The
+**HPET is the source of time**: out on the chipset, so every counter read is a slow bus round
+trip, but monotonic and independent of the processor's clock — exactly what is needed to measure
+how fast the APIC timer actually runs, since that frequency is not discoverable on AMD hardware.
+
+Neither is trusted blindly. The HPET is refused if its declared tick period is implausible or its
+counter is not advancing — a stopped counter is worse than no counter, because every delay
+written against it hangs forever. And the two clocks are checked against each other at boot: a
+tick period misread by a factor of a thousand looks perfectly reasonable in isolation and is
+obvious the moment it is compared.
+
+**The polled PIT was losing time, and the comparison is what found it.** A 16-bit counter
+reloading every millisecond can only show movement inside one period, so any stretch of work that
+did not stop to poll subtracted itself from the clock — 100 ms once read back as 0. The
+interrupt-driven tick is the fix, and the same measurement now reads 100.
+
+Switching over has to happen all at once. The end-of-interrupt must follow the delivery, or the
+APIC believes an interrupt is still in service and stops delivering that priority; the keyboard
+IRQ has to move to the I/O APIC in the same breath or it silently stops arriving; and the 8259 is
+masked entirely rather than left half-live.
+
+Three things the current code is honest about not having: the xHCI interrupt is not routed, so a
+USB keystroke is collected on the timer tick rather than delivered; USB devices are enumerated
+once at boot, so plugging a stick in afterwards does nothing until a reboot; and devices behind a
+**hub** are invisible, because the route string is hardcoded to zero.
+
 ### Console
 
 Text is drawn into a back buffer in ordinary RAM and copied out a rectangle at a time. Scrolling
@@ -378,6 +476,50 @@ the familiar `0x00RRGGBB`. Reading that backwards swaps red and blue.
 
 The font in `font.c` was written for this project rather than imported: the bitmap fonts that
 ship on a typical Linux box are GPL, which does not fit this project's licence.
+
+### Graphics
+
+There is no mode switching, and there cannot be. UEFI chose the resolution before
+`ExitBootServices` and the GOP is gone afterwards, so "graphics mode" here means the console
+stops drawing and something else starts. A program calls `graphics_enter`, gets a buffer the size
+of the display, draws, calls `graphics_present` to put a finished frame up, and `graphics_leave`
+to give the screen back.
+
+Three parts of that handover are the design rather than details, and each was a defect first:
+
+- **The console keeps its back buffer the whole time.** Leaving is a repaint, not a redraw.
+  Nothing the shell had on screen is lost, and text printed *during* graphics mode simply appears
+  when the screen comes back.
+- **`present()` in `console.c` returns early while a program holds the screen.** Without it the
+  caret alone blinks a hole in every picture — waiting for a keypress is the last thing a
+  graphics program does, and showing the caret is what waiting does.
+- **The shell takes the screen back whether or not the program did.** A program that returns
+  while still holding it would leave the shell invisible with no way to ask for it back. That is
+  the failure DOS programs were famous for, and it is prevented in the one place that always
+  runs.
+
+Primitives live in the kernel and are reached by system call, and the program is *also* handed a
+raw pointer to the buffer. Both, deliberately: the calls mean a program need not know how a pixel
+is laid out, and the pointer means it need not pay a system call per pixel when it does know.
+This is a ring-0 monolith; pretending the buffer is out of reach would only make drawing slow
+without making anything safer.
+
+Colours are built by `graphics_color` rather than assembled by hand, for the reason the console
+section gives — the channel order differs between machines, and code that guesses is wrong on
+half of them. The gradient across the top of `demo` exists to make exactly that visible.
+
+Every primitive clips. Drawing off the edge is what a program does while it is being written, and
+a layer that treats it as an error either refuses to draw anything or writes past the buffer.
+
+`show` reads BMP because it is the one image format that needs no decoder: no compression to
+undo, no entropy coding, no tables. PNG would need inflate and JPEG a discrete cosine transform,
+and neither belongs in the first thing that puts a picture on a screen. `BI_RGB` and
+`BI_BITFIELDS` with the ordinary BGRA masks are read; anything else says what it is and stops,
+because an image drawn from a format that was not understood is worse than no image. The file is
+read forwards exactly once, with no seeking, which a BMP does not need.
+
+Both were checked by screenshot taken from outside the guest — QEMU's `screendump` writes a PPM —
+rather than by looking at them.
 
 ### Keyboard
 
@@ -466,8 +608,11 @@ than the kernel's, and with the double-fault stack in place even that is reporte
 rebooting the machine.
 
 The shell tries its built-in commands first and treats anything left over as a file to load,
-appending `.EXE` if the user did not. The search order is the current directory then the root of
-the drive — a two-entry PATH, which is as much as a system without one needs.
+appending `.EXE` if the user did not. The search order is the current directory, then the root of
+the drive, then `\BIN` — a three-entry PATH, which is as much as a system without one needs.
+`\BIN` is where an installation puts them: the root of the system volume is for the user's files,
+and a pile of `.EXE` in it turns `dir` into a search. Built-in commands stay built in; only
+programs live there.
 
 ### Wildcards
 
@@ -505,9 +650,35 @@ step with the C convention, so the stub shifts them all along by one. The shifts
 that order; each reads a register the next overwrites. Getting that wrong was a real bug during
 development, caught because the fourth argument silently destroyed the third.
 
-The calls cover console I/O, file open/read/write/close, directory enumeration, arguments and
-exit. `ls.EXE` exists to prove the enumeration calls are enough to write a directory listing as
-an ordinary program, with no privilege the shell does not also lack.
+The calls cover console I/O, file open/read/write/close, directory enumeration, arguments, exit,
+what the system knows about itself, and taking the screen. `ls.EXE` exists to prove the
+enumeration calls are enough to write a directory listing as an ordinary program, with no
+privilege the shell does not also lack.
+
+Relative paths resolve from where the shell was standing, not from the root of the drive. The
+syscall layer is told both the volume and the directory — `syscall_set_location` — because being
+told only the volume is what made `ls` list the root wherever the user was, and `cat FILE.TXT`
+work only from it.
+
+The convention carries four arguments and a line needs five numbers, so a graphics point travels
+as a pair packed into one 64-bit word. Widening the convention for one call would have left every
+other call working around the change; the SDK wrappers hide the packing entirely, and a program
+written against them never sees it.
+
+**Programs are stamped with the interface version they were built against**, in a `.koi_abi`
+section the linker script places at the load address, and the kernel reads it before deciding to
+run anything. The check runs in both directions, and the second half is the surprising one. A
+program built for a *newer* interface would call functions this kernel does not have — obvious.
+A program built for an *older* one is refused too, while the interface is still ALPHA, because
+function numbers may have been reused since: a program calling a number that has changed meaning
+does not fail, it quietly does the wrong thing. `KOI_ABI_MINIMUM` is what makes that a decision
+rather than a rule; the day the numbering is frozen it stops moving, and from then on function
+numbers are never reused — a removed call leaves a hole.
+
+The SDK in [sdk/](sdk/) is the same four files programs here are built from, refreshed by the
+build so the two cannot drift apart. **DOSFETCH** lives outside this repository on purpose and is
+built with nothing but the SDK: if it stops building, the SDK is broken for everybody rather than
+only for programs that happen to sit in this tree.
 
 ### Configuration
 
@@ -577,39 +748,24 @@ virtual FAT is FAT16, and a FAT32 driver of our own could never be tested agains
 with `-m 2G` on purpose — at 256 MiB no allocation ever lands above 4 GiB, which is exactly the
 condition under which truncated DMA addresses stay invisible.
 
+## Installation
+
+`setup` lays down two partitions: an EFI System Partition for the loader, and a system partition
+for everything else. Two rather than one because every other operating system does it that way,
+and because it removes a migration that would otherwise have to happen later.
+
+The loader's partition gets **no drive letter at all**. That is not security — any other
+operating system sees an ordinary partition — but it does mean a stray `del` cannot reach the
+files the machine needs to start, which is the accident worth preventing. The kernel finds the
+system volume instead by looking for `\BOOT\KOIDOS.SYS` on the device it booted from, and only on
+that device: a marker on some other disk describes some other installation.
+
+It was verified the only way that means anything — installing to a blank disk, removing the
+media, and booting the machine from what was written.
+
 ## What comes next
 
-Graphics, then audio and networking.
-
-### Time, and which timer does what
-
-Two clocks, with a deliberate division of labour that is the standard one. The **Local APIC timer
-is the source of events**: on the processor die, so programming and reading it is cheap, and
-per-CPU, which means its tick would need no locking if this ever grew a second processor. The
-**HPET is the source of time**: out on the chipset, so every counter read is a slow bus round
-trip, but monotonic and independent of the processor's clock — exactly what is needed to measure
-how fast the APIC timer actually runs, since that frequency is not discoverable on AMD hardware.
-
-Neither is trusted blindly. The HPET is refused if its declared tick period is implausible or its
-counter is not advancing — a stopped counter is worse than no counter, because every delay
-written against it hangs forever. And the two clocks are checked against each other at boot: a
-tick period misread by a factor of a thousand looks perfectly reasonable in isolation and is
-obvious the moment it is compared.
-
-**The polled PIT was losing time, and the comparison is what found it.** A 16-bit counter
-reloading every millisecond can only show movement inside one period, so any stretch of work that
-did not stop to poll subtracted itself from the clock — 100 ms once read back as 0. The
-interrupt-driven tick is the fix, and the same measurement now reads 100.
-
-Switching over has to happen all at once. The end-of-interrupt must follow the delivery, or the
-APIC believes an interrupt is still in service and stops delivering that priority; the keyboard
-IRQ has to move to the I/O APIC in the same breath or it silently stops arriving; and the 8259 is
-masked entirely rather than left half-live.
-
-Three things the current code is honest about not having: the xHCI interrupt is not routed, so a
-USB keystroke is collected on the timer tick rather than delivered; USB devices are enumerated
-once at boot, so plugging a stick in afterwards does nothing until a reboot; and devices behind a
-**hub** are invisible, because the route string is hardcoded to zero.
+Audio and networking.
 
 ## Historical
 
