@@ -14,6 +14,8 @@
 #include "pci.h"
 #include "xhci.h"
 #include "graphics.h"
+#include "audio.h"
+#include "hda.h"
 #include "build.h"
 #include "string.h"
 
@@ -145,6 +147,14 @@ static long do_free(long address) {
 void syscall_close_all(void) {
     memset(handles, 0, sizeof(handles));
     memset(searches, 0, sizeof(searches));
+    /* Sound first, and this one is not tidiness.
+     *
+     * A voice holds a pointer into the program's own memory and the mixer
+     * reads it from the timer interrupt. Leave one playing past the program
+     * that started it and the mixer keeps reading an address that now belongs
+     * to something else - which is not a wrong noise, it is a wrong noise
+     * arriving a thousand times a second forever. */
+    audio_stop_all();
     /* Anything the program still held goes back, whether or not it asked. */
     for (int slot = 0; slot < BLOCK_MAX; slot++) {
         if (!blocks[slot].address) continue;
@@ -333,6 +343,10 @@ static long system_info(long item, long index) {
         VOLUME* volume = volume_at((boot_uint32_t)index);
         return volume ? volume->is_boot_volume : SYSCALL_ERROR;
     }
+    case KOI_INFO_AUDIO:
+        return audio_ready() ? 1 : 0;
+    case KOI_INFO_AUDIO_RATE:
+        return audio_ready() ? (long)HDA_RATE : 0;
 
     default:
         return SYSCALL_ERROR;
@@ -364,6 +378,9 @@ static long system_text(long item, long index, char* buffer, long size) {
         source = volume->label;
         break;
     }
+    case KOI_TEXT_AUDIO_DEVICE:
+        source = audio_device_name();
+        break;
     default:
         return SYSCALL_ERROR;
     }
@@ -574,6 +591,34 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
     case SYS_GFX_LEAVE:
         graphics_leave();
         return 0;
+
+    case SYS_SOUND_PLAY: {
+        const KOI_SOUND* sound = (const KOI_SOUND*)(unsigned long long)a;
+        if (!sound) return SYSCALL_ERROR;
+        return audio_play(sound->samples, sound->frames, sound->rate,
+                          sound->bits, sound->channels, sound->volume,
+                          sound->pan, (int)sound->loop);
+    }
+
+    case SYS_SOUND_TONE:
+        return audio_tone((boot_uint32_t)a, (boot_uint32_t)b, (int)c);
+
+    case SYS_SOUND_STOP:
+        /* -1 means all of them, which is what a program wants when it is
+           shutting down and does not want to have kept a list. */
+        if (a < 0) audio_stop_all();
+        else audio_stop((int)a);
+        return 0;
+
+    case SYS_SOUND_PARAMS:
+        return audio_set_params((int)a, (int)b, (int)c);
+
+    case SYS_SOUND_ACTIVE:
+        return audio_active((int)a) ? 1 : 0;
+
+    case SYS_SOUND_VOLUME:
+        if (a >= 0) audio_set_volume((int)a);
+        return audio_volume();
 
     case SYS_GFX_PRESENT:
         graphics_present();

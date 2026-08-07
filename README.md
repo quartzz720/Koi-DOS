@@ -58,6 +58,7 @@ KEYBOARD: MOVED TO THE IO APIC
 PCI: 9 DEVICES
 AHCI: DISK 192 MB
 NVME: DISK 128 MB
+AUDIO: QEMU CODEC, 48 KHZ STEREO
 XHCI: 2 OF 2 CONTROLLERS
 XHCI: 2 OF 16 PORTS IN USE, KEYBOARD, STORAGE
 VOLUMES: 4 FAT32 OF 4
@@ -104,6 +105,7 @@ make at all, because it used to read 100 ms as 0.
 | `part <disk>` | replace the partition table — destroys the whole disk |
 | `setup` | install Koi-DOS onto a disk |
 | `shutdown`, `reboot` | through ACPI, which is the only way there is |
+| `beep [hz] [ms]` | a tone, if the machine has a sound device |
 | `echo`, `ver`, `cls`, `help` | the usual |
 | `Z:` | change drive |
 
@@ -131,6 +133,7 @@ PCI devices     : 9
 Disks           : 3  ahci0, nvme0, usb0
 Volumes         : 3  Z:, Y:, X:
 USB             : keyboard, storage (2 of 16 ports in use)
+Audio           : QEMU codec, 48 kHz stereo
 ```
 
 `ver` carries a build number, which during development is worth more than the version — two
@@ -196,6 +199,40 @@ Z:\> color /b black        just the background
 Z:\> color yellow blue     text and background
 ```
 
+### Sound
+
+**HD Audio**, because AC'97 is emulated everywhere and fitted to nothing: every machine this
+could run on has an HDA controller, and QEMU emulating the easy one as well is a trap rather than
+a shortcut.
+
+The driver does one thing — it finds a codec, traces a path from a physical output jack back
+through whatever mixers and selectors are in the way to a converter, unmutes every step of it,
+and leaves a single stream of 48 kHz stereo running over a ring of memory forever. It never
+starts or stops: a stream started per sound clicks, and one that always runs does not.
+
+Everything above that is [kernel/audio.c](kernel/audio.c), which has no hardware in it. Sixteen
+voices, each with its own rate, volume and pan, resampled into the ring in 32.32 fixed point —
+there is no floating point anywhere, because nothing configures SSE state after
+`ExitBootServices`.
+
+**The mixer runs from the timer interrupt.** Not for precision: forty-eight frames a millisecond
+is nothing. It is because the alternative is mixing wherever the system happens to be looping,
+and the moment a program stops making system calls — a game rendering a frame, a copy grinding
+through a large file — the sound would stop with it. Measured: a tone held through a graphics
+program starting, drawing and exiting, with not one silent 20 ms block in it.
+
+**[K-DOOM](https://github.com/quartzz720/K-DOOM) is the first thing to use it**, and it needed
+exactly one addition to do so: `SYS_SOUND_PARAMS`, which changes a sound that is already playing.
+DOOM calls it every tic for every sound whose source has moved relative to the player, and
+without it a rocket stays where it was fired.
+
+The whole path was checked from outside the guest rather than by ear. QEMU records what the
+machine played into a file, and the file is measurable where a noise in the room is not: a tone
+asked for as 440 Hz for one second measures as 440 Hz for 1.000 seconds; six pistol shots in DOOM
+land at the six moments the keys were sent, each the length `DSPISTOL` is at 11025 Hz, because a
+wrong sample rate shows up as a wrong duration; and a sound panned from one side to the other
+comes out silent in the far channel at each end and full in both at the centre.
+
 ### Writing programs without the kernel source
 
 [sdk/](sdk/) holds the four files a program needs — the header, the entry stub,
@@ -244,9 +281,9 @@ Programs write that file; the kernel reads it. Neither reaches into the other.
 ### System calls
 
 Programs call the kernel with `int 0x40`, in the spirit of DOS's INT 21h. `RAX` holds the
-function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Thirty-seven calls cover
+function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Forty-two calls cover
 console I/O, files, directory enumeration, the command line, exit codes, what the system knows
-about itself, and taking the screen; they are listed in
+about itself, taking the screen and making a noise; they are listed in
 [include/syscall.h](include/syscall.h), which the kernel and every program include from the same
 copy so the two cannot drift apart. That file also names the keys that have no ASCII value — the
 arrows and the function keys — because a program that reads them has to name them, and two copies
@@ -267,6 +304,14 @@ idea when it stopped being — so anything where that matters, walking forward o
 holding a button, needs events rather than characters. Both drivers had the information all along
 and were discarding it one line before it could be delivered. The identity reported is the
 unshifted one, so a key reads the same going down as coming up.
+
+`SYS_SOUND_PLAY` and `SYS_SOUND_TONE` put something into the one stream that is always running.
+There is nothing to open and nothing to wait for: a call hands back a voice, or -1 when every
+voice is busy or the machine has no sound hardware. **The samples are not copied**, which is what
+makes firing the same effect twenty times a second free — and it is why every voice is stopped
+when a program exits. A voice holds a pointer into the program's memory and the mixer reads it
+from the timer interrupt; left running past its program, it would not make a wrong noise once, it
+would make one a thousand times a second forever.
 
 `SYS_ALLOC` and `SYS_FREE` give a program whole pages beyond its own image. Not a malloc and not
 meant to be one: a program that wants small objects takes one large block and divides it itself.
@@ -549,6 +594,12 @@ it, which is where `Device or resource busy` came from.
 
 It also picks up `GAMES.EXE` and `DOSFETCH.EXE` from the sibling projects when they are checked
 out next to this one, so one command refreshes everything.
+
+DOOM is carried the same way but not into `\BIN`: a program with data files gets a directory of
+its own, so `DOOM.EXE` and its WAD land together in `\DOOM`. The WAD is looked for beside the
+port and then in a copy of the game next to it, is skipped when the one on the stick is already
+that size — eleven megabytes over USB is worth not doing twice — and is in no repository, here
+or there. If none is found, DOOM goes across anyway and the script says where to put yours.
 
 The bootloader records the FAT volume serial of the device it was loaded from, and the kernel
 matches on it rather than assuming the first FAT volume it finds is the right one. That

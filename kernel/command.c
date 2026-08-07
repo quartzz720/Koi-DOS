@@ -9,6 +9,7 @@
 #include "pci.h"
 #include "block.h"
 #include "xhci.h"
+#include "audio.h"
 #include "graphics.h"
 #include "fat32.h"
 #include "partition.h"
@@ -362,6 +363,7 @@ static void command_help(void) {
     print_line("date           show the date");
     print_line("time           show the time");
     print_line("echo [text]    print text");
+    print_line("beep [hz] [ms] a tone, if there is a sound device");
     print_line("ver            show the version");
     print_line("help           this list");
     print_line("");
@@ -465,6 +467,57 @@ static void command_mem(void) {
         print_dec(xhci_port_count());
         print_line(" ports in use)");
     }
+
+    print("Audio           : ");
+    if (audio_ready()) {
+        print(audio_device_name());
+        print_line(" codec, 48 kHz stereo");
+    } else {
+        print_line("no device");
+    }
+}
+
+/* A plain decimal number, or `fallback` when the text is not one. Small and
+   local because the shell has no general number parsing and one command
+   asking for two integers does not justify inventing it. */
+static boot_uint32_t decimal(const char* text, boot_uint32_t fallback) {
+    boot_uint32_t value = 0;
+    int digits = 0;
+
+    if (!text) return fallback;
+    while (*text >= '0' && *text <= '9') {
+        value = value * 10 + (boot_uint32_t)(*text++ - '0');
+        if (value > 1000000U) return fallback;
+        digits++;
+    }
+    if (!digits || *text) return fallback;
+    return value;
+}
+
+static void command_beep(const ARGUMENTS* arguments) {
+    boot_uint32_t hertz = 880;
+    boot_uint32_t milliseconds = 200;
+
+    if (!audio_ready()) {
+        print_line("No sound device.");
+        return;
+    }
+    /* 880 Hz for a fifth of a second by default - close enough to the note a
+       PC speaker made that it is recognisable, and short enough not to be
+       tiresome when it is the thing being tested. */
+    if (arguments->operand_count > 0)
+        hertz = decimal(arguments->operand[0], 880);
+    if (arguments->operand_count > 1)
+        milliseconds = decimal(arguments->operand[1], 200);
+
+    if (hertz < 20 || hertz > 20000) {
+        print_line("Usage: beep [hertz 20-20000] [milliseconds]");
+        return;
+    }
+    if (milliseconds > 10000) milliseconds = 10000;
+
+    if (audio_tone(hertz, milliseconds, 180) < 0)
+        print_line("Every voice is busy.");
 }
 
 static void print_hex(boot_uint64_t value, int digits) {
@@ -2239,6 +2292,7 @@ static void execute(const char* input) {
     if (word_is(input, "DATE")) { command_date(); return; }
     if (word_is(input, "TIME")) { command_time(); return; }
     if (word_is(input, "VER")) { command_ver(); return; }
+    if (word_is(input, "BEEP")) { command_beep(&arguments); return; }
     if (word_is(input, "HELP")) { command_help(); return; }
     /* `echo.` prints a blank line - the DOS idiom for one, since a bare
        `echo` prints the on/off state instead. */

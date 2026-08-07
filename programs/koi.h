@@ -329,6 +329,69 @@ static inline void koi_gfx_text(int x, int y, const char* text,
                     background);
 }
 
+/* ---- Sound ---------------------------------------------------------------
+ *
+ * There is nothing to open. One stream of 48 kHz stereo is always running and
+ * these put things into it; a call returns a voice, or -1 when every voice is
+ * busy or the machine has no sound hardware. Nothing here blocks - a sound
+ * plays while the program gets on with something else, and koi_sound_active
+ * is how to find out whether it has finished.
+ *
+ * The samples are not copied. Keep the buffer where it is until the sound has
+ * finished, which is what makes firing the same effect twenty times a second
+ * cost nothing.
+ */
+static inline int koi_sound_play(const KOI_SOUND* sound) {
+    return (int)koi_call(SYS_SOUND_PLAY, (long)sound, 0, 0);
+}
+
+/* The one-line version, for a sound with no panning and no looping. */
+static inline int koi_sound_play_simple(const void* samples,
+                                        unsigned int frames,
+                                        unsigned int rate, int bits,
+                                        int channels, int volume) {
+    KOI_SOUND sound;
+    sound.samples = samples;
+    sound.frames = frames;
+    sound.rate = rate;
+    sound.bits = (unsigned short)bits;
+    sound.channels = (unsigned short)channels;
+    sound.volume = (unsigned short)volume;
+    sound.pan = 128;
+    sound.loop = 0;
+    sound.reserved = 0;
+    return koi_sound_play(&sound);
+}
+
+static inline int koi_sound_tone(unsigned int hertz,
+                                 unsigned int milliseconds, int volume) {
+    return (int)koi_call(SYS_SOUND_TONE, (long)hertz, (long)milliseconds,
+                         (long)volume);
+}
+
+/* -1 stops everything, which is what to do before returning if the program
+   did not keep a list of what it started. */
+static inline void koi_sound_stop(int voice) {
+    (void)koi_call(SYS_SOUND_STOP, (long)voice, 0, 0);
+}
+
+/* Change a sound that is already playing - what a moving source needs. Pass
+   -1 for either to leave it alone. Returns -1 once the sound has finished,
+   which is an answer rather than a failure. */
+static inline int koi_sound_params(int voice, int volume, int pan) {
+    return (int)koi_call(SYS_SOUND_PARAMS, (long)voice, (long)volume,
+                         (long)pan);
+}
+
+static inline int koi_sound_active(int voice) {
+    return (int)koi_call(SYS_SOUND_ACTIVE, (long)voice, 0, 0);
+}
+
+/* 0 to 255, applied to everything. Pass -1 to ask without changing it. */
+static inline int koi_sound_volume(int volume) {
+    return (int)koi_call(SYS_SOUND_VOLUME, (long)volume, 0, 0);
+}
+
 /* ---- The parts of a C library a program cannot do without ---------------
  *
  * Defined in koilib.c, which koicc compiles in alongside start.c. Not a C

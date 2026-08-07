@@ -53,8 +53,8 @@
  * ONCE THE INTERFACE IS FROZEN, FUNCTION NUMBERS ARE NEVER REUSED. A removed
  * call leaves a hole. This is the promise that makes old programs safe, and it
  * costs nothing to keep - there are 256 numbers and twenty are in use. */
-#define KOI_ABI_VERSION 7
-#define KOI_ABI_MINIMUM 7
+#define KOI_ABI_VERSION 8
+#define KOI_ABI_MINIMUM 8
 #define KOI_ABI_IS_ALPHA 1
 
 /* Every program begins with this, placed at its load address by the linker
@@ -254,12 +254,18 @@ typedef struct {
 #define KOI_INFO_DISK_SECTOR_SIZE 19
 #define KOI_INFO_VOLUME_LETTER 20    /* the drive letter, as a character */
 #define KOI_INFO_VOLUME_IS_BOOT 21
+/* Whether there is anything to play sound through. A program that makes noise
+   has to be able to ask, because every sound call succeeding into silence and
+   every one failing look identical from the inside. */
+#define KOI_INFO_AUDIO 22
+#define KOI_INFO_AUDIO_RATE 23
 
 /* Text items, written into the caller's buffer and always terminated. */
 #define KOI_TEXT_BUILD_DATE 0
 #define KOI_TEXT_BUILD_COMMIT 1
 #define KOI_TEXT_DISK_NAME 2         /* index selects the disk */
 #define KOI_TEXT_VOLUME_LABEL 3      /* index selects the volume */
+#define KOI_TEXT_AUDIO_DEVICE 4      /* the codec, or "none" */
 
 /* Graphics.
  *
@@ -292,6 +298,48 @@ typedef struct {
  * so a caller that knows what it changed need not also know where the edges
  * are. */
 #define SYS_GFX_PRESENT_RECT 0x3A  /* (point, size) */
+
+/* ---- Sound ---------------------------------------------------------------
+ *
+ * One stream of 48 kHz stereo is always running; these put things into it.
+ * There is no call to open or close a device, because there is nothing to
+ * open: a program asks for a sound and gets a voice back, or -1 when every
+ * voice is busy or the machine has no sound hardware.
+ *
+ * A sound's samples are NOT copied. The buffer must stay where it is until the
+ * sound finishes or is stopped - which is what makes firing a sound effect
+ * free rather than a copy of it per shot. Every voice is stopped when the
+ * program exits, so a program that forgets cannot leave the mixer reading
+ * memory that has been handed to something else.
+ */
+#define SYS_SOUND_PLAY 0x40    /* (KOI_SOUND*) -> voice, or -1 */
+#define SYS_SOUND_TONE 0x41    /* (hertz, milliseconds, volume) -> voice, -1 */
+#define SYS_SOUND_STOP 0x42    /* (voice), or -1 for all of them */
+#define SYS_SOUND_ACTIVE 0x43  /* (voice) -> 1 while it is still playing */
+#define SYS_SOUND_VOLUME 0x44  /* (volume 0-255, or -1 to ask) -> volume */
+
+/* Change a sound that is already playing. What a moving source needs: DOOM
+   calls this every tic for every sound whose direction or distance from the
+   player has changed, and without it a rocket that flies past stays where it
+   was fired. Pass -1 for either to leave it alone. */
+#define SYS_SOUND_PARAMS 0x45  /* (voice, volume, pan) -> 0, or -1 */
+
+#define KOI_SOUND_U8 8         /* unsigned bytes, 0x80 is silence */
+#define KOI_SOUND_S16 16       /* signed 16-bit, little endian */
+
+/* What a sound is. Eight things do not fit in four registers, and a
+   descriptor is clearer than packing them two to a word. */
+typedef struct {
+    const void* samples;
+    unsigned int frames;       /* not bytes: a stereo frame is two samples */
+    unsigned int rate;         /* what it was recorded at; resampled for you */
+    unsigned short bits;       /* KOI_SOUND_U8 or KOI_SOUND_S16 */
+    unsigned short channels;   /* 1 or 2 */
+    unsigned short volume;     /* 0-255 */
+    unsigned short pan;        /* 0 left, 128 centre, 255 right */
+    unsigned int loop;         /* non-zero to repeat until stopped */
+    unsigned int reserved;
+} KOI_SOUND;
 
 /* Two coordinates in one argument.
  *

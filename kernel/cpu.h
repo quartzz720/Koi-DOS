@@ -35,6 +35,23 @@ static inline void cpu_enable_interrupts(void) {
     __asm__ volatile ("sti" : : : "memory");
 }
 
+/* Shut interrupts out for a moment and put them back exactly as they were.
+ *
+ * A plain cli/sti pair around a short critical section is wrong in one case
+ * that is easy to reach and hard to see: called with interrupts already off -
+ * from inside another handler, or during start-up before they are first
+ * enabled - the `sti` turns them on early rather than leaving them alone.
+ * Saving the flag makes the pair say what it means. */
+static inline boot_uint64_t cpu_hold_interrupts(void) {
+    boot_uint64_t flags;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+    return flags;
+}
+
+static inline void cpu_release_interrupts(boot_uint64_t flags) {
+    if (flags & 0x200ULL) __asm__ volatile ("sti" : : : "memory");
+}
+
 /* Stop for good: mask interrupts and park the core. Used by the panic screen. */
 /* Restart the machine, by the crudest method that always works.
  *

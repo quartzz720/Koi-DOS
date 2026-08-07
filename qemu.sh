@@ -64,6 +64,28 @@ find_ovmf() {
 OVMF_CODE=${OVMF_CODE:-$(find_ovmf CODE || true)}
 OVMF_VARS=${OVMF_VARS:-$(find_ovmf VARS || true)}
 
+# Sound. An HD Audio controller with one output codec, which is the shape of
+# every machine this could run on - AC'97 is emulated here and exists nowhere
+# else, which makes the easy one a trap.
+#
+# KOI_AUDIO_WAV=out.wav records what the guest played into a file instead of
+# sending it to the speakers. That is how the driver was checked: a sine wave
+# is either at the frequency and amplitude that were asked for or it is not,
+# and a file can be measured where a noise in the room cannot.
+if [ -n "${KOI_AUDIO_WAV:-}" ]; then
+    AUDIO_BACKEND="wav,id=koisnd,path=$KOI_AUDIO_WAV"
+else
+    # Whichever of these the host actually has. `none` last, so a machine with
+    # no sound server still boots rather than refusing on the command line.
+    AUDIO_BACKEND="none,id=koisnd"
+    for driver in pipewire pa alsa; do
+        if qemu-system-x86_64 -audiodev help 2>/dev/null | grep -qx "$driver"; then
+            AUDIO_BACKEND="$driver,id=koisnd"
+            break
+        fi
+    done
+fi
+
 if [ -z "$OVMF_CODE" ] || [ -z "$OVMF_VARS" ]; then
     echo "OVMF firmware not found. Install it (Fedora: edk2-ovmf, Debian/Ubuntu: ovmf," >&2
     echo "Arch: edk2-ovmf) or set OVMF_CODE and OVMF_VARS to its location." >&2
@@ -199,6 +221,9 @@ exec qemu-system-x86_64 \
   -device usb-storage,bus=xhci1.0,drive=stick \
   -drive id=ssd,format=raw,file="$NVME",if=none \
   -device nvme,drive=ssd,serial=KOI0001 \
+  -audiodev "$AUDIO_BACKEND" \
+  -device ich9-intel-hda,id=hda \
+  -device hda-output,bus=hda.0,audiodev=koisnd \
   -serial stdio \
   -net none \
   "$@"

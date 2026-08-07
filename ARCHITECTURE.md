@@ -33,6 +33,7 @@ KEYBOARD: MOVED TO THE IO APIC
 PCI: 9 DEVICES
 AHCI: DISK 192 MB
 NVME: DISK 128 MB
+AUDIO: QEMU CODEC, 48 KHZ STEREO
 XHCI: 2 OF 2 CONTROLLERS
 XHCI: 2 OF 16 PORTS IN USE, KEYBOARD, STORAGE
 VOLUMES: 4 FAT32 OF 4
@@ -145,6 +146,8 @@ the whole span is what initialises `.bss`, which has no presence in the file at 
 | [kernel/console.c](kernel/console.c) | Framebuffer text console |
 | [kernel/font.c](kernel/font.c) | 8×16 font on the CP437 code page |
 | [kernel/graphics.c](kernel/graphics.c) | Drawing primitives, and the screen a program can take |
+| [kernel/hda.c](kernel/hda.c) | Intel HD Audio: the codec graph, and one endless output stream |
+| [kernel/audio.c](kernel/audio.c) | The mixer: voices, resampling, volume. No hardware in it |
 | [kernel/keyboard.c](kernel/keyboard.c) | PS/2 keyboard on IRQ1 |
 | [kernel/acpi.c](kernel/acpi.c) | RSDP/XSDT walk, hardware-presence questions |
 | [kernel/string.c](kernel/string.c) | `memset`, `memcpy`, `memmove`, `memcmp`, `strlen`, `strcmp` |
@@ -547,6 +550,67 @@ read forwards exactly once, with no seeking, which a BMP does not need.
 Both were checked by screenshot taken from outside the guest — QEMU's `screendump` writes a PPM —
 rather than by looking at them.
 
+### Sound
+
+Two files, and the split is the point. [kernel/hda.c](kernel/hda.c) knows about hardware and
+nothing about sound; [kernel/audio.c](kernel/audio.c) knows about sound and nothing about
+hardware. A second sound device would be a third file that fills a ring, not a second mixer.
+
+**HD Audio rather than AC'97.** AC'97 is a much smaller driver and QEMU emulates it, which is
+exactly what makes it a trap: no machine that could run this has one. The audio device in the
+desk this was written at is an AMD HDA controller, and so is every laptop made since about 2005.
+
+The controller is the easy half — two rings and a stream. The codec is not the controller: it is
+a little graph of widgets, converters and mixers and selectors and the physical jacks, and
+getting sound out of it means finding a route through that graph and unmuting every step. The
+driver ranks the output pins by what the codec says they are wired to (line out, then headphones,
+then the built-in speaker, skipping anything with no physical connection), then walks the
+connection lists backwards from that pin until it reaches a converter, unmuting behind itself.
+One muted amplifier anywhere on that path is indistinguishable from a driver that never ran.
+
+**The bug worth writing down.** The controller stops fetching commands once it has produced
+`RINTCNT` responses, and what releases it is software clearing the response bit in `RIRBSTS`. But
+it only ever *sets* that bit if the response interrupt is enabled — so with interrupts off, as
+they are here, the bit never appears, clearing it does nothing, and the command ring stalls after
+exactly one verb. The symptom was a codec that answered once and then went quiet, which reads
+like a mapping or ring-layout mistake and is neither. The fix is to enable the response interrupt
+while leaving the global interrupt enable off: the bit gets set, we clear it, the count resets,
+and no interrupt is ever delivered.
+
+The stream is started once and never stopped. Starting one per sound is where clicks come from,
+and there is nothing to gain: an idle stream plays whatever silence the mixer wrote.
+
+**The mixer runs from the timer interrupt**, which is the one design decision here worth arguing
+about. Mixing from wherever the system is looping is simpler and works right up until a program
+stops making system calls, at which point sound stops with it — a game rendering a frame is
+exactly that case. Forty-eight frames a millisecond is a few microseconds of arithmetic. Voices
+are edited with interrupts held, and released to exactly what they were rather than unconditionally
+enabled, because start-up and interrupt handlers both reach this code with interrupts already
+off.
+
+Sixteen voices, each with a rate, a volume and a pan, resampled in 32.32 fixed point. No floating
+point anywhere: programs and the kernel are both `-mgeneral-regs-only`, since nothing configures
+SSE state after `ExitBootServices`. Nearest-sample rather than interpolated — against effects
+recorded at 11 kHz in 1993 the difference is inaudible and the cost is a second fetch per voice
+per frame.
+
+**A voice holds a pointer into the program's own memory and is not copied.** That is what makes
+firing the same effect twenty times a second free, and it is why every voice is stopped when a
+program exits: left running, the mixer would keep reading an address that now belongs to
+something else, a thousand times a second, forever.
+
+A voice already playing can be retuned - `SYS_SOUND_PARAMS`. That call exists because DOOM asked
+for it: the game adjusts every sound's volume and stereo position every tic as the player moves,
+and without it a rocket stays where it was fired.
+
+Verified from outside the guest rather than by ear, because a file can be measured and a noise in
+the room cannot. QEMU records what the machine played, and four things were checked in it: a tone
+asked for as 440 Hz for one second measures as 440 Hz for 1.000 seconds; a tone held across a
+graphics program starting, drawing and exiting has not one silent 20 ms block in it; six pistol
+shots in DOOM land at the six moments the keys were sent, each the length `DSPISTOL` is at
+11025 Hz, since a wrong sample rate would show as a wrong duration; and a voice panned across
+while playing is silent in the far channel at each end and full in both at the centre.
+
 ### Keyboard
 
 IRQ1, scancode set 1, with shift, ctrl, alt and caps lock. `keyboard_getchar()` idles on `hlt`
@@ -803,7 +867,12 @@ media, and booting the machine from what was written.
 
 ## What comes next
 
-Audio and networking.
+Networking. It is not one project but four: USB plug-and-play first (xHCI interrupt routing,
+hot-plug enumeration, hub support), then a class driver, then a TCP/IP stack, then something that
+uses it. The Wi-Fi half depends on the vendor and may never be worth it.
+
+Sound has its device and its mixer; what it does not have is music. DOOM's is MUS, which needs a
+synthesiser rather than a mixer.
 
 ## Historical
 

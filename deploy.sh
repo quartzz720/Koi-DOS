@@ -11,6 +11,10 @@
 # not format, does not partition, does not touch a boot sector. If the stick
 # needs preparing, do that once by hand - see README.
 #
+# DOOM is carried too when it has been built, into \DOOM rather than \BIN: a
+# program with data files gets a directory of its own, and the WAD goes beside
+# the binary. The WAD is copied here and belongs in no repository.
+#
 #   ./deploy.sh              find the stick, ask, copy
 #   ./deploy.sh -y           do not ask (the checks still run)
 #   ./deploy.sh /dev/sdd     use this device, still checked and still asked
@@ -28,7 +32,7 @@ while [ $# -gt 0 ]; do
         -y|--yes) ASSUME_YES=1 ;;
         -l|--list) LIST_ONLY=1 ;;
         -h|--help)
-            sed -n '2,20p' "$0" | sed 's/^# \?//'
+            sed -n '2,21p' "$0" | sed 's/^# \?//'
             exit 0 ;;
         /dev/*) WANTED=$1 ;;
         *) echo "deploy.sh: do not understand '$1'" >&2; exit 1 ;;
@@ -168,6 +172,25 @@ for extra in ../Games/GAMES.EXE ../DOSFETCH/DOSFETCH.EXE; do
     [ -f "$extra" ] && EXTRA+=("$extra")
 done
 
+# ---- DOOM ----------------------------------------------------------------
+#
+# Not one of the above, because DOOM does not belong in \BIN. A program that
+# carries data files gets a directory of its own, and Koi-DOS resolves a
+# relative path from wherever the shell is standing - so the WAD sitting next
+# to the binary is all the configuration there is.
+#
+# The WAD is looked for beside the port first, then in the copy of the game
+# next door. Only ever a .WAD: `../doom` also holds id's DOS binaries, and
+# those are not ours to carry anywhere.
+DOOM_EXE=""
+DOOM_WAD=""
+[ -f ../K-DOOM/DOOM.EXE ] && DOOM_EXE=../K-DOOM/DOOM.EXE
+if [ -n "$DOOM_EXE" ]; then
+    for wad in ../K-DOOM/*.WAD ../K-DOOM/*.wad ../doom/*.WAD ../doom/*.wad; do
+        [ -f "$wad" ] && { DOOM_WAD=$wad; break; }
+    done
+fi
+
 MODEL=$(printf '%s\n' "$FOUND" | grep "^$DEVICE	" | cut -f3)
 SIZE=$(printf '%s\n' "$FOUND" | grep "^$DEVICE	" | cut -f2)
 LABEL=$(lsblk -no LABEL "/dev/$PARTITION" 2>/dev/null | head -1)
@@ -181,6 +204,13 @@ say "    EFI/BOOT/BOOTX64.EFI"
 say "    BOOT/KERNEL.ELF"
 say "    LICENSE"
 say "    BIN/  ${#PROGRAMS[@]} programs$([ ${#EXTRA[@]} -gt 0 ] && printf ' + %d from sibling projects' "${#EXTRA[@]}")"
+if [ -n "$DOOM_EXE" ]; then
+    if [ -n "$DOOM_WAD" ]; then
+        say "    DOOM/ DOOM.EXE and $(basename "$DOOM_WAD") ($(du -h "$DOOM_WAD" | cut -f1))"
+    else
+        say "    DOOM/ DOOM.EXE, with no WAD to go with it"
+    fi
+fi
 say ""
 say "Nothing is formatted, partitioned or erased. Existing files of the same"
 say "name are replaced; everything else on the stick is left alone."
@@ -245,9 +275,32 @@ for program in "${PROGRAMS[@]}" "${EXTRA[@]:-}"; do
     copy "$program" "$MOUNT/BIN/$name" || die "Copy failed."
 done
 
+if [ -n "$DOOM_EXE" ]; then
+    copy "$DOOM_EXE" "$MOUNT/DOOM/DOOM.EXE" || die "Copy failed."
+    if [ -n "$DOOM_WAD" ]; then
+        WAD_TARGET="$MOUNT/DOOM/$(basename "$DOOM_WAD" | tr 'a-z' 'A-Z')"
+        # Eleven megabytes over USB is worth not doing twice. Size only: a WAD
+        # is never edited in place, and the ones that differ differ in size.
+        # To force it across anyway, delete it from the stick first.
+        if [ -f "$WAD_TARGET" ] \
+           && [ "$(stat -c%s "$WAD_TARGET")" = "$(stat -c%s "$DOOM_WAD")" ]; then
+            printf '    %-28s %s\n' "$(basename "$WAD_TARGET")" "already there"
+        else
+            copy "$DOOM_WAD" "$WAD_TARGET" || die "Copy failed."
+        fi
+    fi
+fi
+
 sync
 
 say ""
+if [ -n "$DOOM_EXE" ] && [ -z "$DOOM_WAD" ]; then
+    say "DOOM went on without a WAD, and will refuse to start until one is next"
+    say "to it. Put yours there by hand:"
+    say ""
+    say "    cp /path/to/DOOM.WAD $MOUNT/DOOM/"
+    say ""
+fi
 say "Done. The stick can be pulled once this prompt returns."
 say ""
 say "Built from:"

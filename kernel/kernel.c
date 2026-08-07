@@ -22,6 +22,7 @@
 #include "build.h"
 #include "xhci.h"
 #include "graphics.h"
+#include "audio.h"
 #include "timer.h"
 
 /* Everything the kernel reports goes to both the framebuffer and COM1. If a
@@ -37,6 +38,11 @@ static void report(const char* text) {
 static void timer_interrupt(INTERRUPT_FRAME* frame) {
     (void)frame;
     timer_tick();
+    /* And the sound, for the same reason the tick is here: it has to happen
+       whether or not anything else is looking. Forty-eight frames of mixing is
+       a few microseconds, and it is the difference between sound that survives
+       a program rendering a frame and sound that stutters whenever one does. */
+    audio_service();
 }
 
 static void report_hex(boot_uint64_t value) {
@@ -231,6 +237,14 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
             report(" MB\n");
         } else {
             report("NVME: NOT FOUND\n");
+        }
+
+        if (audio_init()) {
+            report("AUDIO: ");
+            report(audio_device_name());
+            report(" CODEC, 48 KHZ STEREO\n");
+        } else {
+            report("AUDIO: NOT FOUND\n");
         }
 
         /* Every xHCI controller on the bus, not the first one. A board
