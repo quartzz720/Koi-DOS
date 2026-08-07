@@ -460,6 +460,11 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
         graphics_present();
         return 0;
 
+    case SYS_GFX_PRESENT_RECT:
+        graphics_present_rect(KOI_POINT_X(a), KOI_POINT_Y(a),
+                              KOI_POINT_X(b), KOI_POINT_Y(b));
+        return 0;
+
     case SYS_GFX_COLOR:
         return (long)graphics_color((boot_uint8_t)a, (boot_uint8_t)b,
                                     (boot_uint8_t)c);

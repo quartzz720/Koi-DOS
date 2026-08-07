@@ -21,7 +21,7 @@ KOI DOS KERNEL
 MEMORY ALLOC FREE: OK
 MEMORY FREE: 1970 MB
 CPU: GDT IDT PIC READY
-PAGING: IDENTITY MAP 16384 MB
+PAGING: IDENTITY MAP 16384 MB, FRAMEBUFFER WRITE COMBINING
 HEAP: 1023 KB, SELF TEST OK
 KEYBOARD: PS/2 READY
 TIMER: PIT POLLING 1000 HZ
@@ -470,6 +470,21 @@ magnitude slower than reading RAM. With a back buffer the move is a `memmove` an
 direction ever touches the device. If the buffer cannot be allocated, drawing falls back to the
 framebuffer directly — degraded, never dark.
 
+The framebuffer is mapped **write-combining**, through a PAT entry reprogrammed for it at boot.
+It used to be write-through, which is also correct - the pixels reach the adapter either way -
+but write-through sends every store across the bus on its own, and a full screen is a million of
+them. Measured at 7.8 ms a frame, which is half the budget of anything that animates, before a
+single pixel had been drawn. Write-combining lets the processor gather stores into whole
+cache-line bursts first, and the same frame costs 1.2 ms. The boot log says which one the machine
+ended up with, because a machine where it failed would otherwise show up only as everything
+graphical being mysteriously slow.
+
+The copies themselves are `rep movsq` and `rep stosq` rather than C loops. A loop over a volatile
+pointer is the slowest thing that can be written: volatile forbids the compiler from merging
+anything, so it emits one four-byte store per pixel. Clearing the screen that way measured as the
+most expensive thing in a frame - more than sending the frame to the adapter - and became six
+times cheaper as one instruction.
+
 The UEFI pixel-format names describe *byte* order, not the value of the 32-bit word.
 `PixelBlueGreenRedReserved` means bytes B,G,R,X, which on a little-endian machine reads back as
 the familiar `0x00RRGGBB`. Reading that backwards swaps red and blue.
@@ -497,6 +512,17 @@ Three parts of that handover are the design rather than details, and each was a 
   while still holding it would leave the shell invisible with no way to ask for it back. That is
   the failure DOS programs were famous for, and it is prevented in the one place that always
   runs.
+
+`graphics_present_rect` sends one rectangle rather than the whole screen, and it matters more than
+anything else here. The screen is whatever size the firmware chose; a program that uses a corner
+of it and sends all of it sixty times a second spends more on that than on everything else put
+together. The games collection draws into 640x480 of a 1280x800 screen, and pushing only that is
+a third of the work.
+
+One thing that follows from it, learned by screenshot rather than by reasoning: a program that
+only ever sends its own corner has to send the whole screen **once**, or the console's text is
+still sitting in the part it never touches. Entering the mode clears the buffer; something has to
+make the clearing visible.
 
 Primitives live in the kernel and are reached by system call, and the program is *also* handed a
 raw pointer to the buffer. Both, deliberately: the calls mean a program need not know how a pixel

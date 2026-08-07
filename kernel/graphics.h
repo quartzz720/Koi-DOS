@@ -35,6 +35,16 @@ int graphics_enter(GRAPHICS_SCREEN* screen);
    is called, which is what stops a half-drawn frame from being seen. */
 void graphics_present(void);
 
+/* Push one rectangle instead of the whole screen.
+ *
+ * This is the difference between a game that runs and one that crawls. The
+ * screen is whatever size the firmware chose - often far larger than the area
+ * a program actually uses - and sending all of it sixty times a second costs
+ * more than everything else the program does put together. Coordinates are
+ * clipped, so a caller that knows what it changed need not also know where the
+ * edges are. */
+void graphics_present_rect(int x, int y, int width, int height);
+
 /* Give the screen back and let the console repaint. Safe to call when not in
    graphics mode. */
 void graphics_leave(void);

@@ -220,6 +220,14 @@ static inline void koi_gfx_present(void) {
     (void)koi_call(SYS_GFX_PRESENT, 0, 0, 0);
 }
 
+/* Show only the part that changed. Anything that redraws continuously wants
+   this: the screen is usually much larger than the area a program uses, and
+   sending all of it every frame costs more than drawing does. */
+static inline void koi_gfx_present_rect(int x, int y, int width, int height) {
+    (void)koi_call(SYS_GFX_PRESENT_RECT, KOI_POINT(x, y),
+                   KOI_POINT(width, height), 0);
+}
+
 /* Build a pixel for whatever channel order this machine's framebuffer uses.
    Never assemble one by hand: the order differs between machines, and code
    that guesses draws in the wrong colours on half of them. */

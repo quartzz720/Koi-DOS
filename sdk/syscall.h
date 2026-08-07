@@ -49,8 +49,8 @@
  * ONCE THE INTERFACE IS FROZEN, FUNCTION NUMBERS ARE NEVER REUSED. A removed
  * call leaves a hole. This is the promise that makes old programs safe, and it
  * costs nothing to keep - there are 256 numbers and twenty are in use. */
-#define KOI_ABI_VERSION 3
-#define KOI_ABI_MINIMUM 3
+#define KOI_ABI_VERSION 4
+#define KOI_ABI_MINIMUM 4
 #define KOI_ABI_IS_ALPHA 1
 
 /* Every program begins with this, placed at its load address by the linker
@@ -219,6 +219,14 @@ typedef struct {
 #define SYS_GFX_RECT 0x37    /* (point, size, colour) - outline */
 #define SYS_GFX_FILL 0x38    /* (point, size, colour) - solid */
 #define SYS_GFX_TEXT 0x39    /* (point, text, colour, background) */
+/* Show one rectangle rather than the whole screen.
+ *
+ * The screen is whatever size the firmware chose, often far larger than the
+ * area a program uses, and sending all of it sixty times a second costs more
+ * than everything else the program does put together. Coordinates are clipped,
+ * so a caller that knows what it changed need not also know where the edges
+ * are. */
+#define SYS_GFX_PRESENT_RECT 0x3A  /* (point, size) */
 
 /* Two coordinates in one argument.
  *

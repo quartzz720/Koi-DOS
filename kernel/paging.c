@@ -15,6 +15,26 @@
 #define PAGE_WRITE_THROUGH 0x008ULL
 #define PAGE_CACHE_DISABLE 0x010ULL
 
+/* The memory type of a page is an index into the PAT, assembled from three
+ * bits: PAT<<2 | PCD<<1 | PWT. On a 2 MiB page the PAT bit is bit 12 rather
+ * than bit 7 - the address field starts at bit 21, so bit 12 is free.
+ *
+ * The processor powers up with no write-combining type in the table at all,
+ * which is the one a framebuffer wants: it lets the processor gather stores
+ * into whole cache-line bursts instead of sending each one across the bus on
+ * its own. Entry 4 is reprogrammed to provide it. Entries 0-3 are left exactly
+ * as they were found, so nothing that does not ask for the new type can
+ * notice this happened. */
+#define PAGE_LARGE_PAT 0x1000ULL
+#define PAT_MSR 0x277
+
+/* PA7..PA0, with PA4 changed from write-back to write-combining. The rest is
+   the architectural default: WB, WT, UC-, UC, then those four again. */
+#define PAT_VALUE 0x0007040100070406ULL
+#define PAT_WRITE_COMBINING PAGE_LARGE_PAT   /* index 4: PAT=1, PCD=0, PWT=0 */
+
+static int write_combining_available;
+
 #define ENTRIES 512ULL
 #define LARGE_PAGE_SIZE (2ULL * 1024ULL * 1024ULL)
 #define GIGABYTE (1024ULL * 1024ULL * 1024ULL)
@@ -71,9 +91,40 @@ static int map_range(boot_uint64_t start, boot_uint64_t size, boot_uint64_t flag
     return 1;
 }
 
+/* Put a write-combining type into the PAT, if this processor has one to put it
+ * in. Every x86-64 part does; the check is here because acting on an absent
+ * feature would set an MSR that does not exist and take a #GP doing it.
+ *
+ * Returns the page flag that selects it, or 0 when it could not be arranged -
+ * in which case the caller falls back to write-through, which is correct and
+ * merely slow. */
+static boot_uint64_t enable_write_combining(void) {
+    boot_uint32_t a;
+    boot_uint32_t b;
+    boot_uint32_t c;
+    boot_uint32_t d;
+
+    __asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1));
+    if (!(d & (1U << 16))) return 0;     /* no PAT on this processor */
+
+    __asm__ volatile ("wrmsr"
+                      : : "c"((boot_uint32_t)PAT_MSR),
+                          "a"((boot_uint32_t)(PAT_VALUE & 0xFFFFFFFFU)),
+                          "d"((boot_uint32_t)(PAT_VALUE >> 32)));
+    write_combining_available = 1;
+    return PAT_WRITE_COMBINING;
+}
+
+int paging_write_combining(void) {
+    return write_combining_available;
+}
+
 int paging_init(const BOOT_INFO* info) {
+    boot_uint64_t framebuffer_flags;
+
     mapped_bytes = 0;
     table_bytes = 0;
+    write_combining_available = 0;
     pml4 = alloc_table();
     if (!pml4) return 0;
 
@@ -99,12 +150,21 @@ int paging_init(const BOOT_INFO* info) {
             return 0;
     }
 
-    /* The framebuffer is device memory. Caching writes to it would leave the
-       screen showing whatever was in the cache; mark it write-through so the
-       pixels actually reach the adapter. */
+    /* The framebuffer is device memory: writes have to reach the adapter
+     * rather than sit in a cache. Write-through does that and was what this
+     * used before, but it sends every store across the bus on its own, and a
+     * full screen is a million of them - which measured at nearly eight
+     * milliseconds a frame, half the budget of anything that animates.
+     *
+     * Write-combining reaches the adapter too, and lets the processor gather
+     * stores into whole cache-line bursts first. Falling back to write-through
+     * when the PAT cannot be arranged keeps the old behaviour rather than
+     * risking a screen that shows stale pixels. */
+    framebuffer_flags = enable_write_combining();
+    if (!framebuffer_flags) framebuffer_flags = PAGE_WRITE_THROUGH;
     if (info->framebuffer_base && info->framebuffer_size) {
         if (!map_range(info->framebuffer_base, info->framebuffer_size,
-                       PAGE_WRITE_THROUGH))
+                       framebuffer_flags))
             return 0;
     }
 

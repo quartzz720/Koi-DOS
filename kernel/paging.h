@@ -36,4 +36,10 @@ boot_uint64_t paging_table_bytes(void);
  * Returns 0 if the tables could not be extended. */
 int paging_map_device(boot_uint64_t base, boot_uint64_t size);
 
+/* Whether the framebuffer ended up write-combining rather than write-through.
+   Worth reporting: it is the difference between a screen that can be redrawn
+   sixty times a second and one that cannot, and a machine where it failed
+   will otherwise only be noticeable as everything being mysteriously slow. */
+int paging_write_combining(void);
+
 #endif

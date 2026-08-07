@@ -31,7 +31,7 @@ KOI DOS KERNEL
 MEMORY ALLOC FREE: OK
 MEMORY FREE: 1970 MB
 CPU: GDT IDT PIC READY
-PAGING: IDENTITY MAP 16384 MB
+PAGING: IDENTITY MAP 16384 MB, FRAMEBUFFER WRITE COMBINING
 HEAP: 1023 KB, SELF TEST OK
 KEYBOARD: PS/2 READY
 TIMER: PIT POLLING 1000 HZ
@@ -212,13 +212,18 @@ Programs write that file; the kernel reads it. Neither reaches into the other.
 ### System calls
 
 Programs call the kernel with `int 0x40`, in the spirit of DOS's INT 21h. `RAX` holds the
-function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Thirty-two calls cover
+function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Thirty-three calls cover
 console I/O, files, directory enumeration, the command line, exit codes, what the system knows
 about itself, and taking the screen; they are listed in
 [include/syscall.h](include/syscall.h), which the kernel and every program include from the same
 copy so the two cannot drift apart. That file also names the keys that have no ASCII value — the
 arrows and the function keys — because a program that reads them has to name them, and two copies
 of a number is how two copies of a number drift apart.
+
+`SYS_GFX_PRESENT_RECT` sends one rectangle instead of the whole screen, and it is the difference
+between a game that runs and one that crawls: the screen is whatever size the firmware chose,
+often far larger than the area a program uses, and sending all of it sixty times a second costs
+more than everything else put together.
 
 Two of those calls exist for programs that cannot afford to stop. `SYS_GETCHAR` waits, which is
 right for a prompt and wrong for anything that has to keep moving; `SYS_KEYPRESSED` asks whether a

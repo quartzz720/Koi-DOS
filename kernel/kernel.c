@@ -83,7 +83,13 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
     if (paging_init(info)) {
         report("PAGING: IDENTITY MAP ");
         report_dec(paging_mapped_bytes() / 1024U / 1024U);
-        report(" MB\n");
+        report(" MB, FRAMEBUFFER ");
+        /* Worth a line of its own. It is the difference between a screen that
+           can be redrawn sixty times a second and one that cannot, and a
+           machine where it failed would otherwise show up only as everything
+           graphical being mysteriously slow. */
+        report(paging_write_combining() ? "WRITE COMBINING\n"
+                                        : "WRITE THROUGH - SLOW\n");
     } else {
         report("PAGING: FAILED, USING FIRMWARE TABLES\n");
     }

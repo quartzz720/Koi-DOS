@@ -63,14 +63,52 @@ int graphics_enter(GRAPHICS_SCREEN* screen) {
     return 1;
 }
 
+/* One row out to the adapter.
+ *
+ * `rep movsq` rather than a loop of stores. A C loop over a volatile pointer
+ * is the slowest thing that can be written here: volatile forbids the compiler
+ * from merging or reordering anything, so it emits one four-byte store per
+ * pixel and a million of them per frame. The string move is a single
+ * instruction the processor is allowed to turn into whole cache-line
+ * transfers, which is what the write-combining mapping exists to let it do.
+ *
+ * A trailing odd pixel is copied on its own: rows are almost always an even
+ * number of pixels, and "almost" is not a thing to build on. */
+static void copy_row(volatile boot_uint32_t* destination,
+                     const boot_uint32_t* source, boot_uint32_t pixels) {
+    boot_uint64_t quads = pixels / 2;
+
+    if (quads) {
+        __asm__ volatile ("rep movsq"
+                          : "+D"(destination), "+S"(source), "+c"(quads)
+                          : : "memory");
+    }
+    if (pixels & 1) destination[0] = source[0];
+}
+
 void graphics_present(void) {
     if (!active) return;
-    for (boot_uint32_t y = 0; y < screen_height; y++) {
+    graphics_present_rect(0, 0, (int)screen_width, (int)screen_height);
+}
+
+void graphics_present_rect(int x, int y, int width, int height) {
+    if (!active || width <= 0 || height <= 0) return;
+
+    /* Clip rather than refuse. A caller that knows what it changed should not
+       also have to know where the edges are. */
+    if (x < 0) { width += x; x = 0; }
+    if (y < 0) { height += y; y = 0; }
+    if (x >= (int)screen_width || y >= (int)screen_height) return;
+    if (x + width > (int)screen_width) width = (int)screen_width - x;
+    if (y + height > (int)screen_height) height = (int)screen_height - y;
+    if (width <= 0 || height <= 0) return;
+
+    for (int line = 0; line < height; line++) {
         volatile boot_uint32_t* destination =
-            framebuffer + (boot_uint64_t)y * pixels_per_scan_line;
-        const boot_uint32_t* source = buffer + (boot_uint64_t)y * screen_width;
-        for (boot_uint32_t x = 0; x < screen_width; x++)
-            destination[x] = source[x];
+            framebuffer + (boot_uint64_t)(y + line) * pixels_per_scan_line + x;
+        const boot_uint32_t* source =
+            buffer + (boot_uint64_t)(y + line) * screen_width + x;
+        copy_row(destination, source, (boot_uint32_t)width);
     }
 }
 
@@ -97,6 +135,37 @@ static boot_uint32_t* row_of(int y) {
     return buffer + (boot_uint64_t)y * screen_width;
 }
 
+/* A run of one colour, as one instruction.
+ *
+ * The obvious C loop is one four-byte store per pixel, and a full-screen clear
+ * is a million of them - which measured as the most expensive thing in a
+ * frame, more than sending the frame to the adapter. `rep stosq` writes eight
+ * bytes at a time and is a single instruction the processor is free to widen
+ * further. Two pixels of the same colour are one quadword, which is why the
+ * colour is doubled up first. */
+static void fill_run(boot_uint32_t* pixels, boot_uint32_t color,
+                     boot_uint32_t count) {
+    boot_uint64_t pair = ((boot_uint64_t)color << 32) | color;
+    boot_uint64_t quads = count / 2;
+
+    if (((boot_uint64_t)pixels & 7) && count) {
+        /* An odd starting address has no quadword to begin with; place one
+           pixel to reach alignment and carry on from there. */
+        *pixels++ = color;
+        count--;
+        quads = count / 2;
+    }
+    if (quads) {
+        boot_uint64_t* out = (boot_uint64_t*)pixels;
+        __asm__ volatile ("rep stosq"
+                          : "+D"(out), "+c"(quads)
+                          : "a"(pair)
+                          : "memory");
+        pixels = (boot_uint32_t*)out;
+    }
+    if (count & 1) *pixels = color;
+}
+
 void graphics_pixel(int x, int y, boot_uint32_t color) {
     if (!active) return;
     if (x < 0 || y < 0 || (boot_uint32_t)x >= screen_width ||
@@ -106,10 +175,9 @@ void graphics_pixel(int x, int y, boot_uint32_t color) {
 
 void graphics_clear(boot_uint32_t color) {
     if (!active) return;
-    for (boot_uint32_t y = 0; y < screen_height; y++) {
-        boot_uint32_t* line = row_of((int)y);
-        for (boot_uint32_t x = 0; x < screen_width; x++) line[x] = color;
-    }
+    /* The buffer is one contiguous run, so the whole screen is a single fill
+       rather than one per row. */
+    fill_run(buffer, color, screen_width * screen_height);
 }
 
 void graphics_fill(int x, int y, int width, int height, boot_uint32_t color) {
@@ -124,10 +192,8 @@ void graphics_fill(int x, int y, int width, int height, boot_uint32_t color) {
     if (right > (int)screen_width) right = (int)screen_width;
     if (bottom > (int)screen_height) bottom = (int)screen_height;
 
-    for (int line = y; line < bottom; line++) {
-        boot_uint32_t* pixels = row_of(line);
-        for (int column = x; column < right; column++) pixels[column] = color;
-    }
+    for (int line = y; line < bottom; line++)
+        fill_run(row_of(line) + x, color, (boot_uint32_t)(right - x));
 }
 
 void graphics_rect(int x, int y, int width, int height, boot_uint32_t color) {
