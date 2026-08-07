@@ -1,5 +1,6 @@
 #include "console.h"
 #include "font.h"
+#include "graphics.h"
 #include "memory.h"
 #include "string.h"
 
@@ -70,10 +71,18 @@ static boot_uint32_t* target_row(boot_uint32_t y) {
 }
 
 /* Copy a rectangle out to the device. Kept tight on purpose: pushing a whole
-   scanline for every character would move 160 times more pixels than the cell
-   that actually changed. */
+ * scanline for every character would move 160 times more pixels than the cell
+ * that actually changed.
+ *
+ * Nothing goes out while a program owns the screen. The console keeps writing
+ * to its back buffer throughout - so text printed during graphics mode is not
+ * lost, it simply appears when the screen comes back - but the display belongs
+ * to whoever entered graphics mode until they leave. Without this the caret
+ * alone would blink a hole in every picture, because waiting for a keypress is
+ * what a graphics program does last. */
 static void present(boot_uint32_t x, boot_uint32_t y,
                     boot_uint32_t width, boot_uint32_t height) {
+    if (graphics_active()) return;
     if (!back_buffer || x >= screen_width || y >= screen_height) return;
     if (x + width > screen_width) width = screen_width - x;
     if (y + height > screen_height) height = screen_height - y;
@@ -144,6 +153,17 @@ void console_clear(void) {
     cursor_column = 0;
     cursor_row = 0;
     cursor_drawn = 0;
+}
+
+void console_redraw(void) {
+    /* Without a back buffer there is nothing held to redraw from: the console
+       has been writing straight to the device all along, and whatever covered
+       it took the only copy. Saying so beats painting the screen black. */
+    if (!back_buffer) {
+        console_write("\n[the screen could not be restored]\n");
+        return;
+    }
+    present(0, 0, screen_width, screen_height);
 }
 
 static void draw_glyph(boot_uint32_t column, boot_uint32_t row,

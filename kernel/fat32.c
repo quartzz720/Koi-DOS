@@ -21,6 +21,19 @@
 #define ENTRY_FREE 0xE5
 #define ENTRY_END 0x00
 
+/* The FSInfo sector: a hint, kept next to the boot sector, saying how many
+   clusters are free and where to start looking. Advisory by specification -
+   the allocation table is the only authority - but reading it at mount is the
+   difference between answering `dir` immediately and walking a table that is
+   tens of megabytes long on a large volume. */
+#define FSINFO_SECTOR 1
+#define FSINFO_LEAD_SIGNATURE 0x41615252U
+#define FSINFO_STRUCT_SIGNATURE 0x61417272U
+#define FSINFO_TRAIL_SIGNATURE 0xAA550000U
+#define FSINFO_FREE_COUNT_OFFSET 488
+#define FSINFO_NEXT_FREE_OFFSET 492
+#define FSINFO_UNKNOWN 0xFFFFFFFFU
+
 #define LONG_NAME_LAST 0x40
 #define LONG_NAME_SEQUENCE_MASK 0x1F
 #define LONG_NAME_CHARS 13
@@ -40,6 +53,18 @@ typedef struct {
     boot_uint32_t cluster_count;
     boot_uint64_t free_bytes;
     int free_bytes_known;
+    /* Where the next search for a free cluster starts. Without it every
+       allocation walks the table from the beginning, which on a large volume
+       means re-reading megabytes to find a cluster the previous call had
+       already walked past. Zero means "no hint yet". */
+    boot_uint32_t search_hint;
+    /* One sector of the allocation table, held in memory and written back when
+       something else needs the buffer. 128 clusters share a sector, so a file
+       of any size touches each sector of the table a great many times. */
+    boot_uint8_t* fat_cache;
+    boot_uint32_t fat_cache_sector;   /* index within one copy of the table */
+    int fat_cache_valid;
+    int fat_cache_dirty;
     int mounted;
 } FAT_VOLUME;
 
@@ -61,10 +86,82 @@ static boot_uint32_t read32(const boot_uint8_t* data) {
            ((boot_uint32_t)data[2] << 16) | ((boot_uint32_t)data[3] << 24);
 }
 
+/* Sectors are addressed relative to the volume; the device knows nothing about
+   partitions. The multi-sector form is the one that matters for bulk transfer:
+   every driver underneath splits a long request itself, and a request per
+   sector costs a full command round trip for 512 bytes. */
+static int read_volume_sectors(FAT_VOLUME* fat, boot_uint64_t sector,
+                               boot_uint32_t count, void* buffer) {
+    return block_read(fat->volume->device, fat->volume->first_sector + sector,
+                      count, buffer);
+}
+
 static int read_volume_sector(FAT_VOLUME* fat, boot_uint64_t sector,
                               void* buffer) {
-    return block_read(fat->volume->device, fat->volume->first_sector + sector,
-                      1, buffer);
+    return read_volume_sectors(fat, sector, 1, buffer);
+}
+
+static int write_volume_sectors(FAT_VOLUME* fat, boot_uint64_t sector,
+                                boot_uint32_t count, const void* buffer) {
+    return block_write(fat->volume->device, fat->volume->first_sector + sector,
+                       count, buffer);
+}
+
+static int write_volume_sector(FAT_VOLUME* fat, boot_uint64_t sector,
+                               const void* buffer) {
+    return write_volume_sectors(fat, sector, 1, buffer);
+}
+
+/* ---- The allocation table, one sector at a time -------------------------
+ *
+ * Every cluster of every file has an entry here, and 128 entries share a
+ * 512-byte sector, so a chain walks over the same sector again and again.
+ * Reading it from the disk each time - and writing it back to both copies of
+ * the table each time it changed - is what made growing a file cost four disk
+ * commands per cluster. Holding one sector and writing it back only when
+ * something else needs the buffer collapses that to four per 128 clusters.
+ *
+ * Write-back, so the disk is behind between calls. Every public operation that
+ * can dirty it flushes before it returns, which is the same guarantee the
+ * directory entry already had. */
+static int fat_flush(FAT_VOLUME* fat) {
+    int ok = 1;
+
+    if (!fat->fat_cache || !fat->fat_cache_valid || !fat->fat_cache_dirty) return 1;
+    for (boot_uint32_t copy = 0; copy < fat->fat_count; copy++) {
+        boot_uint64_t target = fat->reserved_sectors +
+                               (boot_uint64_t)copy * fat->sectors_per_fat +
+                               fat->fat_cache_sector;
+        if (!write_volume_sector(fat, target, fat->fat_cache)) { ok = 0; break; }
+    }
+    fat->fat_cache_dirty = 0;
+    /* A half-written entry means the copies may now disagree; refuse to keep
+       serving a buffer whose relationship to the disk is unknown. */
+    if (!ok) fat->fat_cache_valid = 0;
+    return ok;
+}
+
+/* The sector of the table holding a given entry, ready to be read or changed.
+   NULL when it could not be brought in. */
+static boot_uint8_t* fat_sector(FAT_VOLUME* fat, boot_uint32_t relative) {
+    if (relative >= fat->sectors_per_fat) return (boot_uint8_t*)0;
+    if (!fat->fat_cache) {
+        fat->fat_cache = (boot_uint8_t*)alloc_page();
+        if (!fat->fat_cache) return (boot_uint8_t*)0;
+        fat->fat_cache_valid = 0;
+        fat->fat_cache_dirty = 0;
+    }
+    if (fat->fat_cache_valid && fat->fat_cache_sector == relative)
+        return fat->fat_cache;
+    if (!fat_flush(fat)) return (boot_uint8_t*)0;
+    if (!read_volume_sector(fat, fat->reserved_sectors + relative,
+                            fat->fat_cache)) {
+        fat->fat_cache_valid = 0;
+        return (boot_uint8_t*)0;
+    }
+    fat->fat_cache_sector = relative;
+    fat->fat_cache_valid = 1;
+    return fat->fat_cache;
 }
 
 static boot_uint64_t cluster_first_sector(FAT_VOLUME* fat, boot_uint32_t cluster) {
@@ -80,25 +177,23 @@ static int cluster_is_end(boot_uint32_t cluster) {
 
 /* Follow one link in the allocation chain. */
 static boot_uint32_t next_cluster(FAT_VOLUME* fat, boot_uint32_t cluster) {
-    boot_uint8_t* sector;
     boot_uint32_t offset = cluster * 4;
-    boot_uint64_t fat_sector = fat->reserved_sectors + offset / fat->bytes_per_sector;
-    boot_uint32_t within = offset % fat->bytes_per_sector;
-    boot_uint32_t value;
+    boot_uint8_t* sector;
 
     if (cluster < 2 || cluster >= fat->cluster_count + 2) return CLUSTER_MASK;
-    sector = (boot_uint8_t*)alloc_page();
+    sector = fat_sector(fat, offset / fat->bytes_per_sector);
     if (!sector) return CLUSTER_MASK;
-    if (!read_volume_sector(fat, fat_sector, sector)) {
-        free_page(sector);
-        return CLUSTER_MASK;
-    }
-    value = read32(sector + within) & CLUSTER_MASK;
-    free_page(sector);
-    return value;
+    return read32(sector + offset % fat->bytes_per_sector) & CLUSTER_MASK;
 }
 
 void fat32_unmount_all(void) {
+    /* Anything still held for a volume goes out to the disk before the record
+       of that volume disappears. */
+    for (boot_uint32_t index = 0; index < VOLUME_MAX; index++) {
+        if (!mounts[index].mounted) continue;
+        (void)fat_flush(&mounts[index]);
+        if (mounts[index].fat_cache) free_page(mounts[index].fat_cache);
+    }
     memset(mounts, 0, sizeof(mounts));
 }
 
@@ -170,6 +265,28 @@ int fat32_mount(VOLUME* volume) {
     }
 
     fat->mounted = 1;
+
+    /* Take the free-space figure and the search position from FSInfo when it
+       is there and plausible. Everything that writes keeps both up to date
+       from here on, so this is the only chance to avoid the full scan - and on
+       a large volume that scan is the slowest thing the driver can do. A value
+       that fails the sanity check simply leaves them unknown, and the scan
+       happens the first time something asks. */
+    if (read_volume_sector(fat, FSINFO_SECTOR, sector) &&
+        read32(sector) == FSINFO_LEAD_SIGNATURE &&
+        read32(sector + 484) == FSINFO_STRUCT_SIGNATURE) {
+        boot_uint32_t free_clusters = read32(sector + FSINFO_FREE_COUNT_OFFSET);
+        boot_uint32_t next_free = read32(sector + FSINFO_NEXT_FREE_OFFSET);
+
+        if (free_clusters != FSINFO_UNKNOWN && free_clusters <= fat->cluster_count) {
+            fat->free_bytes = (boot_uint64_t)free_clusters *
+                              fat->sectors_per_cluster * fat->bytes_per_sector;
+            fat->free_bytes_known = 1;
+        }
+        if (next_free >= 2 && next_free < fat->cluster_count + 2)
+            fat->search_hint = next_free;
+    }
+
     free_page(sector);
     return 1;
 }
@@ -181,32 +298,57 @@ boot_uint64_t fat32_total_bytes(VOLUME* volume) {
            fat->bytes_per_sector;
 }
 
+/* How much of the table to read per command when it has to be counted. */
+#define FREE_SCAN_PAGES 16
+
 boot_uint64_t fat32_free_bytes(VOLUME* volume) {
     FAT_VOLUME* fat = mount_for(volume);
-    boot_uint8_t* sector;
+    boot_uint8_t* buffer;
     boot_uint64_t free_clusters = 0;
-    boot_uint32_t entries_per_sector;
+    boot_uint32_t total;
+    boot_uint32_t pages = FREE_SCAN_PAGES;
+    boot_uint32_t per_pass;
 
     if (!fat) return 0;
-    /* Walking the whole FAT costs a read per sector of it, so the answer is
-       computed once and kept. It stays valid until writing exists. */
+    total = fat->cluster_count + 2;
+    /* The answer is computed once and then kept up to date by write_fat_entry
+       rather than recomputed, because counting means reading the whole table.
+       Getting that wrong is not a cosmetic bug: this used to be invalidated on
+       every cluster allocation, and update_fsinfo asks for it after every
+       write, so copying one file rescanned the table once per cluster. Mount
+       usually seeds it from FSInfo and the count below never runs at all. */
     if (fat->free_bytes_known) return fat->free_bytes;
 
-    sector = (boot_uint8_t*)alloc_page();
-    if (!sector) return 0;
-    entries_per_sector = fat->bytes_per_sector / 4;
+    /* Everything held for this volume goes out first: the count has to see the
+       disk, and the disk is only complete once the cache is flushed. */
+    if (!fat_flush(fat)) return 0;
 
-    for (boot_uint32_t index = 0; index < fat->sectors_per_fat; index++) {
-        if (!read_volume_sector(fat, fat->reserved_sectors + index, sector)) break;
-        for (boot_uint32_t entry = 0; entry < entries_per_sector; entry++) {
-            boot_uint32_t cluster = index * entries_per_sector + entry;
+    for (;;) {
+        buffer = (boot_uint8_t*)alloc_pages(pages);
+        if (buffer || pages == 1) break;
+        pages /= 2;
+    }
+    if (!buffer) return 0;
+    per_pass = pages * (boot_uint32_t)PAGE_SIZE / fat->bytes_per_sector;
+
+    for (boot_uint32_t index = 0; index < fat->sectors_per_fat; index += per_pass) {
+        boot_uint32_t run = fat->sectors_per_fat - index;
+        boot_uint32_t entries;
+
+        if (run > per_pass) run = per_pass;
+        if (!read_volume_sectors(fat, fat->reserved_sectors + index, run, buffer))
+            break;
+
+        entries = run * fat->bytes_per_sector / 4;
+        for (boot_uint32_t entry = 0; entry < entries; entry++) {
+            boot_uint32_t cluster = index * (fat->bytes_per_sector / 4) + entry;
             if (cluster < 2) continue;
-            if (cluster >= fat->cluster_count + 2) break;
-            if ((read32(sector + entry * 4) & CLUSTER_MASK) == CLUSTER_FREE)
+            if (cluster >= total) break;
+            if ((read32(buffer + entry * 4) & CLUSTER_MASK) == CLUSTER_FREE)
                 free_clusters++;
         }
     }
-    free_page(sector);
+    free_pages(buffer, pages);
 
     fat->free_bytes = free_clusters * fat->sectors_per_cluster *
                       fat->bytes_per_sector;
@@ -464,12 +606,15 @@ boot_uint32_t fat32_read(VOLUME* volume, const FAT_ENTRY* entry,
     if (!sector) return 0;
 
     /* `offset` is now the position within the current cluster, and stays so:
-       each pass copies at most to the end of one sector, and a cluster is a
-       whole number of sectors, so it lands exactly on the cluster boundary. */
+       each pass copies at most to the end of the cluster, and lands exactly on
+       the boundary. Whole sectors are read straight into the caller's buffer,
+       as many at a time as the cluster holds; only a partial sector at either
+       end goes through the scratch page. */
     while (copied < length) {
         boot_uint32_t sector_index;
         boot_uint32_t sector_offset;
         boot_uint32_t chunk;
+        boot_uint64_t first;
 
         if (offset >= cluster_bytes) {
             cluster = next_cluster(fat, cluster);
@@ -480,8 +625,22 @@ boot_uint32_t fat32_read(VOLUME* volume, const FAT_ENTRY* entry,
 
         sector_index = offset / fat->bytes_per_sector;
         sector_offset = offset % fat->bytes_per_sector;
-        if (!read_volume_sector(fat,
-                cluster_first_sector(fat, cluster) + sector_index, sector)) break;
+        first = cluster_first_sector(fat, cluster) + sector_index;
+
+        if (!sector_offset && length - copied >= fat->bytes_per_sector &&
+            !((boot_uint64_t)(output + copied) & 3)) {
+            boot_uint32_t run = (length - copied) / fat->bytes_per_sector;
+            boot_uint32_t left = fat->sectors_per_cluster - sector_index;
+
+            if (run > left) run = left;
+            if (!read_volume_sectors(fat, first, run, output + copied)) break;
+            chunk = run * fat->bytes_per_sector;
+            copied += chunk;
+            offset += chunk;
+            continue;
+        }
+
+        if (!read_volume_sector(fat, first, sector)) break;
 
         chunk = fat->bytes_per_sector - sector_offset;
         if (chunk > length - copied) chunk = length - copied;
@@ -503,19 +662,6 @@ boot_uint32_t fat32_read(VOLUME* volume, const FAT_ENTRY* entry,
  * the table.
  */
 
-#define FSINFO_SECTOR 1
-#define FSINFO_LEAD_SIGNATURE 0x41615252U
-#define FSINFO_STRUCT_SIGNATURE 0x61417272U
-#define FSINFO_TRAIL_SIGNATURE 0xAA550000U
-#define FSINFO_FREE_COUNT_OFFSET 488
-#define FSINFO_NEXT_FREE_OFFSET 492
-
-static int write_volume_sector(FAT_VOLUME* fat, boot_uint64_t sector,
-                               const void* buffer) {
-    return block_write(fat->volume->device, fat->volume->first_sector + sector,
-                       1, buffer);
-}
-
 static void write16(boot_uint8_t* data, boot_uint16_t value) {
     data[0] = (boot_uint8_t)value;
     data[1] = (boot_uint8_t)(value >> 8);
@@ -528,35 +674,63 @@ static void write32(boot_uint8_t* data, boot_uint32_t value) {
     data[3] = (boot_uint8_t)(value >> 24);
 }
 
-/* Set one FAT entry in every copy of the table. */
+/* Set one FAT entry. The held sector belongs to every copy of the table at
+   once - fat_flush writes it to all of them - so the two copies cannot drift
+   apart by any route through here. */
 static int write_fat_entry(FAT_VOLUME* fat, boot_uint32_t cluster,
                            boot_uint32_t value) {
-    boot_uint8_t* sector;
     boot_uint32_t byte_offset = cluster * 4;
-    boot_uint64_t relative = byte_offset / fat->bytes_per_sector;
     boot_uint32_t within = byte_offset % fat->bytes_per_sector;
-    int ok = 1;
+    boot_uint32_t previous_value;
+    boot_uint8_t* sector;
+    int was_free;
+    int now_free;
 
     if (cluster < 2 || cluster >= fat->cluster_count + 2) return 0;
-    sector = (boot_uint8_t*)alloc_page();
-    if (!sector) return 0;
-
-    for (boot_uint32_t copy = 0; copy < fat->fat_count; copy++) {
-        boot_uint64_t target = fat->reserved_sectors +
-                               (boot_uint64_t)copy * fat->sectors_per_fat + relative;
-        if (!read_volume_sector(fat, target, sector)) { ok = 0; break; }
-        /* The top four bits of a FAT32 entry are reserved and must be kept as
-           they were found, not overwritten with zeroes. */
-        write32(sector + within,
-                (read32(sector + within) & 0xF0000000U) | (value & CLUSTER_MASK));
-        if (!write_volume_sector(fat, target, sector)) { ok = 0; break; }
+    sector = fat_sector(fat, byte_offset / fat->bytes_per_sector);
+    if (!sector) {
+        fat->free_bytes_known = 0;
+        return 0;
     }
 
-    free_page(sector);
-    /* The cached free-space figure no longer reflects the disk. */
-    fat->free_bytes_known = 0;
-    return ok;
+    previous_value = read32(sector + within) & CLUSTER_MASK;
+    /* The top four bits of a FAT32 entry are reserved and must be kept as they
+       were found, not overwritten with zeroes. */
+    write32(sector + within,
+            (read32(sector + within) & 0xF0000000U) | (value & CLUSTER_MASK));
+    fat->fat_cache_dirty = 1;
+
+    was_free = previous_value == CLUSTER_FREE;
+    now_free = (value & CLUSTER_MASK) == CLUSTER_FREE;
+
+    /* Space given back should be handed out again, so the next search starts
+       no later than the cluster that was just released. */
+    if (now_free && !was_free && cluster < fat->search_hint)
+        fat->search_hint = cluster;
+
+    /* Adjust the running free-space figure rather than throwing it away. One
+       entry changed and we know which way, so a full rescan would be answering
+       a question we already hold the answer to. */
+    if (fat->free_bytes_known) {
+        boot_uint64_t cluster_bytes = (boot_uint64_t)fat->sectors_per_cluster *
+                                      fat->bytes_per_sector;
+        if (was_free && !now_free) {
+            fat->free_bytes = fat->free_bytes >= cluster_bytes
+                            ? fat->free_bytes - cluster_bytes : 0;
+        } else if (!was_free && now_free) {
+            fat->free_bytes += cluster_bytes;
+        }
+    }
+    return 1;
 }
+
+/* Finish a change to the volume: the held sector of the allocation table goes
+ * out to the disk, and the FSInfo hint is brought back into line with it.
+ *
+ * Every public operation that can touch the table ends here, which is what
+ * makes the write-back cache safe: between commands the disk holds everything,
+ * and only within one command is it allowed to be behind. */
+static void commit(FAT_VOLUME* fat);
 
 /* Refresh the FSInfo hint. It is advisory - the FAT is authoritative - but a
    stale value makes other systems report nonsense free space. */
@@ -569,51 +743,103 @@ static void update_fsinfo(FAT_VOLUME* fat) {
         boot_uint64_t free_bytes = fat32_free_bytes(fat->volume);
         boot_uint32_t clusters = (boot_uint32_t)(free_bytes /
             (fat->sectors_per_cluster * fat->bytes_per_sector));
-        write32(sector + FSINFO_FREE_COUNT_OFFSET, clusters);
-        (void)write_volume_sector(fat, FSINFO_SECTOR, sector);
+        /* Only when something actually moved. A write that stays inside the
+           clusters a file already owns changes neither, and that is most of
+           them. */
+        if (read32(sector + FSINFO_FREE_COUNT_OFFSET) != clusters ||
+            read32(sector + FSINFO_NEXT_FREE_OFFSET) != fat->search_hint) {
+            write32(sector + FSINFO_FREE_COUNT_OFFSET, clusters);
+            write32(sector + FSINFO_NEXT_FREE_OFFSET, fat->search_hint);
+            (void)write_volume_sector(fat, FSINFO_SECTOR, sector);
+        }
     }
     free_page(sector);
 }
 
-/* Find a free cluster, claim it, and link it after `previous` when given. */
-static boot_uint32_t allocate_cluster(FAT_VOLUME* fat, boot_uint32_t previous) {
-    boot_uint8_t* sector = (boot_uint8_t*)alloc_page();
-    boot_uint32_t entries_per_sector;
+static void commit(FAT_VOLUME* fat) {
+    (void)fat_flush(fat);
+    update_fsinfo(fat);
+}
+
+/* The most memory this will take to clear one cluster. Clusters run to 32 KB
+   on a large volume and 64 KB is legal, so a cap keeps a rare large cluster
+   from asking the allocator for an awkward run of pages. */
+#define BLANK_MAX_PAGES 8
+
+/* A freshly allocated cluster still holds whatever was there before. For a
+   directory that would be read as a screenful of garbage entries, so directory
+   clusters are cleared; a file's are not. Nothing can read past a file's
+   recorded size, and clearing every cluster before writing over it would mean
+   writing the whole volume twice. */
+static void blank_cluster(FAT_VOLUME* fat, boot_uint32_t cluster) {
+    boot_uint64_t first = cluster_first_sector(fat, cluster);
+    boot_uint32_t cluster_bytes = fat->sectors_per_cluster * fat->bytes_per_sector;
+    boot_uint32_t pages = (cluster_bytes + (boot_uint32_t)PAGE_SIZE - 1) /
+                          (boot_uint32_t)PAGE_SIZE;
+    boot_uint32_t per_pass;
+    boot_uint8_t* blank;
+
+    if (pages > BLANK_MAX_PAGES) pages = BLANK_MAX_PAGES;
+    for (;;) {
+        blank = (boot_uint8_t*)alloc_pages(pages);
+        if (blank || pages == 1) break;
+        pages /= 2;
+    }
+    if (!blank) return;
+
+    memset(blank, 0, pages * (boot_uint32_t)PAGE_SIZE);
+    per_pass = pages * (boot_uint32_t)PAGE_SIZE / fat->bytes_per_sector;
+    for (boot_uint32_t done = 0; done < fat->sectors_per_cluster; done += per_pass) {
+        boot_uint32_t chunk = fat->sectors_per_cluster - done;
+        if (chunk > per_pass) chunk = per_pass;
+        (void)write_volume_sectors(fat, first + done, chunk, blank);
+    }
+    free_pages(blank, pages);
+}
+
+/* Find a free cluster, claim it, and link it after `previous` when given.
+ *
+ * The search resumes where the last one stopped. Starting from the beginning
+ * every time is correct but quadratic: filling a volume means walking an
+ * ever-longer prefix of used entries to reach the first free one, and each
+ * step of that walk is a disk read. */
+static boot_uint32_t allocate_cluster(FAT_VOLUME* fat, boot_uint32_t previous,
+                                      int blank) {
+    boot_uint32_t entries_per_sector = fat->bytes_per_sector / 4;
+    boot_uint32_t total = fat->cluster_count + 2;
+    boot_uint32_t start;
+    boot_uint32_t first_sector;
     boot_uint32_t found = 0;
 
-    if (!sector) return 0;
-    entries_per_sector = fat->bytes_per_sector / 4;
+    start = fat->search_hint >= 2 && fat->search_hint < total ? fat->search_hint : 2;
+    first_sector = start / entries_per_sector;
 
-    for (boot_uint32_t index = 0; index < fat->sectors_per_fat && !found; index++) {
-        if (!read_volume_sector(fat, fat->reserved_sectors + index, sector)) break;
+    /* One lap of the table from the hint, wrapping back to the front, so a
+       volume with free space anywhere still finds it. */
+    for (boot_uint32_t step = 0; step < fat->sectors_per_fat && !found; step++) {
+        boot_uint32_t index = first_sector + step;
+        boot_uint8_t* sector;
+
+        if (index >= fat->sectors_per_fat) index -= fat->sectors_per_fat;
+        sector = fat_sector(fat, index);
+        if (!sector) break;
         for (boot_uint32_t slot = 0; slot < entries_per_sector; slot++) {
             boot_uint32_t cluster = index * entries_per_sector + slot;
             if (cluster < 2) continue;
-            if (cluster >= fat->cluster_count + 2) break;
+            if (cluster >= total) break;
             if ((read32(sector + slot * 4) & CLUSTER_MASK) == CLUSTER_FREE) {
                 found = cluster;
                 break;
             }
         }
     }
-    free_page(sector);
     if (!found) return 0;
+    fat->search_hint = found + 1;
 
     if (!write_fat_entry(fat, found, CLUSTER_MASK)) return 0;   /* end of chain */
     if (previous && !write_fat_entry(fat, previous, found)) return 0;
 
-    /* A freshly allocated cluster still holds whatever was there before. For a
-       directory that would be read as a screenful of garbage entries. */
-    {
-        boot_uint8_t* blank = (boot_uint8_t*)alloc_page();
-        if (blank) {
-            memset(blank, 0, fat->bytes_per_sector);
-            for (boot_uint32_t s = 0; s < fat->sectors_per_cluster; s++)
-                (void)write_volume_sector(fat, cluster_first_sector(fat, found) + s,
-                                          blank);
-            free_page(blank);
-        }
-    }
+    if (blank) blank_cluster(fat, found);
     return found;
 }
 
@@ -804,7 +1030,7 @@ static int find_free_slots(FAT_VOLUME* fat, boot_uint32_t directory_cluster,
                    was building at the tail cannot continue across the join,
                    because the new cluster is not adjacent in the chain sense
                    this loop assumes - so it restarts there. */
-                boot_uint32_t added = allocate_cluster(fat, cluster);
+                boot_uint32_t added = allocate_cluster(fat, cluster, 1);
                 free_page(sector);
                 if (!added) return 0;
                 *out_cluster = added;
@@ -973,7 +1199,7 @@ int fat32_create(VOLUME* volume, const char* path, int directory,
                          &slot_cluster, &slot_index)) return 0;
 
     if (directory) {
-        first_cluster = allocate_cluster(fat, 0);
+        first_cluster = allocate_cluster(fat, 0, 1);
         if (!first_cluster) return 0;
     }
 
@@ -1022,7 +1248,7 @@ int fat32_create(VOLUME* volume, const char* path, int directory,
             return 0;
     }
 
-    update_fsinfo(fat);
+    commit(fat);
     return 1;
 }
 
@@ -1066,7 +1292,7 @@ boot_uint32_t fat32_write(VOLUME* volume, FAT_ENTRY* entry,
     cluster_bytes = fat->sectors_per_cluster * fat->bytes_per_sector;
 
     if (!entry->first_cluster) {
-        entry->first_cluster = allocate_cluster(fat, 0);
+        entry->first_cluster = allocate_cluster(fat, 0, 0);
         if (!entry->first_cluster) return 0;
     }
     cluster = entry->first_cluster;
@@ -1076,7 +1302,7 @@ boot_uint32_t fat32_write(VOLUME* volume, FAT_ENTRY* entry,
     while (offset >= cluster_bytes) {
         boot_uint32_t following = next_cluster(fat, cluster);
         if (cluster_is_end(following) || following < 2) {
-            following = allocate_cluster(fat, cluster);
+            following = allocate_cluster(fat, cluster, 0);
             if (!following) return 0;
         }
         cluster = following;
@@ -1095,7 +1321,7 @@ boot_uint32_t fat32_write(VOLUME* volume, FAT_ENTRY* entry,
         if (offset >= cluster_bytes) {
             boot_uint32_t following = next_cluster(fat, cluster);
             if (cluster_is_end(following) || following < 2) {
-                following = allocate_cluster(fat, cluster);
+                following = allocate_cluster(fat, cluster, 0);
                 if (!following) break;
             }
             cluster = following;
@@ -1106,6 +1332,23 @@ boot_uint32_t fat32_write(VOLUME* volume, FAT_ENTRY* entry,
         sector_index = offset / fat->bytes_per_sector;
         sector_offset = offset % fat->bytes_per_sector;
         sector_number = cluster_first_sector(fat, cluster) + sector_index;
+
+        /* Whole sectors go straight from the caller's buffer, as many at a
+           time as the cluster holds. */
+        if (!sector_offset && length - written >= fat->bytes_per_sector &&
+            !((boot_uint64_t)(input + written) & 3)) {
+            boot_uint32_t run = (length - written) / fat->bytes_per_sector;
+            boot_uint32_t left = fat->sectors_per_cluster - sector_index;
+
+            if (run > left) run = left;
+            if (!write_volume_sectors(fat, sector_number, run, input + written))
+                break;
+            chunk = run * fat->bytes_per_sector;
+            written += chunk;
+            offset += chunk;
+            continue;
+        }
+
         chunk = fat->bytes_per_sector - sector_offset;
         if (chunk > length - written) chunk = length - written;
 
@@ -1131,7 +1374,7 @@ boot_uint32_t fat32_write(VOLUME* volume, FAT_ENTRY* entry,
         entry->modified_date = rtc_fat_date(&now);
         entry->modified_time = rtc_fat_time(&now);
         (void)flush_entry(fat, entry);
-        update_fsinfo(fat);
+        commit(fat);
     }
     return written;
 }
@@ -1186,7 +1429,7 @@ int fat32_remove(VOLUME* volume, const char* path) {
     }
     if (entry.first_cluster) free_chain(fat, entry.first_cluster);
     if (!erase_entries(fat, &entry)) return 0;
-    update_fsinfo(fat);
+    commit(fat);
     return 1;
 }
 
@@ -1224,7 +1467,7 @@ int fat32_rename(VOLUME* volume, const char* from, const char* to) {
                                  source.modified_time, &created))
         return 0;
     if (!erase_entries(fat, &source)) return 0;
-    update_fsinfo(fat);
+    commit(fat);
     return 1;
 }
 
@@ -1291,39 +1534,90 @@ static boot_uint32_t format_cluster_count(boot_uint64_t total_sectors,
     return (boot_uint32_t)(data / sectors_per_cluster);
 }
 
-/* Pick the smallest cluster that still yields a legal FAT32 count.
- *
- * Smallest rather than largest because a small cluster wastes less on short
- * files, and the only reason to grow it is a volume so large that the table
- * would otherwise describe more clusters than FAT32 can address. */
-static boot_uint32_t format_choose_cluster(boot_uint64_t total_sectors) {
-    for (boot_uint32_t sectors_per_cluster = 1;
-         sectors_per_cluster <= 128; sectors_per_cluster *= 2) {
-        boot_uint32_t fat_size = format_fat_size(total_sectors, sectors_per_cluster);
-        boot_uint32_t clusters =
-            format_cluster_count(total_sectors, sectors_per_cluster, fat_size);
+static int format_cluster_is_legal(boot_uint64_t total_sectors,
+                                   boot_uint32_t sectors_per_cluster) {
+    boot_uint32_t fat_size = format_fat_size(total_sectors, sectors_per_cluster);
+    boot_uint32_t clusters =
+        format_cluster_count(total_sectors, sectors_per_cluster, fat_size);
 
-        if (!fat_size || !clusters) continue;
-        if (clusters < FAT32_MINIMUM_CLUSTERS) continue;
-        if (clusters > FAT32_MAXIMUM_CLUSTERS) continue;
-        return sectors_per_cluster;
+    if (!fat_size || !clusters) return 0;
+    return clusters >= FAT32_MINIMUM_CLUSTERS && clusters <= FAT32_MAXIMUM_CLUSTERS;
+}
+
+/* Cluster size by volume size - the same table every other FAT32 formatter
+ * uses, and for the same reason.
+ *
+ * This code used to pick the smallest cluster that was still legal, on the
+ * argument that a small cluster wastes less on short files. That argument only
+ * holds for small volumes. A 223 GB partition formatted with 1 KiB clusters
+ * has 234 million of them, and the table describing them is 936 MiB - per
+ * copy, of which FAT32 keeps two. Merely creating such a volume means zeroing
+ * nearly two gigabytes, and every file written afterwards pays for a chain
+ * hundreds of times longer than it needed to be. The wasted tail of a cluster
+ * is measured in kilobytes; getting this wrong is measured in minutes. */
+static boot_uint32_t format_default_cluster(boot_uint64_t total_sectors) {
+    boot_uint64_t megabytes = total_sectors / 2048ULL;
+
+    if (megabytes <= 260) return 1;         /* 512 B  - the FAT32 floor */
+    if (megabytes <= 8192) return 8;        /* 4 KiB  - up to 8 GiB */
+    if (megabytes <= 16384) return 16;      /* 8 KiB  - up to 16 GiB */
+    if (megabytes <= 32768) return 32;      /* 16 KiB - up to 32 GiB */
+    return 64;                              /* 32 KiB - everything larger */
+}
+
+/* Start from the table, then move in whichever direction legality demands:
+   up when the count would exceed what FAT32 can address, down when it falls
+   below the minimum that distinguishes FAT32 from FAT16. */
+static boot_uint32_t format_choose_cluster(boot_uint64_t total_sectors) {
+    boot_uint32_t wanted = format_default_cluster(total_sectors);
+
+    for (boot_uint32_t size = wanted; size <= 128; size *= 2)
+        if (format_cluster_is_legal(total_sectors, size)) return size;
+    for (boot_uint32_t size = wanted / 2; size >= 1; size /= 2) {
+        if (format_cluster_is_legal(total_sectors, size)) return size;
+        if (size == 1) break;
     }
     return 0;
 }
 
-/* Write `count` identical sectors, which is how the tables and the root
-   directory are cleared. */
+/* Clear a run of sectors, many at a time.
+ *
+ * One sector per command is the obvious way to write this and it is unusable.
+ * A 223 GB volume needs an allocation table of about 1.8 million sectors, and
+ * two copies of it - three and a half million round trips to the controller,
+ * which is minutes at best and an hour at worst. On the 64 MB volumes a test
+ * bench uses it is two thousand writes and finishes instantly, which is
+ * exactly why the cost stayed invisible until it met a real disk.
+ *
+ * The block layer has always taken a count. This just uses it. */
+#define FORMAT_CHUNK_SECTORS 256        /* 128 KiB per command */
+
 static int format_fill(BLOCK_DEVICE* device, boot_uint64_t first,
-                       boot_uint64_t count, const boot_uint8_t* sector) {
-    for (boot_uint64_t index = 0; index < count; index++)
-        if (!block_write(device, first + index, 1, sector)) return 0;
+                       boot_uint64_t count, const boot_uint8_t* zeros,
+                       FAT_FORMAT_PROGRESS progress, boot_uint64_t done,
+                       boot_uint64_t total) {
+    boot_uint64_t written = 0;
+
+    while (written < count) {
+        boot_uint64_t chunk = count - written;
+        if (chunk > FORMAT_CHUNK_SECTORS) chunk = FORMAT_CHUNK_SECTORS;
+        if (!block_write(device, first + written, (boot_uint32_t)chunk, zeros))
+            return 0;
+        written += chunk;
+        /* Often enough to look alive, rarely enough not to be the slow part. */
+        if (progress && (written % (FORMAT_CHUNK_SECTORS * 64)) == 0)
+            progress(done + written, total);
+    }
     return 1;
 }
 
 int fat32_format(BLOCK_DEVICE* device, boot_uint64_t first_sector,
                  boot_uint64_t sector_count, const char* label,
-                 boot_uint32_t serial) {
+                 boot_uint32_t serial, FAT_FORMAT_PROGRESS progress) {
     boot_uint8_t* sector;
+    boot_uint8_t* zeros;
+    boot_uint64_t cleared = 0;
+    boot_uint64_t to_clear;
     boot_uint32_t sectors_per_cluster;
     boot_uint32_t fat_size;
     boot_uint32_t clusters;
@@ -1338,7 +1632,17 @@ int fat32_format(BLOCK_DEVICE* device, boot_uint64_t first_sector,
     clusters = format_cluster_count(sector_count, sectors_per_cluster, fat_size);
 
     sector = (boot_uint8_t*)alloc_page();
-    if (!sector) return 0;
+    /* One buffer of zeroes, reused for every chunk. Contiguous because the
+       block layer hands it straight to a controller. */
+    zeros = (boot_uint8_t*)alloc_pages(
+        FORMAT_CHUNK_SECTORS * SECTOR_SIZE / PAGE_SIZE);
+    if (!sector || !zeros) {
+        if (sector) free_page(sector);
+        if (zeros) free_pages(zeros, FORMAT_CHUNK_SECTORS * SECTOR_SIZE / PAGE_SIZE);
+        return 0;
+    }
+    memset(zeros, 0, FORMAT_CHUNK_SECTORS * SECTOR_SIZE);
+    to_clear = (boot_uint64_t)fat_size * FORMAT_FAT_COPIES + sectors_per_cluster;
 
     /* The boot sector, and its backup at sector 6. Both are written because a
        reader that finds the first one damaged looks for the second, and a
@@ -1397,12 +1701,15 @@ int fat32_format(BLOCK_DEVICE* device, boot_uint64_t first_sector,
                      1, sector)) goto done;
 
     /* Clear both allocation tables. Every cluster free, before the first three
-       entries are given their fixed meanings. */
+       entries are given their fixed meanings. This is the part that takes the
+       time on a large volume, which is why it is the part that reports. */
     memset(sector, 0, SECTOR_SIZE);
     for (boot_uint32_t copy = 0; copy < FORMAT_FAT_COPIES; copy++) {
         boot_uint64_t start = first_sector + FORMAT_RESERVED_SECTORS +
                               (boot_uint64_t)copy * fat_size;
-        if (!format_fill(device, start, fat_size, sector)) goto done;
+        if (!format_fill(device, start, fat_size, zeros, progress,
+                         cleared, to_clear)) goto done;
+        cleared += fat_size;
     }
 
     /* Entry 0 carries the media descriptor, entry 1 is reserved, and entry 2
@@ -1422,7 +1729,9 @@ int fat32_format(BLOCK_DEVICE* device, boot_uint64_t first_sector,
     {
         boot_uint64_t root = first_sector + FORMAT_RESERVED_SECTORS +
                              (boot_uint64_t)fat_size * FORMAT_FAT_COPIES;
-        if (!format_fill(device, root, sectors_per_cluster, sector)) goto done;
+        if (!format_fill(device, root, sectors_per_cluster, zeros, progress,
+                         cleared, to_clear)) goto done;
+        cleared += sectors_per_cluster;
 
         /* The label goes in twice, and both are needed. The copy in the boot
            sector is what this driver reads; the one here, as a directory entry
@@ -1439,8 +1748,10 @@ int fat32_format(BLOCK_DEVICE* device, boot_uint64_t first_sector,
         }
     }
 
+    if (progress) progress(to_clear, to_clear);
     ok = 1;
 done:
     free_page(sector);
+    free_pages(zeros, FORMAT_CHUNK_SECTORS * SECTOR_SIZE / PAGE_SIZE);
     return ok;
 }

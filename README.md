@@ -120,7 +120,7 @@ and `AUTOEXEC.BAT` at the root of the boot drive runs at startup.
 
 Anything that is not a built-in command is looked up on disk as `NAME` or `NAME.EXE`, first in
 the current directory and then at the root of the drive, and given the rest of the line as its
-arguments. Five ship in [programs/](programs/):
+arguments. Seven ship in [programs/](programs/):
 
 | | |
 |---|---|
@@ -129,6 +129,8 @@ arguments. Five ship in [programs/](programs/):
 | `save <file> <text>` | writes its arguments to a file |
 | `ls [pattern]` | a directory listing written as an ordinary program |
 | `color` | changes the console colours and remembers them |
+| `demo` | every drawing primitive on one screen, as a test that happens to look like something |
+| `show <file.bmp>` | displays an uncompressed 24- or 32-bit BMP, centred |
 
 `ls` and `color` exist to prove two specific things: that the directory-enumeration calls are
 enough to write a listing with no privilege the shell does not also lack, and that a program can
@@ -243,7 +245,16 @@ HPET is the monotonic clock it was calibrated against. IRQs come through the I/O
 whatever the firmware's MADT says about where a legacy IRQ actually arrives, and the 8259 is
 masked once that is standing.
 
-Missing: **graphics**, then audio and networking. There is no `edit` — the line editor is
+**A program can take the screen.** `koi_gfx_enter` hands it a buffer the size of the display and
+stops the console from drawing; `koi_gfx_present` puts a finished frame up; `koi_gfx_leave` gives
+the screen back and the console repaints exactly what was there before. Between those the program
+may use the drawing calls or write to the buffer directly — this is ring 0 and pretending
+otherwise would only make drawing slow. There is no mode switching: UEFI chose the resolution
+before `ExitBootServices` and it cannot be changed afterwards, so "graphics mode" here means the
+console stops drawing and something else starts. The shell takes the screen back whether or not a
+program remembered to, which is the failure DOS programs were famous for.
+
+Missing: **audio and networking**. There is no `edit` — the line editor is
 the one command from the old shell not carried over, and it belongs as a program now that
 programs exist. `chkdsk` does not exist, so an interrupted write has to be repaired from another
 system. The xHCI interrupt is not routed anywhere, so waiting for a USB key spins rather than
@@ -431,6 +442,7 @@ kernel/
   heap.c               kmalloc/kfree
   console.c            framebuffer text console, and the theme
   font.c               8x16 CP437 font
+  graphics.c           drawing primitives, and the screen a program can take
   keyboard.c           PS/2 keyboard on IRQ1
   acpi.c               RSDP/XSDT walk, hardware-presence questions
   rtc.c                CMOS clock, and FAT timestamp packing

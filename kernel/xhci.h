@@ -37,6 +37,11 @@ int xhci_has_keyboard(void);
    layer. From that point on the filesystem reaches it like any other disk. */
 int xhci_has_storage(void);
 
+/* Why the last USB storage transfer failed, in the device's own words, or NULL
+   when the last one succeeded. "Copy failed" is not a diagnosis; a stick that
+   has gone read-only and a stick that is dying deserve different sentences. */
+const char* xhci_storage_error(void);
+
 /* Collect anything the keyboard has sent and hand it to the keyboard driver.
    Called from the input wait loop: the controller's interrupt is not wired to
    anything yet, so keystrokes only arrive when someone asks for them. */

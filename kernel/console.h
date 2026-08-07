@@ -47,6 +47,14 @@ void console_use_theme(void);
 /* Erase the screen with the current background colour and home the cursor. */
 void console_clear(void);
 
+/* Push the whole back buffer to the display without changing it.
+ *
+ * For when something else has been drawing on the screen - a program in
+ * graphics mode - and the console has to take it back. Nothing was lost while
+ * it was hidden, because the console never stopped owning its buffer; this
+ * simply makes it visible again. */
+void console_redraw(void);
+
 void console_set_color(boot_uint8_t foreground, boot_uint8_t background);
 void console_putchar(char character);
 void console_write(const char* text);

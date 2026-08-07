@@ -49,8 +49,8 @@
  * ONCE THE INTERFACE IS FROZEN, FUNCTION NUMBERS ARE NEVER REUSED. A removed
  * call leaves a hole. This is the promise that makes old programs safe, and it
  * costs nothing to keep - there are 256 numbers and twenty are in use. */
-#define KOI_ABI_VERSION 1
-#define KOI_ABI_MINIMUM 1
+#define KOI_ABI_VERSION 2
+#define KOI_ABI_MINIMUM 2
 #define KOI_ABI_IS_ALPHA 1
 
 /* Every program begins with this, placed at its load address by the linker
@@ -163,6 +163,55 @@ typedef struct {
 #define KOI_TEXT_BUILD_COMMIT 1
 #define KOI_TEXT_DISK_NAME 2         /* index selects the disk */
 #define KOI_TEXT_VOLUME_LABEL 3      /* index selects the volume */
+
+/* Graphics.
+ *
+ * A program takes the screen, draws, shows the result, and gives the screen
+ * back. Between the taking and the giving back the console is not on display -
+ * but it has not lost anything either, and leaving restores it exactly.
+ *
+ * Nothing appears until SYS_GFX_PRESENT. That is not an optimisation, it is
+ * the difference between an image and a program being watched as it draws one.
+ *
+ * SYS_GFX_ENTER fills in a KOI_SCREEN, which carries a pointer to the buffer
+ * being drawn into. A program may write to it directly - this is a ring-0
+ * system with no memory protection and pretending otherwise would only make
+ * drawing slow. The primitives are here so that a program does not have to. */
+#define SYS_GFX_ENTER 0x30   /* (KOI_SCREEN*) -> 0, or -1 */
+#define SYS_GFX_LEAVE 0x31   /* () */
+#define SYS_GFX_PRESENT 0x32 /* () */
+#define SYS_GFX_COLOR 0x33   /* (red, green, blue) -> packed pixel */
+#define SYS_GFX_CLEAR 0x34   /* (colour) */
+#define SYS_GFX_PIXEL 0x35   /* (point, colour) */
+#define SYS_GFX_LINE 0x36    /* (point, point, colour) */
+#define SYS_GFX_RECT 0x37    /* (point, size, colour) - outline */
+#define SYS_GFX_FILL 0x38    /* (point, size, colour) - solid */
+#define SYS_GFX_TEXT 0x39    /* (point, text, colour, background) */
+
+/* Two coordinates in one argument.
+ *
+ * The call convention carries four arguments, and a line needs five numbers.
+ * Rather than widen the convention for one call - which every other call would
+ * then have to keep working around - a point travels as a pair packed into one
+ * 64-bit word. The wrappers in the SDK hide it; a program written against them
+ * never sees this. */
+#define KOI_POINT(x, y) \
+    ((long)((((unsigned long)(unsigned int)(x)) << 32) | \
+            ((unsigned long)(unsigned int)(y))))
+#define KOI_POINT_X(packed) ((int)((unsigned long)(packed) >> 32))
+#define KOI_POINT_Y(packed) ((int)((unsigned long)(packed) & 0xFFFFFFFFUL))
+
+/* Passing the background colour has no meaning when the text is drawn over
+   whatever is already there; this says so. */
+#define KOI_TEXT_TRANSPARENT (-1)
+
+typedef struct {
+    unsigned int width;
+    unsigned int height;
+    unsigned int pitch;            /* bytes between the starts of two rows */
+    unsigned int bytes_per_pixel;
+    void* pixels;
+} KOI_SCREEN;
 
 #define OPEN_READ 0
 #define OPEN_WRITE 1         /* creates, or truncates an existing file */

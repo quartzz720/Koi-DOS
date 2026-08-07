@@ -169,6 +169,77 @@ static inline long koi_systext(long item, long index, char* buffer, long size) {
     return koi_call4(SYS_SYSTEXT, item, index, (long)buffer, size);
 }
 
+/* ---- Graphics ------------------------------------------------------------
+ *
+ * The shape of a graphics program:
+ *
+ *     KOI_SCREEN screen;
+ *     if (koi_gfx_enter(&screen) != 0) return 1;
+ *     koi_gfx_clear(koi_gfx_color(0, 0, 40));
+ *     koi_gfx_fill(10, 10, 100, 60, koi_gfx_color(255, 200, 0));
+ *     koi_gfx_present();
+ *     koi_getchar();
+ *     koi_gfx_leave();
+ *
+ * Nothing is on screen until koi_gfx_present. Always leave before returning -
+ * the shell is not visible until you do.
+ *
+ * screen.pixels is the buffer itself. Writing to it directly is allowed and is
+ * the fast path; the calls below exist so that a program does not have to care
+ * how a pixel is laid out. */
+static inline int koi_gfx_enter(KOI_SCREEN* screen) {
+    return (int)koi_call(SYS_GFX_ENTER, (long)screen, 0, 0);
+}
+
+static inline void koi_gfx_leave(void) {
+    (void)koi_call(SYS_GFX_LEAVE, 0, 0, 0);
+}
+
+static inline void koi_gfx_present(void) {
+    (void)koi_call(SYS_GFX_PRESENT, 0, 0, 0);
+}
+
+/* Build a pixel for whatever channel order this machine's framebuffer uses.
+   Never assemble one by hand: the order differs between machines, and code
+   that guesses draws in the wrong colours on half of them. */
+static inline koi_uint32 koi_gfx_color(int red, int green, int blue) {
+    return (koi_uint32)koi_call(SYS_GFX_COLOR, red, green, blue);
+}
+
+static inline void koi_gfx_clear(koi_uint32 color) {
+    (void)koi_call(SYS_GFX_CLEAR, (long)color, 0, 0);
+}
+
+static inline void koi_gfx_pixel(int x, int y, koi_uint32 color) {
+    (void)koi_call(SYS_GFX_PIXEL, KOI_POINT(x, y), (long)color, 0);
+}
+
+static inline void koi_gfx_line(int x0, int y0, int x1, int y1,
+                                koi_uint32 color) {
+    (void)koi_call(SYS_GFX_LINE, KOI_POINT(x0, y0), KOI_POINT(x1, y1),
+                   (long)color);
+}
+
+static inline void koi_gfx_rect(int x, int y, int width, int height,
+                                koi_uint32 color) {
+    (void)koi_call(SYS_GFX_RECT, KOI_POINT(x, y), KOI_POINT(width, height),
+                   (long)color);
+}
+
+static inline void koi_gfx_fill(int x, int y, int width, int height,
+                                koi_uint32 color) {
+    (void)koi_call(SYS_GFX_FILL, KOI_POINT(x, y), KOI_POINT(width, height),
+                   (long)color);
+}
+
+/* Text in the system font at pixel coordinates. Pass KOI_TEXT_TRANSPARENT as
+   the background to draw only the lit pixels over whatever is already there. */
+static inline void koi_gfx_text(int x, int y, const char* text,
+                                koi_uint32 color, long background) {
+    (void)koi_call4(SYS_GFX_TEXT, KOI_POINT(x, y), (long)text, (long)color,
+                    background);
+}
+
 /* The processor's own name for itself.
  *
  * No system call for this on purpose: programs run in ring 0, so a program can

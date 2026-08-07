@@ -9,6 +9,7 @@
 #include "pci.h"
 #include "block.h"
 #include "xhci.h"
+#include "graphics.h"
 #include "fat32.h"
 #include "partition.h"
 #include "rtc.h"
@@ -640,6 +641,17 @@ static void remount_everything(void) {
 static int copy_one(VOLUME* from_volume, const char* from,
                     VOLUME* to_volume, const char* to, boot_uint32_t* copied);
 
+/* When a file operation fails and the device has something to say about why,
+   say it. The layer that knows is the driver, and by the time the failure
+   reaches here it has been reduced to a zero - so this asks. */
+static void print_device_reason(void) {
+    const char* reason = xhci_storage_error();
+
+    if (!reason) return;
+    print("The USB device reported: ");
+    print_line(reason);
+}
+
 /* Which volume on the boot device holds a given file. The installation media
    may be a single volume or a two-partition layout where the loader's
    partition has no drive letter at all, so it cannot be named - only found. */
@@ -729,6 +741,7 @@ static int setup_copy(VOLUME* from, const char* source,
         console_set_color(console_theme()->error, console_theme()->background);
         print_line("  FAILED");
         console_use_theme();
+        print_device_reason();
         return 0;
     }
     print("  ");
@@ -893,6 +906,22 @@ static void command_part(const ARGUMENTS* arguments) {
     }
     remount_everything();
     print_line("Done. Run `disk` to see it, then `format` each partition.");
+}
+
+/* A percentage that overwrites itself, so a long format says something
+   without scrolling the screen away. */
+static void format_progress(boot_uint64_t done, boot_uint64_t total) {
+    static boot_uint64_t last = 200;
+    boot_uint64_t percent = total ? done * 100U / total : 100;
+
+    if (percent == last) return;
+    last = percent >= 100 ? 200 : percent;
+
+    put('\r');
+    print("    clearing the allocation tables: ");
+    print_dec(percent);
+    print("%   ");
+    if (percent >= 100) print_line("");
 }
 
 /* Turn the machine off, or restart it.
@@ -1111,9 +1140,11 @@ static void command_setup(void) {
 
         if (!first || !second ||
             !fat32_format(target, first->first_sector, first->sector_count,
-                          "KOI-BOOT", serial ^ 0x4B4F4901U) ||
+                          "KOI-BOOT", serial ^ 0x4B4F4901U,
+                          format_progress) ||
             !fat32_format(target, second->first_sector, second->sector_count,
-                          "KOI-DOS", serial ^ 0x4B4F4902U)) {
+                          "KOI-DOS", serial ^ 0x4B4F4902U,
+                          format_progress)) {
             console_set_color(console_theme()->error, console_theme()->background);
             print_line("  Failed.");
             console_use_theme();
@@ -1314,7 +1345,8 @@ static void command_format(const ARGUMENTS* arguments) {
         serial ^= (boot_uint32_t)partition->first_sector;
 
         if (!fat32_format(partition->device, partition->first_sector,
-                          partition->sector_count, label, serial)) {
+                          partition->sector_count, label, serial,
+                          format_progress)) {
             console_set_color(console_theme()->error, console_theme()->background);
             print_line("Format failed. The partition may be too small for FAT32,");
             print_line("or the device rejected a write.");
@@ -1718,19 +1750,40 @@ static int copy_one(VOLUME* from_volume, const char* from,
                     VOLUME* to_volume, const char* to, boot_uint32_t* copied) {
     FAT_ENTRY source;
     FAT_ENTRY destination;
+    FAT_ENTRY existing;
     char* buffer;
+    /* Bigger is straightforwardly faster: the filesystem turns one call into
+       one disk command per run of sectors, so a small buffer means the drive
+       spends its time answering rather than transferring. */
+    boot_uint32_t size = 65536;
     boot_uint32_t offset = 0;
     int ok = 1;
 
     if (!fat32_stat(from_volume, from, &source)) return 0;
     if (source.attributes & FAT_ATTRIBUTE_DIRECTORY) return 0;
+
+    /* Copying over a file that is already there replaces it - that is what
+       copy has always meant. It has to be removed first: fat32_create refuses
+       a name that is taken, and without this the second copy of anything
+       failed with nothing to say why. */
+    if (fat32_stat(to_volume, to, &existing)) {
+        if (existing.attributes & FAT_ATTRIBUTE_DIRECTORY) return 0;
+        /* Onto itself is not a copy, it is a way to lose the file: the remove
+           below would take the only copy and there would be nothing left to
+           read from. Two names are the same file when they share a directory
+           entry on the same volume. */
+        if (from_volume == to_volume &&
+            source.entry_sector == existing.entry_sector &&
+            source.entry_offset == existing.entry_offset) return 0;
+        if (!fat32_remove(to_volume, to)) return 0;
+    }
     if (!fat32_create(to_volume, to, 0, &destination)) return 0;
 
-    buffer = (char*)kmalloc(4096);
+    while (!(buffer = (char*)kmalloc(size)) && size > 4096) size /= 2;
     if (!buffer) return 0;
 
     while (offset < source.size) {
-        boot_uint32_t got = fat32_read(from_volume, &source, offset, buffer, 4096);
+        boot_uint32_t got = fat32_read(from_volume, &source, offset, buffer, size);
         if (!got) { ok = 0; break; }
         if (fat32_write(to_volume, &destination, offset, buffer, got) != got) {
             ok = 0;
@@ -1823,6 +1876,7 @@ static void command_copy(const ARGUMENTS* arguments) {
 
     if (!copy_one(from_volume, from, to_volume, to, &copied)) {
         print_line("Copy failed.");
+        print_device_reason();
         return;
     }
     print("        1 file(s) copied, ");
@@ -2045,9 +2099,14 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
         return 1;
     }
 
-    syscall_set_volume(current_volume);
+    syscall_set_location(current_volume, current_path);
     code = program_run(current_volume, path, arguments->tail);
     syscall_close_all();
+    /* And take the screen back, whether or not the program gave it up. A
+       program that returns while still holding it would otherwise leave the
+       shell invisible with no way to ask for it back - which is precisely the
+       failure this mode was shaped to avoid. */
+    graphics_leave();
 
     if (code == PROGRAM_NOT_LOADABLE) {
         console_set_color(console_theme()->error, console_theme()->background);

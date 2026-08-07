@@ -68,6 +68,11 @@ int fat32_mount(VOLUME* volume);
  * one volume's metadata written into the middle of another volume. */
 void fat32_unmount_all(void);
 
+/* Called while the allocation tables are being cleared, which on a large volume
+   is tens of seconds of work. Without it the machine looks hung, and a person
+   watching a hung installer reaches for the power switch. */
+typedef void (*FAT_FORMAT_PROGRESS)(boot_uint64_t done, boot_uint64_t total);
+
 /* Write a fresh, empty FAT32 filesystem over a region of a block device.
  *
  * Everything already on it is gone. This is the most destructive thing the
@@ -78,13 +83,21 @@ void fat32_unmount_all(void);
  * `label` may be empty. `serial` is the volume serial that identifies a volume
  * afterwards; the boot volume is matched by it, so two volumes sharing one
  * would be a genuine problem. Returns 0 when the region cannot hold a legal
- * FAT32 filesystem, or when a write fails. */
+ * FAT32 filesystem, or when a write fails.
+ *
+ * The cluster size is chosen from the volume's size, not from what would waste
+ * the least - a large volume given small clusters gets an allocation table
+ * bigger than everything that will ever be stored on it. */
 int fat32_format(BLOCK_DEVICE* device, boot_uint64_t first_sector,
                  boot_uint64_t sector_count, const char* label,
-                 boot_uint32_t serial);
+                 boot_uint32_t serial, FAT_FORMAT_PROGRESS progress);
 
-/* Total and free bytes, for `dir` and `mem`. Counting free space walks the
-   whole FAT, so the result is cached after the first call. */
+/* Total and free bytes, for `dir` and `mem`.
+ *
+ * The free figure is seeded from the FSInfo sector at mount and kept current
+ * as clusters are claimed and released. Counting it properly means reading the
+ * whole allocation table - tens of thousands of sectors on a large volume - so
+ * that only happens when FSInfo is missing or says something impossible. */
 boot_uint64_t fat32_total_bytes(VOLUME* volume);
 boot_uint64_t fat32_free_bytes(VOLUME* volume);
 

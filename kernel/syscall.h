@@ -7,9 +7,11 @@
    function numbers, register convention - lives in include/syscall.h, which
    programs include too. */
 
-/* The drive a program's relative paths are resolved against. Set by the shell
-   before starting one. */
-void syscall_set_volume(VOLUME* volume);
+/* Where a program's relative paths are resolved from: the drive, and the
+   directory on it the user was standing in. Set by the shell before starting
+   one. Passing the volume without the directory would leave every program
+   working from the root however deep the user had navigated. */
+void syscall_set_location(VOLUME* volume, const char* directory);
 
 /* Drop every open handle. Called when a program ends, so a program that exits
    without closing its files does not leak them into the next one. */

@@ -1350,6 +1350,9 @@ static boot_uint32_t storage_tag;
 static boot_uint32_t storage_sector_size;
 static boot_uint64_t storage_sectors;
 static int storage_ready;
+/* Why the last transfer failed, as the device explained it. 0xFF when nothing
+   has failed or the device would not say. */
+static boot_uint8_t storage_last_sense = 0xFF;
 
 /* One bulk transfer: a single Normal TRB, rung and waited for.
  *
@@ -1460,19 +1463,54 @@ static int scsi_command(const boot_uint8_t* command, boot_uint32_t command_lengt
     return csw->status == 0;
 }
 
-/* Ask the device why the last command failed, and throw the answer away.
+/* What a sense key means, in the words the reader needs rather than a number.
+   Only the ones a USB stick actually returns are worth naming. */
+static const char* sense_meaning(boot_uint8_t key) {
+    switch (key) {
+    case 0x00: return "no sense";
+    case 0x01: return "recovered error";
+    case 0x02: return "not ready";
+    case 0x03: return "medium error";
+    case 0x04: return "hardware error";
+    case 0x05: return "illegal request";
+    case 0x06: return "unit attention - the medium may have changed";
+    case 0x07: return "write protected";
+    case 0x0B: return "aborted command";
+    default: return "unknown";
+    }
+}
+
+/* Ask the device why the last command failed.
  *
- * The sense data itself is not interesting here - what matters is that a
- * device holding a pending condition will refuse every command until somebody
- * reads it. This is the "medium may have changed" handshake that makes a stick
- * appear dead if skipped. */
-static void request_sense(void) {
+ * Two reasons to do this, and the second was learned the hard way. A device
+ * holding a pending condition refuses every command until somebody reads it -
+ * that is the "medium may have changed" handshake that makes a stick appear
+ * dead if skipped. And the answer itself is the only account anyone gets of
+ * why a transfer failed: without it a write to a write-protected stick and a
+ * write to a dying one produce the same three words on screen.
+ *
+ * Returns the sense key, or 0xFF when the device would not even say. */
+static boot_uint8_t request_sense(void) {
     boot_uint8_t command[6];
+    boot_uint8_t key;
 
     memset(command, 0, sizeof(command));
     command[0] = SCSI_REQUEST_SENSE;
     command[4] = 18;
-    (void)scsi_command(command, sizeof(command), storage_bounce, 18, 1);
+    if (!scsi_command(command, sizeof(command), storage_bounce, 18, 1))
+        return 0xFF;
+
+    key = (boot_uint8_t)(storage_bounce[2] & 0x0F);
+    log("XHCI: storage says ");
+    log(sense_meaning(key));
+    log(" (key ");
+    log_hex(key);
+    log(", code ");
+    log_hex(storage_bounce[12]);
+    log("/");
+    log_hex(storage_bounce[13]);
+    log(")\n");
+    return key;
 }
 
 /* Wait for the device to say it is ready. A stick that has just been given
@@ -1488,7 +1526,7 @@ static int wait_until_ready(void) {
         boot_uint64_t start;
 
         if (scsi_command(command, sizeof(command), 0, 0, 0)) return 1;
-        request_sense();
+        (void)request_sense();
         start = timer_ticks();
         while (timer_ticks() - start < 100) timer_poll();
     }
@@ -1592,6 +1630,7 @@ static int storage_transfer(boot_uint64_t lba, boot_uint32_t count,
 
     if (!storage_ready || !count || !buffer) return 0;
     if (storage_sectors && lba + count > storage_sectors) return 0;
+    storage_last_sense = 0xFF;
 
     per_chunk = (boot_uint32_t)(PAGE_SIZE / storage_sector_size);
     while (count) {
@@ -1606,8 +1645,16 @@ static int storage_transfer(boot_uint64_t lba, boot_uint32_t count,
         command[8] = (boot_uint8_t)chunk;
 
         if (write) memcpy(storage_bounce, caller, bytes);
-        if (!scsi_command(command, sizeof(command), storage_bounce, bytes, !write))
+        if (!scsi_command(command, sizeof(command), storage_bounce, bytes, !write)) {
+            /* Ask why before giving up. The answer goes to the log, and the
+               sense key is kept so the shell can say something better than
+               that a copy failed. */
+            log(write ? "XHCI: write to sector " : "XHCI: read of sector ");
+            log_hex(lba);
+            log(" failed\n");
+            storage_last_sense = request_sense();
             return 0;
+        }
         if (!write) memcpy(caller, storage_bounce, bytes);
 
         caller += bytes;
@@ -1789,6 +1836,11 @@ static int configure_storage(USB_DEVICE* device,
 
 int xhci_has_storage(void) {
     return storage_ready;
+}
+
+const char* xhci_storage_error(void) {
+    if (storage_last_sense == 0xFF) return (const char*)0;
+    return sense_meaning(storage_last_sense);
 }
 
 /* ---- Bringing devices up ------------------------------------------------ */

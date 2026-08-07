@@ -13,6 +13,7 @@
 #include "timer.h"
 #include "pci.h"
 #include "xhci.h"
+#include "graphics.h"
 #include "build.h"
 #include "string.h"
 
@@ -44,11 +45,52 @@ typedef struct {
 static SEARCH searches[SEARCH_MAX];
 
 /* Set by the shell before a program starts, so file paths a program passes are
-   resolved against the same drive the user was on. */
+   resolved from the same place the user was standing. */
+#define WORKING_PATH_MAX 256
 static VOLUME* working_volume;
+static char working_path[WORKING_PATH_MAX] = "\\";
 
-void syscall_set_volume(VOLUME* volume) {
+void syscall_set_location(VOLUME* volume, const char* directory) {
+    boot_uint64_t length;
+
     working_volume = volume;
+    if (!directory || directory[0] != '\\') {
+        working_path[0] = '\\';
+        working_path[1] = 0;
+        return;
+    }
+    length = strlen(directory);
+    if (length >= WORKING_PATH_MAX) length = WORKING_PATH_MAX - 1;
+    memcpy(working_path, directory, length);
+    working_path[length] = 0;
+}
+
+/* Turn whatever a program wrote into a path from the root of the drive.
+ *
+ * A leading backslash already means that. Anything else is relative to where
+ * the shell was, which is the reading DOS has always had and the only one that
+ * makes `ls` or `cat FILE.TXT` behave the same as the built-in commands. */
+static void resolve_working(const char* name, char* result) {
+    boot_uint64_t length = 0;
+
+    if (name[0] == '\\') {
+        while (name[length] && length + 1 < WORKING_PATH_MAX) {
+            result[length] = name[length];
+            length++;
+        }
+        result[length] = 0;
+        return;
+    }
+
+    length = strlen(working_path);
+    if (length >= WORKING_PATH_MAX) length = WORKING_PATH_MAX - 1;
+    memcpy(result, working_path, length);
+    if (length && result[length - 1] != '\\' && length + 1 < WORKING_PATH_MAX)
+        result[length++] = '\\';
+    for (boot_uint64_t index = 0;
+         name[index] && length + 1 < WORKING_PATH_MAX; index++)
+        result[length++] = name[index];
+    result[length] = 0;
 }
 
 void syscall_close_all(void) {
@@ -90,7 +132,8 @@ static void fill_find_data(const FAT_ENTRY* entry, KOI_FIND_DATA* data) {
 }
 
 static long find_first(const char* pattern, KOI_FIND_DATA* data) {
-    char directory[FAT_NAME_MAX];
+    char directory[WORKING_PATH_MAX];
+    char absolute[WORKING_PATH_MAX];
     int slot;
 
     if (!pattern || !data || !working_volume) return SYSCALL_ERROR;
@@ -98,7 +141,8 @@ static long find_first(const char* pattern, KOI_FIND_DATA* data) {
     if (slot == SEARCH_MAX) return SYSCALL_ERROR;
 
     memset(&searches[slot], 0, sizeof(searches[slot]));
-    split_search(pattern, directory, searches[slot].pattern);
+    resolve_working(pattern, absolute);
+    split_search(absolute, directory, searches[slot].pattern);
     if (!searches[slot].pattern[0]) {
         searches[slot].pattern[0] = '*';
         searches[slot].pattern[1] = 0;
@@ -134,6 +178,7 @@ static void write_out(const char* text) {
 }
 
 static long do_open(const char* path, long mode) {
+    char absolute[WORKING_PATH_MAX];
     int slot;
 
     if (!path || !working_volume) return SYSCALL_ERROR;
@@ -142,19 +187,20 @@ static long do_open(const char* path, long mode) {
 
     memset(&handles[slot], 0, sizeof(handles[slot]));
     handles[slot].volume = working_volume;
+    resolve_working(path, absolute);
 
     if (mode == OPEN_WRITE) {
         /* Truncate by removing and recreating: the alternative is walking the
            cluster chain to release the tail, and this is one program-visible
            operation either way. */
         FAT_ENTRY existing;
-        if (fat32_stat(working_volume, path, &existing))
-            (void)fat32_remove(working_volume, path);
-        if (!fat32_create(working_volume, path, 0, &handles[slot].entry))
+        if (fat32_stat(working_volume, absolute, &existing))
+            (void)fat32_remove(working_volume, absolute);
+        if (!fat32_create(working_volume, absolute, 0, &handles[slot].entry))
             return SYSCALL_ERROR;
         handles[slot].writable = 1;
     } else {
-        if (!fat32_stat(working_volume, path, &handles[slot].entry))
+        if (!fat32_stat(working_volume, absolute, &handles[slot].entry))
             return SYSCALL_ERROR;
         if (handles[slot].entry.attributes & FAT_ATTRIBUTE_DIRECTORY)
             return SYSCALL_ERROR;
@@ -379,6 +425,64 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
 
     case SYS_SYSTEXT:
         return system_text(a, b, (char*)c, d);
+
+    /* Graphics. Every drawing call is silently ignored when the program has
+       not entered the mode - the alternative is a program that forgot to enter
+       getting a stream of errors it has no way to act on, when the honest
+       answer is that nothing was drawn. */
+    case SYS_GFX_ENTER: {
+        GRAPHICS_SCREEN screen;
+        KOI_SCREEN* out = (KOI_SCREEN*)a;
+
+        if (!out || !graphics_enter(&screen)) return SYSCALL_ERROR;
+        out->width = screen.width;
+        out->height = screen.height;
+        out->pitch = screen.pitch;
+        out->bytes_per_pixel = screen.bytes_per_pixel;
+        out->pixels = screen.pixels;
+        return 0;
+    }
+
+    case SYS_GFX_LEAVE:
+        graphics_leave();
+        return 0;
+
+    case SYS_GFX_PRESENT:
+        graphics_present();
+        return 0;
+
+    case SYS_GFX_COLOR:
+        return (long)graphics_color((boot_uint8_t)a, (boot_uint8_t)b,
+                                    (boot_uint8_t)c);
+
+    case SYS_GFX_CLEAR:
+        graphics_clear((boot_uint32_t)a);
+        return 0;
+
+    case SYS_GFX_PIXEL:
+        graphics_pixel(KOI_POINT_X(a), KOI_POINT_Y(a), (boot_uint32_t)b);
+        return 0;
+
+    case SYS_GFX_LINE:
+        graphics_line(KOI_POINT_X(a), KOI_POINT_Y(a),
+                      KOI_POINT_X(b), KOI_POINT_Y(b), (boot_uint32_t)c);
+        return 0;
+
+    case SYS_GFX_RECT:
+        graphics_rect(KOI_POINT_X(a), KOI_POINT_Y(a),
+                      KOI_POINT_X(b), KOI_POINT_Y(b), (boot_uint32_t)c);
+        return 0;
+
+    case SYS_GFX_FILL:
+        graphics_fill(KOI_POINT_X(a), KOI_POINT_Y(a),
+                      KOI_POINT_X(b), KOI_POINT_Y(b), (boot_uint32_t)c);
+        return 0;
+
+    case SYS_GFX_TEXT:
+        graphics_text(KOI_POINT_X(a), KOI_POINT_Y(a), (const char*)b,
+                      (boot_uint32_t)c, (boot_uint32_t)(d < 0 ? 0 : d),
+                      d == KOI_TEXT_TRANSPARENT);
+        return 0;
 
     default:
         return SYSCALL_ERROR;

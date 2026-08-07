@@ -21,6 +21,7 @@
 #include "apic.h"
 #include "build.h"
 #include "xhci.h"
+#include "graphics.h"
 #include "timer.h"
 
 /* Everything the kernel reports goes to both the framebuffer and COM1. If a
@@ -58,6 +59,7 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
     /* memory_init first: console_init allocates its back buffer. */
     memory_init(info);
     console_init(info);
+    graphics_init(info);
     console_use_theme();
     console_clear();
     console_set_color(COLOR_WHITE, console_theme()->background);
