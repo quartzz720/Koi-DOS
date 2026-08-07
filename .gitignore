@@ -41,3 +41,7 @@ Thumbs.db
 .idea/
 *.code-workspace
 .claude/settings.local.json
+
+# Logs pulled off a machine with `log <file>`. Useful to look at, never worth
+# committing - they are one boot of one machine.
+*.log

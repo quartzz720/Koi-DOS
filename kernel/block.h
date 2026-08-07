@@ -24,6 +24,15 @@ typedef struct BLOCK_DEVICE {
 /* Register a device. Returns the assigned index, or -1 when full. */
 int block_register(const BLOCK_DEVICE* device);
 
+/* Forget one by name, for a device that has been unplugged.
+ *
+ * The entry is emptied rather than the list compacted: an index handed out
+ * earlier has to keep meaning what it meant, and a volume still holding a
+ * pointer to this device would otherwise be holding a pointer to a different
+ * one. Reads and writes to a forgotten device fail rather than reaching
+ * whatever is in that socket now. */
+int block_forget(const char* name);
+
 boot_uint32_t block_device_count(void);
 BLOCK_DEVICE* block_device(boot_uint32_t index);
 

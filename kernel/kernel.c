@@ -244,7 +244,11 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
             report(audio_device_name());
             report(" CODEC, 48 KHZ STEREO\n");
         } else {
-            report("AUDIO: NOT FOUND\n");
+            /* The reason, not just the fact. This line is the only explanation
+               a machine with no serial port will ever give. */
+            report("AUDIO: ");
+            report(audio_failure());
+            report("\n");
         }
 
         /* Every xHCI controller on the bus, not the first one. A board

@@ -1,4 +1,5 @@
 #include "pci.h"
+#include "timer.h"
 #include "io.h"
 
 #define PCI_CONFIG_ADDRESS 0xCF8U
@@ -109,6 +110,81 @@ void pci_enable_bus_mastering(const PCI_DEVICE* device) {
     command_status |= 0x00000006U; /* memory-space + bus-master enable */
     pci_write32(device->bus, device->device, device->function, 0x04,
                 command_status);
+}
+
+/* A genuine byte-wide access, not a dword read-modify-write.
+ *
+ * The difference matters: the registers this exists for are single bytes
+ * sitting beside other single bytes, and writing the enclosing dword back
+ * writes its neighbours too. One of those neighbours being write-one-to-clear
+ * or reserved-must-be-zero is exactly the kind of thing that works on one
+ * chipset and does something else on another. The address port takes the
+ * aligned dword; the data port is addressed at byte resolution. */
+boot_uint8_t pci_config_read8(const PCI_DEVICE* device, boot_uint8_t offset) {
+    boot_uint32_t address = 0x80000000U | ((boot_uint32_t)device->bus << 16) |
+        ((boot_uint32_t)device->device << 11) |
+        ((boot_uint32_t)device->function << 8) | (offset & 0xFCU);
+    outl(PCI_CONFIG_ADDRESS, address);
+    return inb((boot_uint16_t)(PCI_CONFIG_DATA + (offset & 3)));
+}
+
+void pci_config_write8(const PCI_DEVICE* device, boot_uint8_t offset,
+                       boot_uint8_t value) {
+    boot_uint32_t address = 0x80000000U | ((boot_uint32_t)device->bus << 16) |
+        ((boot_uint32_t)device->device << 11) |
+        ((boot_uint32_t)device->function << 8) | (offset & 0xFCU);
+    outl(PCI_CONFIG_ADDRESS, address);
+    outb((boot_uint16_t)(PCI_CONFIG_DATA + (offset & 3)), value);
+}
+
+boot_uint32_t pci_config_read(const PCI_DEVICE* device, boot_uint8_t offset) {
+    return pci_read32(device->bus, device->device, device->function, offset);
+}
+
+void pci_config_write(const PCI_DEVICE* device, boot_uint8_t offset,
+                      boot_uint32_t value) {
+    pci_write32(device->bus, device->device, device->function, offset, value);
+}
+
+/* The capability list: a chain through configuration space, each entry saying
+   what it is and where the next one starts. Bounded by a step count as well as
+   by the terminator, because a device that describes a loop would otherwise
+   take the kernel with it. */
+static boot_uint8_t find_capability(const PCI_DEVICE* device, boot_uint8_t id) {
+    boot_uint32_t status = pci_config_read(device, 0x04);
+    boot_uint8_t offset;
+    int steps;
+
+    if (!(status & 0x00100000U)) return 0;   /* no capability list at all */
+    offset = (boot_uint8_t)(pci_config_read(device, 0x34) & 0xFC);
+    for (steps = 0; offset && steps < 48; steps++) {
+        boot_uint32_t header = pci_config_read(device, offset);
+        if ((header & 0xFF) == id) return offset;
+        offset = (boot_uint8_t)((header >> 8) & 0xFC);
+    }
+    return 0;
+}
+
+int pci_power_on(const PCI_DEVICE* device) {
+    boot_uint8_t capability = find_capability(device, 0x01);
+    boot_uint32_t control;
+
+    /* No power management capability means the device cannot be anywhere but
+       D0, which is the answer the caller wants. */
+    if (!capability) return 1;
+
+    control = pci_config_read(device, (boot_uint8_t)(capability + 4));
+    if (!(control & 0x3)) return 1;
+
+    /* Writing D0 also clears the two write-one-to-clear status bits in the top
+       half of the same register if they are set, which is harmless and is what
+       every other driver does. */
+    pci_config_write(device, (boot_uint8_t)(capability + 4), control & ~0x3U);
+    /* The device is allowed 10 ms to become usable, and reading its registers
+       before then is exactly the mistake this call exists to prevent. */
+    timer_wait(10);
+    control = pci_config_read(device, (boot_uint8_t)(capability + 4));
+    return (control & 0x3) == 0;
 }
 
 boot_uint64_t pci_bar_address(const PCI_DEVICE* device, boot_uint8_t index) {

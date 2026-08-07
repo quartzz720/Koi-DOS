@@ -134,6 +134,7 @@ int audio_init(void) {
 
 int audio_ready(void) { return ready; }
 const char* audio_device_name(void) { return device_name; }
+const char* audio_failure(void) { return ready ? "none" : hda_failure(); }
 
 void audio_set_volume(int volume) {
     if (volume < 0) volume = 0;
@@ -410,8 +411,30 @@ void audio_service(void) {
     if (target > played + HDA_RING_FRAMES - 64)
         target = played + HDA_RING_FRAMES - 64;
 
-    while (written < target) {
-        mix_frame(ring + (written % HDA_RING_FRAMES) * HDA_CHANNELS);
-        written++;
+    {
+        boot_uint64_t first = written;
+        while (written < target) {
+            mix_frame(ring + (written % HDA_RING_FRAMES) * HDA_CHANNELS);
+            written++;
+        }
+        /* And out of the cache, for the same reason the descriptor list is
+           flushed once: a controller reading this without snooping would keep
+           playing whatever was in memory before. Two or three cache lines a
+           millisecond, and nothing at all on a machine that does snoop. */
+        if (written > first) {
+            boot_uint32_t from = (boot_uint32_t)(first % HDA_RING_FRAMES);
+            boot_uint32_t count = (boot_uint32_t)(written - first);
+
+            if (from + count <= HDA_RING_FRAMES) {
+                cpu_flush_cache(ring + from * HDA_CHANNELS,
+                                (boot_uint64_t)count * HDA_CHANNELS * 2);
+            } else {
+                boot_uint32_t head = HDA_RING_FRAMES - from;
+                cpu_flush_cache(ring + from * HDA_CHANNELS,
+                                (boot_uint64_t)head * HDA_CHANNELS * 2);
+                cpu_flush_cache(ring,
+                                (boot_uint64_t)(count - head) * HDA_CHANNELS * 2);
+            }
+        }
     }
 }

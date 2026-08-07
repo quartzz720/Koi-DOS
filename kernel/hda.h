@@ -68,6 +68,12 @@ const HDA_PIN* hda_pin(boot_uint32_t index);
 boot_uint8_t hda_converter(void);
 const char* hda_output_name(void);
 
+/* Where initialisation stopped, when it did. The reason used to go to COM1 and
+   nowhere else, which is fine on a machine with a serial port and useless on a
+   laptop - and a laptop is exactly where the hardware behaves in ways QEMU
+   never will. */
+const char* hda_failure(void);
+
 /* The ring the controller is reading from, as interleaved left/right pairs.
    Writing to it is how sound is made; there is no other path. */
 short* hda_ring(void);

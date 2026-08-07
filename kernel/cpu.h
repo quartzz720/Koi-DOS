@@ -23,6 +23,19 @@ void gdt_init(void);
    exactly the diagnostic the panic screen exists to print. */
 void tss_init(void);
 
+/* Push a range of memory out of the cache, and order it against what follows.
+ *
+ * On x86 a device's DMA snoops the caches, so this is normally unnecessary -
+ * and normally is not always. An HD Audio controller marks its stream traffic
+ * with a priority bit that some chipsets tie to non-snooped transfers, and a
+ * non-snooped read of a buffer the CPU has only written into its own cache
+ * returns whatever was in memory before: usually zeros. Nothing fails, no
+ * error bit is set, and the device simply transfers nothing.
+ *
+ * Costs three cache lines a millisecond where it is not needed, and is the
+ * difference between sound and silence where it is. */
+void cpu_flush_cache(const void* address, boot_uint64_t bytes);
+
 static inline void cpu_halt(void) {
     __asm__ volatile ("hlt");
 }

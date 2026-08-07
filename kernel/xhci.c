@@ -62,6 +62,7 @@
 /* PORTSC is a minefield of write-1-to-clear bits. Writing the value straight
    back would clear every change flag and - worse - bit 1 disables the port
    rather than reporting it. Any read-modify-write has to mask these out. */
+#define PORTSC_CONNECT_CHANGE 0x00020000    /* something came or went */
 #define PORTSC_CHANGE_BITS 0x00FE0000
 #define PORTSC_WRITE_MASK (PORTSC_CHANGE_BITS | PORTSC_ENABLED)
 
@@ -72,6 +73,7 @@
 
 /* Commands. */
 #define TRB_ENABLE_SLOT 9
+#define TRB_DISABLE_SLOT 10
 #define TRB_ADDRESS_DEVICE 11
 #define TRB_CONFIGURE_ENDPOINT 12
 #define TRB_EVALUATE_CONTEXT 13
@@ -168,6 +170,11 @@
    controllers in total. The first real machine had two - a chipset one with
    fourteen root ports and a CPU one - so one is definitively not enough. */
 #define USB_MAX_DEVICES 8
+
+/* Root-hub ports a controller may have. The field in HCSPARAMS1 is eight bits
+   wide; nothing real has more than a couple of dozen, and the table this sizes
+   is one word per port. */
+#define XHCI_MAX_PORTS 64
 #define XHCI_MAX_CONTROLLERS 4
 
 /* A Transfer Request Block: the unit every xHCI ring is made of. */
@@ -215,6 +222,11 @@ typedef struct XHCI_CONTROLLER {
     TRB* event_ring;
     boot_uint32_t event_index;
     boot_uint32_t event_cycle;          /* what the controller stamps for us */
+
+    /* What each root-hub port had last time anyone looked. Hot-plug is the
+       difference between this and what it has now: the change bit says
+       something happened, and the connect bit says which way. */
+    boot_uint32_t connected[XHCI_MAX_PORTS];
 
     boot_uint32_t port_count;
     boot_uint32_t slot_count;
@@ -745,6 +757,22 @@ static boot_uint32_t enable_slot(XHCI_CONTROLLER* self) {
     }
 }
 
+/* Give a slot back. A device that has been unplugged still owns one until the
+   controller is told, and slots are a small fixed number. */
+static void disable_slot(XHCI_CONTROLLER* self, boot_uint32_t slot) {
+    TRB event;
+
+    if (!slot) return;
+    enqueue_command(self, 0, 0,
+                    (TRB_DISABLE_SLOT << TRB_TYPE_SHIFT) | (slot << 24));
+    if (!wait_for_command(self, &event, 1000)) {
+        log_controller(self);
+        log("disable slot produced no event\n");
+        return;
+    }
+    self->device_contexts[slot] = 0;
+}
+
 /* The maximum packet size a control endpoint starts with, which depends only
    on the link speed until the device descriptor says otherwise. */
 static boot_uint32_t default_packet_size(boot_uint32_t speed) {
@@ -1203,7 +1231,11 @@ static int keyboard_event(const XHCI_CONTROLLER* self, const TRB* event) {
 void xhci_poll(void) {
     TRB event;
 
-    if (!keyboard_ready) return;
+    /* Not conditional on a keyboard any more. The event rings have to be
+       drained whatever is attached - an event nobody collects stalls the ring
+       it is on - and this is also where a device that has just been plugged in
+       gets noticed. */
+    xhci_service();
     /* Every controller, not just the keyboard's: an event left unread stalls
        its own ring, and a transfer event nobody collects is a device that
        never speaks again. */
@@ -1942,11 +1974,89 @@ static void attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
     free_page(configuration);
 }
 
+/* Something was unplugged. Let go of it before anything tries to talk to it.
+ *
+ * A device that has gone still answers every register read with plausible
+ * values, so nothing notices on its own: a transfer posted to a dead slot
+ * simply never completes, and the caller waits out its timeout for as long as
+ * the machine is on. */
+static void detach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
+    for (boot_uint32_t index = 0; index < self->device_count; index++) {
+        USB_DEVICE* device = &self->devices[index];
+
+        if (!device->used || device->port != port) continue;
+
+        log_controller(self);
+        log("port ");
+        log_dec(port + 1);
+        log(" was unplugged\n");
+
+        if (device == storage_device) {
+            storage_ready = 0;
+            storage_device = (USB_DEVICE*)0;
+            block_forget("usb0");
+        }
+        if (device == keyboard_device) {
+            keyboard_ready = 0;
+            keyboard_device = (USB_DEVICE*)0;
+        }
+
+        disable_slot(self, device->slot);
+        device->used = 0;
+        device->slot = 0;
+    }
+}
+
+/* One pass over the root hub, acting on anything that has changed.
+ *
+ * Polled rather than driven by the port change event, because the controller's
+ * interrupt is not wired to a handler: the events are collected anyway, and a
+ * port that changed says so in its own register whether or not anybody read
+ * the ring. */
+void xhci_service(void) {
+    for (boot_uint32_t index = 0; index < controller_count; index++) {
+        XHCI_CONTROLLER* self = &controllers[index];
+
+        if (!self->running) continue;
+        for (boot_uint32_t port = 0; port < self->port_count; port++) {
+            boot_uint32_t status = op_read32(self, OP_PORTSC(port));
+            boot_uint32_t now = (status & PORTSC_CONNECTED) ? 1 : 0;
+
+            /* Acknowledge the change first. Leaving it set means the next pass
+               sees the same news again, and a port that is being plugged and
+               unplugged faster than this runs would otherwise never settle. */
+            if (status & PORTSC_CHANGE_BITS)
+                op_write32(self, OP_PORTSC(port),
+                           (status & ~PORTSC_WRITE_MASK) |
+                           (status & PORTSC_CHANGE_BITS));
+
+            if (now == self->connected[port]) continue;
+            self->connected[port] = now;
+
+            if (now) {
+                log_controller(self);
+                log("port ");
+                log_dec(port + 1);
+                log(" has a new device, speed ");
+                log_dec((status >> PORTSC_SPEED_SHIFT) & PORTSC_SPEED_MASK);
+                log("\n");
+                attach_device(self, port);
+            } else {
+                detach_device(self, port);
+            }
+            self->connected_ports = 0;
+            for (boot_uint32_t other = 0; other < self->port_count; other++)
+                self->connected_ports += self->connected[other];
+        }
+    }
+}
+
 static void survey_ports(XHCI_CONTROLLER* self) {
     self->connected_ports = 0;
     for (boot_uint32_t port = 0; port < self->port_count; port++) {
         boot_uint32_t status = op_read32(self, OP_PORTSC(port));
         if (!(status & PORTSC_CONNECTED)) continue;
+        self->connected[port] = 1;
         self->connected_ports++;
         log_controller(self);
         log("port ");

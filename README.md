@@ -107,6 +107,7 @@ make at all, because it used to read 100 ms as 0.
 | `shutdown`, `reboot` | through ACPI, which is the only way there is |
 | `beep [hz] [ms]` | a tone, if the machine has a sound device |
 | `sound` | the sound device, and which output it chose |
+| `log [file]` | the kernel log: on screen, or written to a file |
 | `echo`, `ver`, `cls`, `help` | the usual |
 | `Z:` | change drive |
 
@@ -114,6 +115,12 @@ The three destructive ones ask before they act, and none of them will touch the 
 is running from. `format` and `part` require the partition or disk to be typed back by name —
 `y` is too easy to press by reflex — and `setup` shows the licence and the layout it is about to
 write before it writes anything.
+
+`log` is the same idea taken to its end. Every driver says what it found and why it gave up over
+COM1 — and no machine made this century has a COM1. The text is kept in memory as well, so `log`
+prints it and `log KOI.LOG` writes it to a file, which is the only way to get a boot log off a
+laptop and onto something that can read it. It was written the first time a sound card failed on
+real hardware and the explanation went to a port that was not there.
 
 `mem` doubles as the system's self-description, because the alternative to a line reading
 `USB : keyboard, storage` is rebooting with a serial cable attached to find out whether a driver
@@ -204,7 +211,8 @@ Z:\> color yellow blue     text and background
 
 **HD Audio**, because AC'97 is emulated everywhere and fitted to nothing: every machine this
 could run on has an HDA controller, and QEMU emulating the easy one as well is a trap rather than
-a shortcut. **The PC speaker is not used at all** — no laptop has had one for years, and the
+a shortcut. Works on real hardware, where it found the one thing QEMU could never have shown —
+see below. **The PC speaker is not used at all** — no laptop has had one for years, and the
 thing that makes the noise is the same chip the headphone socket comes out of.
 
 The driver does one thing — it finds a codec, traces a path from a physical output back through
@@ -243,6 +251,14 @@ Everything above that is [kernel/audio.c](kernel/audio.c), which has no hardware
 voices, each with its own rate, volume and pan, resampled into the ring in 32.32 fixed point —
 there is no floating point anywhere, because nothing configures SSE state after
 `ExitBootServices`.
+
+**The cache is flushed on the way out.** On x86 a device's DMA snoops the processor's caches, so
+this should be unnecessary — and on the first real machine it was not. That controller marks its
+stream traffic with a priority bit it will not let anyone clear, and traffic marked that way does
+not snoop: the descriptor list had never left the cache, so the controller read a list of
+zero-length buffers, transferred nothing and reported no error, because a buffer of zero bytes is
+not an error. Meanwhile the command rings worked perfectly, because they are not a stream. Two or
+three cache lines per millisecond, and it is the difference between silence and sound.
 
 **The mixer runs from the timer interrupt.** Not for precision: forty-eight frames a millisecond
 is nothing. It is because the alternative is mixing wherever the system happens to be looping,

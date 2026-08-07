@@ -214,6 +214,11 @@ cp -f "$OVMF_VARS" "$VARS"
 # chipset controller and a processor one, and no say in which socket a device
 # gets plugged into. A single controller made every event unambiguous by
 # accident and hid the bug completely.
+#
+# The stick carries an id so it can be pulled out and pushed back in from the
+# monitor - `device_del usbstick`, then `device_add usb-storage,bus=xhci1.0,
+# drive=stick,id=usbstick`. That is the only way to test hot-plug without
+# standing next to the machine.
 exec qemu-system-x86_64 \
   -m 2G \
   -machine q35 \
@@ -226,7 +231,7 @@ exec qemu-system-x86_64 \
   -device usb-kbd,bus=xhci0.0 \
   -device qemu-xhci,id=xhci1 \
   -drive id=stick,format=raw,file="$STICK",if=none \
-  -device usb-storage,bus=xhci1.0,drive=stick \
+  -device usb-storage,bus=xhci1.0,drive=stick,id=usbstick \
   -drive id=ssd,format=raw,file="$NVME",if=none \
   -device nvme,drive=ssd,serial=KOI0001 \
   -audiodev "$AUDIO_BACKEND" \

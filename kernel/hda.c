@@ -4,6 +4,7 @@
 #include "serial.h"
 #include "timer.h"
 #include "paging.h"
+#include "cpu.h"
 
 /* Intel High Definition Audio.
  *
@@ -36,6 +37,12 @@
 #define REG_STATESTS 0x0E       /* word: one bit per codec that answered */
 #define REG_INTCTL 0x20
 #define REG_INTSTS 0x24
+/* Global and controller interrupt enables. Nothing is routed to a handler, so
+   nothing is delivered - but the RIRB already taught us that a controller can
+   treat "enabled" as part of how it runs rather than only as where it
+   reports, and that lesson cost an afternoon. */
+#define INTCTL_GLOBAL 0x80000000U
+#define INTCTL_CONTROLLER 0x40000000U
 #define REG_CORBLBASE 0x40
 #define REG_CORBUBASE 0x44
 #define REG_CORBWP 0x48         /* word */
@@ -49,6 +56,8 @@
 #define REG_RIRBCTL 0x5C        /* byte */
 #define REG_RIRBSTS 0x5D        /* byte */
 #define REG_RIRBSIZE 0x5E       /* byte */
+#define REG_DPLBASE 0x70        /* DMA position buffer, low half plus enable */
+#define REG_DPUBASE 0x74
 
 #define GCTL_RESET 0x00000001U          /* held low is reset; 1 is running */
 
@@ -77,6 +86,19 @@
 
 #define SD_CTL_RESET 0x01U
 #define SD_CTL_RUN 0x02U
+/* Completion, FIFO-error and descriptor-error interrupts. Enabled even though
+   no interrupt is delivered anywhere, because the RIRB taught us that a
+   controller can treat "enabled" as part of how it runs rather than only as
+   where it reports - and they cost nothing with INTCTL clear. */
+#define SD_CTL_INTERRUPTS 0x1CU
+
+/* The DMA position buffer: eight bytes per stream descriptor, saying where
+   each one has got to, written by the controller into memory.
+ *
+ * The same answer as SDnLPIB, by a different route, and worth having both:
+ * LPIB is the obvious one and there are controllers where it does not move,
+ * which is indistinguishable from a stream that never started. */
+#define DPLBASE_ENABLE 0x00000001U
 
 /* 48 kHz, 16-bit, two channels. Bit 14 clear selects the 48 kHz base, the
    divider and multiplier fields are 1:1, bits 6:4 are the sample width and
@@ -95,7 +117,12 @@
 #define VERB_SET_STREAM_CHANNEL 0x706
 #define VERB_SET_PIN_CONTROL 0x707
 #define VERB_GET_CONFIG_DEFAULT 0xF1C
+#define VERB_GET_POWER_STATE 0xF05
+#define VERB_GET_STREAM_CHANNEL 0xF06
+#define VERB_GET_PIN_CONTROL 0xF07
+#define VERB_GET_FORMAT 0xA00           /* 4-bit verb 0xA, reads SET_FORMAT */
 #define VERB_GET_PIN_SENSE 0xF09
+#define VERB_SET_PIN_SENSE 0x709        /* take a fresh measurement */
 #define VERB_SET_EAPD 0x70C
 #define VERB_SET_FORMAT 0x200           /* 4-bit verb 0x2, 16-bit payload */
 #define VERB_SET_AMP 0x300              /* 4-bit verb 0x3, 16-bit payload */
@@ -104,6 +131,8 @@
 #define PARAM_NODE_COUNT 0x04
 #define PARAM_FUNCTION_TYPE 0x05
 #define PARAM_WIDGET_CAP 0x09
+#define PARAM_PCM_SIZES 0x0A            /* which rates and widths it can do */
+#define PARAM_STREAM_FORMATS 0x0B
 #define PARAM_PIN_CAP 0x0C
 #define PARAM_CONNECTION_COUNT 0x0E
 #define PARAM_OUT_AMP_CAP 0x12
@@ -123,6 +152,7 @@
 #define WIDGET_CAP_DIGITAL 0x0200U
 #define WIDGET_CAP_POWER 0x0400U
 
+#define PIN_CAP_TRIGGER 0x00000002U     /* the measurement must be asked for */
 #define PIN_CAP_PRESENCE 0x00000004U
 #define PIN_CAP_OUTPUT 0x00000010U
 #define PIN_CAP_HEADPHONE 0x00000008U
@@ -169,12 +199,33 @@ static boot_uint16_t rirb_read;
 
 static BDL_ENTRY* bdl;
 static short* ring;                     /* HDA_RING_FRAMES * 2 samples */
+static boot_uint32_t* positions;        /* the DMA position buffer */
 static boot_uint32_t stream_offset;     /* the output stream descriptor */
+static boot_uint32_t stream_index;      /* which descriptor that is */
+static int position_source;             /* 1 LPIB, 2 the position buffer */
 
+static const PCI_DEVICE* audio_controller;
 static boot_uint8_t codec_address;
+static boot_uint8_t function_group;
 static boot_uint32_t codec_vendor;
 static const char* codec_name = "none";
+static void log(const char* text);
+static const char* failure = "no controller on the PCI bus";
 static int ready;
+
+/* Where initialisation stopped.
+ *
+ * Every one of these messages used to go to COM1 and nowhere else, which is
+ * fine on a machine with a serial port and useless on a laptop - and a laptop
+ * is exactly where an HD Audio controller behaves in ways QEMU never will. The
+ * reason is kept so that `sound` can print it. */
+static int give_up(const char* reason) {
+    failure = reason;
+    log("HDA: ");
+    log(reason);
+    log("\n");
+    return 0;
+}
 
 static void log(const char* text) { serial_write(text); }
 static void log_dec(boot_uint64_t value) { serial_write_dec(value); }
@@ -215,20 +266,16 @@ static int controller_reset(void) {
     write32(REG_GCTL, read32(REG_GCTL) & ~GCTL_RESET);
     start = timer_ticks();
     while (read32(REG_GCTL) & GCTL_RESET) {
-        if (timer_expired(start, 100)) {
-            log("HDA: the controller would not enter reset\n");
-            return 0;
-        }
+        if (timer_expired(start, 100))
+            return give_up("the controller would not enter reset");
     }
     timer_wait(1);
 
     write32(REG_GCTL, read32(REG_GCTL) | GCTL_RESET);
     start = timer_ticks();
     while (!(read32(REG_GCTL) & GCTL_RESET)) {
-        if (timer_expired(start, 100)) {
-            log("HDA: the controller would not leave reset\n");
-            return 0;
-        }
+        if (timer_expired(start, 100))
+            return give_up("the controller would not leave reset");
     }
 
     /* The codecs need a moment after the link comes up before they will say
@@ -336,6 +383,14 @@ static int command(boot_uint8_t codec, boot_uint8_t node,
        See the comment on RINTCNT above. */
     write8(REG_RIRBSTS, RIRBSTS_RESPONSE);
     return 1;
+}
+
+/* One verb whose answer is wanted rather than discarded. */
+static boot_uint32_t codec_ask(boot_uint8_t node, boot_uint32_t verb,
+                               boot_uint32_t payload) {
+    boot_uint32_t value = 0;
+    if (!command(codec_address, node, verb, payload, &value)) return 0xFFFFFFFFU;
+    return value;
 }
 
 static boot_uint32_t parameter(boot_uint8_t node, boot_uint32_t which) {
@@ -457,10 +512,30 @@ static int trace(boot_uint8_t node, int depth) {
 static boot_uint8_t pin_sense(boot_uint8_t node, boot_uint32_t configuration,
                               boot_uint32_t pin_capabilities) {
     boot_uint32_t connectivity = (configuration >> 30) & 0x3;
+    boot_uint32_t capabilities = parameter(node, PARAM_WIDGET_CAP);
     boot_uint32_t response = 0;
 
     if (connectivity == 2) return HDA_SENSE_FIXED;
     if (!(pin_capabilities & PIN_CAP_PRESENCE)) return HDA_SENSE_UNKNOWN;
+
+    /* A sleeping pin answers, and answers "nothing there".
+     *
+     * Only the pin that was chosen used to be powered up, and the choosing
+     * happens after this - so every socket was asked while it was still in
+     * whatever state the firmware left it, and a laptop with headphones in it
+     * reported an empty jack. The measurement is a physical one; the circuit
+     * that makes it has to be switched on first. */
+    power_up(node, capabilities);
+    if (capabilities & WIDGET_CAP_POWER) timer_wait(1);
+
+    /* Some pins do not measure continuously - the reading is whatever was
+       taken last, which on a machine that has just started is nothing at all
+       until it is asked for. */
+    if (pin_capabilities & PIN_CAP_TRIGGER) {
+        command(codec_address, node, VERB_SET_PIN_SENSE, 0, 0);
+        timer_wait(2);
+    }
+
     if (!command(codec_address, node, VERB_GET_PIN_SENSE, 0, &response))
         return HDA_SENSE_UNKNOWN;
     return (response & 0x80000000U) ? HDA_SENSE_PRESENT : HDA_SENSE_EMPTY;
@@ -575,18 +650,12 @@ static int find_path(boot_uint8_t first_widget, boot_uint32_t widget_count) {
             log("HDA: nothing is plugged in; using the best output anyway\n");
     }
 
-    if (best < 0) {
-        log("HDA: the codec has no analogue output\n");
-        return 0;
-    }
+    if (best < 0) return give_up("the codec has no analogue output");
 
     pins[best].chosen = 1;
     path_pin = pins[best].node;
     path_dac = 0;
-    if (!trace(path_pin, 0)) {
-        log("HDA: no converter feeds the output\n");
-        return 0;
-    }
+    if (!trace(path_pin, 0)) return give_up("no converter feeds the output");
 
     {
         boot_uint32_t capabilities = parameter(path_pin, PARAM_WIDGET_CAP);
@@ -659,6 +728,7 @@ static int find_codec(void) {
             command(codec_address, function, VERB_SET_POWER_STATE, 0, 0);
             timer_wait(2);
 
+            function_group = function;
             widgets = parameter(function, PARAM_NODE_COUNT);
             if (find_path((boot_uint8_t)((widgets >> 16) & 0xFF),
                           widgets & 0xFF))
@@ -690,20 +760,172 @@ static int find_codec(void) {
 
 /* ---- The stream ---------------------------------------------------------- */
 
-static int stream_start(void) {
+/* Configure one output stream descriptor and see whether it moves.
+ *
+ * Tried per descriptor rather than assuming the first, because a descriptor
+ * the firmware left in a state we cannot see is indistinguishable from a
+ * driver that has the arithmetic wrong, and the controller has four. */
+static int try_stream(boot_uint32_t which, boot_uint32_t bytes) {
+    boot_uint64_t start;
+
+    stream_index = which;
+    stream_offset = STREAM_BASE + which * STREAM_STRIDE;
+
+    /* Reset the stream before configuring it. The run bit must be clear first,
+       and the reset bit is written, waited for, cleared and waited for again.
+       Both waits are failures rather than shrugs: a stream still held in reset
+       accepts every register write below and then does nothing, which is a far
+       more confusing thing to be told about later. */
+    write8(stream_offset + SD_CTL, 0);
+    timer_wait(1);
+    write8(stream_offset + SD_CTL, SD_CTL_RESET);
+    start = timer_ticks();
+    while (!(read8(stream_offset + SD_CTL) & SD_CTL_RESET))
+        if (timer_expired(start, 100))
+            return give_up("the stream would not enter reset");
+    write8(stream_offset + SD_CTL, 0);
+    start = timer_ticks();
+    while (read8(stream_offset + SD_CTL) & SD_CTL_RESET)
+        if (timer_expired(start, 100))
+            return give_up("the stream would not leave reset");
+
+    write32(stream_offset + SD_CBL, bytes);
+    write16(stream_offset + SD_LVI, BDL_ENTRIES - 1);
+    write16(stream_offset + SD_FMT, FORMAT_48K_16_STEREO);
+    write32(stream_offset + SD_BDPL, (boot_uint32_t)(unsigned long long)bdl);
+    write32(stream_offset + SD_BDPU,
+            (boot_uint32_t)(((boot_uint64_t)(unsigned long long)bdl) >> 32));
+
+    /* The stream tag lives in the top byte of the control register, and the
+       codec has to be told the same number: that pairing is what connects this
+       buffer to that converter. Written as one dword rather than one byte,
+       because a controller is entitled to latch the register as a whole and a
+       byte write leaves the other two carrying whatever reset left there. */
+    write32(stream_offset + SD_CTL,
+            ((boot_uint32_t)STREAM_TAG << 20) | SD_CTL_INTERRUPTS);
+    command(codec_address, path_dac, VERB_SET_FORMAT, FORMAT_48K_16_STEREO, 0);
+    command(codec_address, path_dac, VERB_SET_STREAM_CHANNEL,
+            (STREAM_TAG << 4) | 0, 0);
+    /* Clear whatever the reset left in the status register: the error bits are
+       write-one-to-clear and a stale one reads as a fresh failure. */
+    write8(stream_offset + SD_STS, 0x1C);
+
+    /* The run bit on its own, as a byte, leaving the rest of the register
+       alone. A dword write here would also write the status register that
+       shares its last byte, and setting a stream running is not the moment to
+       find out whether a controller minds. */
+    write8(stream_offset + SD_CTL,
+           (boot_uint8_t)(read8(stream_offset + SD_CTL) | SD_CTL_RUN));
+
+    /* Proof, not faith: something has to move. Both position sources are
+       watched, because a controller whose LPIB does not advance is not the
+       same thing as a stream that never started, and the two cannot be told
+       apart if only one is consulted. */
+    start = timer_ticks();
+    for (;;) {
+        if (read32(stream_offset + SD_LPIB)) { position_source = 1; return 1; }
+        if (positions[stream_index * 2]) { position_source = 2; return 1; }
+        if (timer_expired(start, 150)) break;
+    }
+
+    log("HDA: output stream ");
+    log_dec(which);
+    log(" did not move (ctl ");
+    log_hex(read32(stream_offset + SD_CTL));
+    log(", sts ");
+    log_hex(read8(stream_offset + SD_STS));
+    log(", cbl ");
+    log_hex(read32(stream_offset + SD_CBL));
+    log(", lvi ");
+    log_hex(read16(stream_offset + SD_LVI));
+    log(", fmt ");
+    log_hex(read16(stream_offset + SD_FMT));
+    log(", bdl ");
+    log_hex(read32(stream_offset + SD_BDPU));
+    log(":");
+    log_hex(read32(stream_offset + SD_BDPL));
+    log(", position ");
+    log_hex(positions[which * 2]);
+    log(")\n");
+    /* What the codec made of what it was told.
+     *
+     * Everything above is the controller's side, and all of it reads back
+     * correct - so the question moves to the other end of the link. A
+     * converter that never took the format or the stream tag is a converter
+     * that is not listening, and on a controller that idles its link when
+     * nothing is streaming, that is enough to keep the DMA engine asleep.
+     * Asking rather than assuming, because every one of these was written by
+     * a command whose reply was thrown away. */
+    log("HDA: converter ");
+    log_dec(path_dac);
+    log(" format ");
+    log_hex(codec_ask(path_dac, VERB_GET_FORMAT, 0));
+    log(", stream/channel ");
+    log_hex(codec_ask(path_dac, VERB_GET_STREAM_CHANNEL, 0));
+    log(", power ");
+    log_hex(codec_ask(path_dac, VERB_GET_POWER_STATE, 0));
+    log(", widget ");
+    log_hex(parameter(path_dac, PARAM_WIDGET_CAP));
+    log("\n");
+    log("HDA: converter rates ");
+    log_hex(parameter(path_dac, PARAM_PCM_SIZES));
+    log(", formats ");
+    log_hex(parameter(path_dac, PARAM_STREAM_FORMATS));
+    log("; group rates ");
+    log_hex(parameter(function_group, PARAM_PCM_SIZES));
+    log(", power ");
+    log_hex(codec_ask(function_group, VERB_GET_POWER_STATE, 0));
+    log("\n");
+    log("HDA: jack ");
+    log_dec(path_pin);
+    log(" control ");
+    log_hex(codec_ask(path_pin, VERB_GET_PIN_CONTROL, 0));
+    log(", power ");
+    log_hex(codec_ask(path_pin, VERB_GET_POWER_STATE, 0));
+    log("\n");
+
+    /* And what the device looks like from the bus side, because a stream that
+       is configured correctly and does not transfer is a question about the
+       path to memory rather than about the stream. */
+    if (audio_controller) {
+        log("HDA: pci command ");
+        log_hex(pci_config_read(audio_controller, 0x04) & 0xFFFF);
+        log(", tcsel ");
+        log_hex(pci_config_read8(audio_controller, 0x44));
+        log(", intctl ");
+        log_hex(read32(REG_INTCTL));
+        log(", intsts ");
+        log_hex(read32(REG_INTSTS));
+        log(", gctl ");
+        log_hex(read32(REG_GCTL));
+        log("\n");
+    }
+    write8(stream_offset + SD_CTL, 0);
+    return 0;
+}
+
+static int stream_start_from(boot_uint32_t first_output,
+                             boot_uint32_t output_streams) {
     boot_uint32_t index;
     boot_uint64_t address;
-    boot_uint64_t start;
     boot_uint32_t bytes = HDA_RING_FRAMES * HDA_CHANNELS * 2;
 
     ring = (short*)alloc_pages((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
     bdl = (BDL_ENTRY*)alloc_page();
-    if (!ring || !bdl) {
-        log("HDA: out of memory for the ring\n");
-        return 0;
-    }
+    positions = (boot_uint32_t*)alloc_page();
+    if (!ring || !bdl || !positions) return give_up("out of memory for the ring");
     memset(ring, 0, bytes);
     memset(bdl, 0, PAGE_SIZE);
+    memset(positions, 0, PAGE_SIZE);
+
+    /* Everything the controller reads has to be somewhere it can reach. A
+       controller that cannot address 64 bits, handed buffers above 4 GiB, does
+       not fail - it transfers from the truncated address, which is somebody
+       else's memory. */
+    if (!(read16(REG_GCAP) & 0x0001) &&
+        (((boot_uint64_t)(unsigned long long)ring >> 32) ||
+         ((boot_uint64_t)(unsigned long long)bdl >> 32)))
+        return give_up("its buffers are above 4 GiB and it cannot reach them");
 
     address = (boot_uint64_t)(unsigned long long)ring;
     for (index = 0; index < BDL_ENTRIES; index++) {
@@ -712,51 +934,49 @@ static int stream_start(void) {
         bdl[index].flags = 0;
     }
 
-    /* Reset the stream before configuring it. The run bit must be clear
-       first, and the reset bit is written, waited for, cleared and waited for
-       again - the same handshake the controller itself uses. */
-    write8(stream_offset + SD_CTL, 0);
-    timer_wait(1);
-    write8(stream_offset + SD_CTL, SD_CTL_RESET);
-    start = timer_ticks();
-    while (!(read8(stream_offset + SD_CTL) & SD_CTL_RESET))
-        if (timer_expired(start, 100)) break;
-    write8(stream_offset + SD_CTL, 0);
-    start = timer_ticks();
-    while (read8(stream_offset + SD_CTL) & SD_CTL_RESET)
-        if (timer_expired(start, 100)) break;
+    /* Out of the cache and into memory, before anything is told to read it.
+       See cpu_flush_cache: a controller whose stream traffic is not snooped
+       reads what is in memory, not what is in this processor's cache, and a
+       descriptor list that never left the cache reads back as zeros - which is
+       a list of empty buffers, which is a stream that transfers nothing and
+       reports no error at all. */
+    cpu_flush_cache(bdl, BDL_ENTRIES * sizeof(BDL_ENTRY));
+    cpu_flush_cache(ring, bytes);
+    /* The position buffer is written by the controller and only read here, so
+       what this does is get our zeroes out of the way: the line is clean
+       afterwards and reading it later invalidates rather than writing back. */
+    cpu_flush_cache(positions, PAGE_SIZE);
 
-    write32(stream_offset + SD_CBL, bytes);
-    write16(stream_offset + SD_LVI, BDL_ENTRIES - 1);
-    write16(stream_offset + SD_FMT, FORMAT_48K_16_STEREO);
-    write32(stream_offset + SD_BDPL,
-            (boot_uint32_t)(boot_uint64_t)(unsigned long long)bdl);
-    write32(stream_offset + SD_BDPU,
-            (boot_uint32_t)(((boot_uint64_t)(unsigned long long)bdl) >> 32));
+    /* Where the controller writes how far each stream has got. Set up before
+       any stream starts, because the enable bit is only examined then. */
+    address = (boot_uint64_t)(unsigned long long)positions;
+    write32(REG_DPUBASE, (boot_uint32_t)(address >> 32));
+    write32(REG_DPLBASE, (boot_uint32_t)address | DPLBASE_ENABLE);
 
-    /* The stream tag lives in the top byte of the control register, and the
-       codec has to be told the same number: that pairing is what connects
-       this buffer to that converter. */
-    write8(stream_offset + SD_CTL + 2, (boot_uint8_t)(STREAM_TAG << 4));
-    command(codec_address, path_dac, VERB_SET_FORMAT,
-            FORMAT_48K_16_STEREO, 0);
-    command(codec_address, path_dac, VERB_SET_STREAM_CHANNEL,
-            (STREAM_TAG << 4) | 0, 0);
+    log("HDA: ring at ");
+    log_hex((boot_uint64_t)(unsigned long long)ring);
+    log(", descriptors at ");
+    log_hex((boot_uint64_t)(unsigned long long)bdl);
+    log(" (first entry ");
+    log_hex(bdl[0].address);
+    log(" for ");
+    log_dec(bdl[0].length);
+    log(" bytes), positions at ");
+    log_hex(read32(REG_DPLBASE));
+    log("\n");
 
-    write8(stream_offset + SD_CTL,
-           (boot_uint8_t)(read8(stream_offset + SD_CTL) | SD_CTL_RUN));
-
-    /* Proof, not faith: the position register has to move. A stream that was
-       configured wrongly sits at zero, and everything up to here would have
-       reported success. */
-    start = timer_ticks();
-    while (read32(stream_offset + SD_LPIB) == 0) {
-        if (timer_expired(start, 200)) {
-            log("HDA: the stream was started and did not move\n");
-            return 0;
+    for (index = 0; index < output_streams; index++)
+        if (try_stream(first_output + index, bytes)) {
+            if (index)
+                log("HDA: the first output stream would not run; "
+                    "using a later one\n");
+            if (position_source == 2)
+                log("HDA: LPIB does not move on this controller; "
+                    "using the position buffer\n");
+            return 1;
         }
-    }
-    return 1;
+
+    return give_up("no output stream would start");
 }
 
 /* ---- Entry point --------------------------------------------------------- */
@@ -791,16 +1011,47 @@ int hda_init(const PCI_DEVICE* controller) {
     if (!controller) return 0;
 
     base = pci_bar_address(controller, 0);
-    if (!base) {
-        log("HDA: BAR0 is not a memory window\n");
-        return 0;
-    }
-    if (!paging_map_device(base, HDA_WINDOW_SIZE)) {
-        log("HDA: could not map its register window\n");
-        return 0;
-    }
+    if (!base) return give_up("BAR0 is not a memory window");
+    if (!paging_map_device(base, HDA_WINDOW_SIZE))
+        return give_up("could not map its register window");
+
+    /* Power, then bus mastering, then the vendor register - in that order.
+     *
+     * Firmware that did not use the audio device is entitled to leave it
+     * asleep, and a sleeping device decodes nothing: every register reads as
+     * ones, the reset never completes, and the driver concludes the hardware
+     * is broken. Nothing in QEMU is ever asleep, which is why this was missing
+     * and why it only showed up on a real laptop. */
+    if (!pci_power_on(controller))
+        return give_up("the controller will not wake up from a low power state");
     pci_enable_bus_mastering(controller);
+
+    /* Intel's traffic class selector, which is one byte and has to be written
+       as one.
+     *
+     * A controller asking for a traffic class the root complex does not carry
+     * does not fail - it simply never transfers anything, which is precisely
+     * what a stream that starts and never moves looks like. The command rings
+     * are unaffected, so the machine can hold a whole conversation with its
+     * codec and still not play a note.
+     *
+     * Written a byte at a time because the three bytes above it are other
+     * registers. The dword this used to write back put their own values back
+     * too, which is fine right up until one of them is write-one-to-clear. */
+    if (controller->vendor_id == 0x8086) {
+        boot_uint8_t tcsel = pci_config_read8(controller, 0x44);
+        if (tcsel & 0x07)
+            pci_config_write8(controller, 0x44, (boot_uint8_t)(tcsel & ~0x07));
+    }
+    audio_controller = controller;
+
     registers = (volatile boot_uint8_t*)(unsigned long long)base;
+
+    /* A device that is not decoding reads as all ones. Saying so beats
+       reporting a reset timeout, which is what happens next and which sounds
+       like a different problem entirely. */
+    if (read32(REG_GCTL) == 0xFFFFFFFFU && read16(REG_GCAP) == 0xFFFFU)
+        return give_up("the controller does not answer at its own address");
 
     if (!controller_reset()) return 0;
 
@@ -818,26 +1069,20 @@ int hda_init(const PCI_DEVICE* controller) {
     log_dec(output_streams);
     log(" output stream(s)\n");
 
-    if (!output_streams) {
-        log("HDA: the controller has no output stream\n");
-        return 0;
-    }
-    /* Input descriptors come first, so the first output one is past them. */
-    stream_offset = STREAM_BASE + input_streams * STREAM_STRIDE;
-
-    /* Interrupts stay off. The mixer refills from the timer tick and reads
-       the position register to decide how much, which needs no interrupt and
-       leaves nothing to go wrong in an unfamiliar handler. */
-    write32(REG_INTCTL, 0);
+    if (!output_streams)
+        return give_up("the controller has no output stream");
+    /* Nothing is routed to a handler, so nothing is delivered: the mixer
+       refills from the timer tick and reads the position to decide how much.
+       The enables are set anyway, for the reason on their definition. */
+    write32(REG_INTCTL, INTCTL_GLOBAL | INTCTL_CONTROLLER | 0xFF);
     write16(REG_WAKEEN, 0);
 
-    if (!rings_init()) {
-        log("HDA: out of memory for the command rings\n");
-        return 0;
-    }
+    if (!rings_init())
+        return give_up("out of memory for the command rings");
     if (!find_codec()) return 0;
     name_codec();
-    if (!stream_start()) return 0;
+    /* Input descriptors come first, so the output ones start past them. */
+    if (!stream_start_from(input_streams, output_streams)) return 0;
 
     ready = 1;
     log("HDA: ready, ");
@@ -847,6 +1092,7 @@ int hda_init(const PCI_DEVICE* controller) {
 }
 
 int hda_ready(void) { return ready; }
+const char* hda_failure(void) { return ready ? "none" : failure; }
 
 boot_uint32_t hda_pin_count(void) { return pin_count; }
 
@@ -870,6 +1116,14 @@ short* hda_ring(void) { return ready ? ring : 0; }
 boot_uint32_t hda_position(void) {
     boot_uint32_t bytes;
     if (!ready) return 0;
-    bytes = read32(stream_offset + SD_LPIB);
+    if (position_source == 2) {
+        /* Written by the controller, so the copy in this processor's cache is
+           whatever it was last time. Dropping the line first is the only way
+           to see what the device actually put there. */
+        cpu_flush_cache(&positions[stream_index * 2], 4);
+        bytes = positions[stream_index * 2];
+    } else {
+        bytes = read32(stream_offset + SD_LPIB);
+    }
     return (bytes / (HDA_CHANNELS * 2)) % HDA_RING_FRAMES;
 }

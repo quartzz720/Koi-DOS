@@ -47,4 +47,13 @@ const char* xhci_storage_error(void);
    anything yet, so keystrokes only arrive when someone asks for them. */
 void xhci_poll(void);
 
+/* One pass over every root-hub port, acting on anything that has been plugged
+   in or pulled out since the last look.
+ *
+ * Enumeration used to happen once, at boot, which is the whole of what a
+ * driver needs when the device is soldered on and the whole of what it must
+ * not be when the device is a plug. Called from xhci_poll, so anything that
+ * waits for a keystroke also notices a stick appearing. */
+void xhci_service(void);
+
 #endif

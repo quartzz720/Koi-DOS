@@ -36,6 +36,11 @@ int audio_ready(void);
 /* What is playing it, for the boot log and `dosfetch`. */
 const char* audio_device_name(void);
 
+/* Why there is nothing playing it, when there is nothing. Worth a sentence on
+   the boot screen: on a machine with no serial port that line is the only
+   explanation there will ever be. */
+const char* audio_failure(void);
+
 /* Start a sound and return a handle, or -1 when every voice is busy.
  *
  * The samples are NOT copied: the buffer must stay put until the sound ends

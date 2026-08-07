@@ -38,11 +38,42 @@ void serial_init(void) {
     outb(COM1_BASE + UART_MODEM_CONTROL, 0x0B);         /* back to normal */
 }
 
-void serial_putchar(char character) {
-    if (!serial_present) return;
-    if (character == '\n') serial_putchar('\r');
+/* Kept whether or not anything is listening on the port itself - which is the
+   entire point, since the machines where the drivers behave unexpectedly are
+   the ones with no serial port. One bounds check per character. */
+static char captured[BOOT_LOG_SIZE];
+static boot_uint32_t captured_length;
+static int captured_truncated;
+
+static void capture(char character) {
+    if (captured_length >= BOOT_LOG_SIZE - 1) {
+        captured_truncated = 1;
+        return;
+    }
+    captured[captured_length++] = character;
+}
+
+const char* boot_log(void) {
+    captured[captured_length] = 0;
+    return captured;
+}
+
+boot_uint32_t boot_log_length(void) { return captured_length; }
+int boot_log_truncated(void) { return captured_truncated; }
+
+static void transmit(char character) {
     while (!(inb(COM1_BASE + UART_LINE_STATUS) & LSR_TRANSMIT_EMPTY));
     outb(COM1_BASE + UART_DATA, (boot_uint8_t)character);
+}
+
+void serial_putchar(char character) {
+    /* Captured before the port is consulted, so a machine with no port still
+       keeps the log. The carriage return the port needs is not captured: it is
+       a property of the wire, not of what was said. */
+    capture(character);
+    if (!serial_present) return;
+    if (character == '\n') transmit('\r');
+    transmit(character);
 }
 
 void serial_write(const char* text) {

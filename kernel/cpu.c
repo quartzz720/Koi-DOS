@@ -122,3 +122,35 @@ void tss_init(void) {
 
     __asm__ volatile ("ltr %w0" : : "r"((boot_uint16_t)TSS_SELECTOR) : "memory");
 }
+
+/* The cache line size, from CPUID leaf 1. Sixty-four everywhere that matters,
+   but read rather than assumed: a stride larger than the real line would skip
+   lines, and skipping one is the whole bug this exists to avoid. */
+static boot_uint32_t cache_line_size(void) {
+    static boot_uint32_t cached;
+    boot_uint32_t a, b, c, d;
+
+    if (cached) return cached;
+    __asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                              : "a"(1), "c"(0));
+    cached = ((b >> 8) & 0xFF) * 8;
+    if (cached < 16 || cached > 256) cached = 64;
+    return cached;
+}
+
+void cpu_flush_cache(const void* address, boot_uint64_t bytes) {
+    boot_uint64_t line = cache_line_size();
+    boot_uint64_t start = (boot_uint64_t)(unsigned long long)address;
+    boot_uint64_t end = start + bytes;
+
+    if (!bytes) return;
+    start &= ~(line - 1);
+
+    /* Fenced on both sides: the writes have to be in the cache before they can
+       be flushed out of it, and the flushes have to have completed before
+       whatever tells the device to go and look. */
+    __asm__ volatile ("mfence" : : : "memory");
+    for (; start < end; start += line)
+        __asm__ volatile ("clflush (%0)" : : "r"((const void*)(unsigned long long)start) : "memory");
+    __asm__ volatile ("mfence" : : : "memory");
+}

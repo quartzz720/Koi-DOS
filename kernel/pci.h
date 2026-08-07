@@ -56,6 +56,27 @@ const PCI_DEVICE* pci_find(boot_uint8_t class_code, boot_uint8_t subclass,
 
 void pci_enable_bus_mastering(const PCI_DEVICE* device);
 
+/* Read and write a device's configuration space directly.
+ *
+ * The scan records what every driver needs; these are for the handful of
+ * per-vendor registers that only one driver has ever heard of - the traffic
+ * class selector on Intel audio, for one. */
+boot_uint8_t pci_config_read8(const PCI_DEVICE* device, boot_uint8_t offset);
+void pci_config_write8(const PCI_DEVICE* device, boot_uint8_t offset,
+                       boot_uint8_t value);
+boot_uint32_t pci_config_read(const PCI_DEVICE* device, boot_uint8_t offset);
+void pci_config_write(const PCI_DEVICE* device, boot_uint8_t offset,
+                      boot_uint32_t value);
+
+/* Move a device to the full-power state D0.
+ *
+ * Firmware is entitled to leave a device it did not use asleep, and a sleeping
+ * device does not decode its registers: every read comes back as ones and the
+ * driver concludes the hardware is broken. Returns 1 if the device is in D0
+ * afterwards - including when it was already there, and when it has no power
+ * management capability to ask. */
+int pci_power_on(const PCI_DEVICE* device);
+
 /* Resolve a memory BAR to its base address, joining the two halves of a
    64-bit BAR. Returns 0 for an I/O-space BAR. */
 boot_uint64_t pci_bar_address(const PCI_DEVICE* device, boot_uint8_t index);

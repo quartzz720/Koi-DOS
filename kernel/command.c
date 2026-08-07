@@ -366,6 +366,7 @@ static void command_help(void) {
     print_line("echo [text]    print text");
     print_line("beep [hz] [ms] a tone, if there is a sound device");
     print_line("sound          the sound device, and which output it picked");
+    print_line("log [file]     the kernel log: on screen, or written to a file");
     print_line("ver            show the version");
     print_line("help           this list");
     print_line("");
@@ -437,11 +438,23 @@ static void command_mem(void) {
     print_field("PCI devices     : ", pci_device_count(), "");
 
     print("Disks           : ");
-    print_dec(block_device_count());
-    for (boot_uint32_t index = 0; index < block_device_count(); index++) {
-        BLOCK_DEVICE* device = block_device(index);
-        print(index ? ", " : "  ");
-        print(device ? device->name : "?");
+    {
+        /* Counted by walking rather than from block_device_count(), which
+           still includes the slots of devices that have been unplugged. */
+        boot_uint32_t present = 0;
+        for (boot_uint32_t index = 0; index < block_device_count(); index++)
+            if (block_device(index)) present++;
+        print_dec(present);
+        {
+            int first = 1;
+            for (boot_uint32_t index = 0; index < block_device_count(); index++) {
+                BLOCK_DEVICE* device = block_device(index);
+                if (!device) continue;
+                print(first ? "  " : ", ");
+                print(device->name);
+                first = 0;
+            }
+        }
     }
     print_line("");
 
@@ -536,9 +549,73 @@ static void print_hex(boot_uint64_t value, int digits) {
  * it, or the right socket picked and muted further along. Printing the codec's
  * own description of its outputs is the difference between guessing and
  * knowing which of those it is. */
+/* The kernel's own log, which on most machines has nowhere else to go.
+ *
+ * Every driver says what it found and why it gave up over COM1, and no machine
+ * made this century has a COM1. The text is kept in memory as well, so this
+ * prints it - or writes it to a file, which is the only way to get a boot log
+ * off a laptop and onto something that can read it. */
+static void command_log(const ARGUMENTS* arguments) {
+    const char* text = boot_log();
+    boot_uint32_t length = boot_log_length();
+    char name[PATH_MAX];
+
+    single_operand(arguments, name);
+
+    if (name[0]) {
+        char path[PATH_MAX];
+        VOLUME* volume;
+        FAT_ENTRY entry;
+        boot_uint32_t written;
+
+        if (!current_volume) { print_line("No volume."); return; }
+        if (!resolve_path(name, &volume, path)) {
+            print_line("Invalid drive.");
+            return;
+        }
+        /* Replacing an older log rather than refusing: this gets written
+           again after every change, and a command that fails the second time
+           is a command nobody uses. */
+        if (fat32_stat(volume, path, &entry)) fat32_remove(volume, path);
+        if (!fat32_create(volume, path, 0, &entry)) {
+            print_line("Unable to create the file.");
+            return;
+        }
+        written = fat32_write(volume, &entry, 0, text, length);
+        print_dec(written);
+        print(" bytes written to ");
+        print_line(name);
+        if (written != length) print_line("The file is short - the disk is full.");
+        return;
+    }
+
+    {
+        boot_uint32_t lines = 0;
+        boot_uint32_t page = console_rows() - 1;
+
+        for (boot_uint32_t index = 0; index < length; index++) {
+            char character = text[index];
+            if (character == '\r') continue;
+            put(character);
+            if (character != '\n') continue;
+            if (++lines < page) continue;
+            console_set_color(console_theme()->background,
+                              console_theme()->foreground);
+            print("-- More --");
+            console_use_theme();
+            if (keyboard_getchar() == 27) return;
+            print("\n");
+            lines = 0;
+        }
+    }
+    if (boot_log_truncated())
+        print_line("(the log filled up; everything after this was dropped)");
+}
+
 static void command_sound(void) {
     if (!audio_ready()) {
-        print_line("No sound device.");
+        print("No sound device: ");
+        print_line(audio_failure());
         print_line("");
         print_line("Koi-DOS drives Intel HD Audio, which is the sound hardware in");
         print_line("every machine since about 2005 - not the PC speaker, which this");
@@ -627,9 +704,13 @@ static const char* class_name(const PCI_DEVICE* device) {
 /* Sizes a person can compare at a glance, which means the largest unit that
    still leaves a whole number rather than everything in sectors. */
 static void print_size(boot_uint64_t sectors, boot_uint32_t sector_size) {
-    boot_uint64_t kib = sectors / (1024U / sector_size ? 1024U / sector_size : 1);
+    boot_uint64_t kib;
 
+    /* The guard comes first, and used to come one line later - after a
+       division by the very thing it was guarding against. Nothing had ever
+       reported a sector size of zero until a device could be unplugged. */
     if (!sector_size) { print("?"); return; }
+    kib = sectors / (1024U / sector_size ? 1024U / sector_size : 1);
     if (kib >= 1024U * 1024U) {
         print_dec(kib / (1024U * 1024U));
         print(" GB");
@@ -2361,6 +2442,7 @@ static void execute(const char* input) {
     if (word_is(input, "VER")) { command_ver(); return; }
     if (word_is(input, "BEEP")) { command_beep(&arguments); return; }
     if (word_is(input, "SOUND")) { command_sound(); return; }
+    if (word_is(input, "LOG")) { command_log(&arguments); return; }
     if (word_is(input, "HELP")) { command_help(); return; }
     /* `echo.` prints a blank line - the DOS idiom for one, since a bare
        `echo` prints the on/off state instead. */

@@ -592,6 +592,36 @@ what happens to the HDA controller inside a graphics card, whose outputs are all
 `sound` prints the whole table, because "there is no sound" has several completely different
 causes that are identical from a chair.
 
+**The bug that only real hardware could show.** On the first machine that was not QEMU, the
+controller came up, the codec answered a hundred verbs, the widget walk found the built-in
+speaker and its converter — and the stream started and never moved. Every stream register read
+back exactly what was written; no error bit was set; the FIFO never became ready; all four output
+streams behaved identically. The bus was clean: memory space and bus mastering enabled, traffic
+class selector zero, controller out of reset.
+
+One bit never matched. `SDnCTL`'s traffic priority bit read set having been written clear, as a
+byte and as a dword, on every descriptor — it is not writable on that controller. That bit marks
+the stream's transfers as a different class of traffic, and the pairing that goes with it, in
+every driver that sets it deliberately, is that those transfers **do not snoop the processor's
+caches**. Linux sets it exactly when snooping is off, and allocates its buffers uncached in the
+same breath.
+
+That is the whole shape of the symptom. The command rings worked because they are not a stream
+and the bit does not apply to them. The stream read its descriptor list from memory, and the
+descriptor list had never left the cache — so it read a list of zero-length buffers, transferred
+nothing, and reported no error, because a buffer of zero bytes is not an error.
+
+`cpu_flush_cache()` — `mfence`, `clflush` by line, `mfence`, with the line size read from CPUID
+rather than assumed — is applied to the descriptor list, the ring and the position buffer. Two or
+three cache lines per millisecond as the mixer fills ahead of the hardware. Where DMA does snoop
+it costs those three lines and changes nothing.
+
+**Presence detection needs the pin powered.** The same machine reported its headphone sockets
+empty while headphones were in them: only the chosen pin was being powered, and the choosing
+happens after every pin has been asked. A sleeping pin answers, and answers "nothing there". Each
+pin is powered before it is asked now, and triggered first where it says its measurement is not
+continuous.
+
 **The bug worth writing down.** The controller stops fetching commands once it has produced
 `RINTCNT` responses, and what releases it is software clearing the response bit in `RIRBSTS`. But
 it only ever *sets* that bit if the response interrupt is enabled — so with interrupts off, as
@@ -683,6 +713,22 @@ holes the memory map does not describe — and then each descriptor is mapped on
 straight from zero to the highest descriptor instead would swallow the gap between the top of
 RAM and the 64-bit PCI window, a terabyte of it on QEMU's q35, and a pointer strayed into that
 gap would silently succeed rather than fault.
+
+### The log, for machines with no serial port
+
+Every driver reports what it found and why it stopped over COM1, and it is the only channel that
+survives a failure before anything can be drawn. It is also absent from every machine made this
+century — and a laptop is precisely where the drivers meet hardware that QEMU never emulates, so
+the explanation is lost exactly where it is needed. An HD Audio controller that would not start
+is what prompted this: the reason existed, in a register write nobody could see.
+
+So the same bytes are captured into 64 KiB of `.bss` on the way past, before the port is even
+consulted, and `log` prints them or writes them to a file. The buffer fills and then stops rather
+than wrapping: the interesting part of a boot log is the beginning, and a ring eats that first.
+
+Drivers now keep their failure reason as well as printing it, so `sound` can say *why* there is
+no sound rather than only that there is none, and the boot line says it too. On a machine with no
+serial port that one line is the entire explanation there will ever be.
 
 ### COM1 comes up first
 
