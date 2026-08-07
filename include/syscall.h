@@ -49,8 +49,8 @@
  * ONCE THE INTERFACE IS FROZEN, FUNCTION NUMBERS ARE NEVER REUSED. A removed
  * call leaves a hole. This is the promise that makes old programs safe, and it
  * costs nothing to keep - there are 256 numbers and twenty are in use. */
-#define KOI_ABI_VERSION 2
-#define KOI_ABI_MINIMUM 2
+#define KOI_ABI_VERSION 3
+#define KOI_ABI_MINIMUM 3
 #define KOI_ABI_IS_ALPHA 1
 
 /* Every program begins with this, placed at its load address by the linker
@@ -71,6 +71,38 @@ typedef struct {
 #define SYS_READLINE 0x04    /* (buffer, size) -> length */
 #define SYS_CLS 0x05         /* () */
 #define SYS_SETCOLOR 0x06    /* (foreground, background) */
+/* Is a key waiting, without taking it? The counterpart to SYS_GETCHAR, and
+   the only way to write anything that has to keep moving while nobody is
+   pressing anything - a game, an animation, an interruptible loop. */
+#define SYS_KEYPRESSED 0x08  /* () -> 1 when a keystroke is ready, else 0 */
+/* Wait, without spinning. A loop around SYS_SYSINFO's uptime would give the
+   same delay while keeping a core busy for the whole of it; this parks the
+   processor between ticks. Any keystroke arriving meanwhile is still buffered
+   and still there afterwards. */
+#define SYS_SLEEP 0x09       /* (milliseconds) */
+
+/* Keys with no ASCII value, returned by SYS_GETCHAR above 0xFF so a caller can
+   switch on them alongside ordinary characters.
+ *
+ * These live here rather than in the kernel's own header because a program
+ * that reads the arrow keys needs to name them, and two copies of a number is
+ * how two copies of a number drift apart. The kernel takes its names from
+ * these. */
+#define KOI_KEY_UP 0x100
+#define KOI_KEY_DOWN 0x101
+#define KOI_KEY_LEFT 0x102
+#define KOI_KEY_RIGHT 0x103
+#define KOI_KEY_HOME 0x104
+#define KOI_KEY_END 0x105
+#define KOI_KEY_PAGE_UP 0x106
+#define KOI_KEY_PAGE_DOWN 0x107
+#define KOI_KEY_DELETE 0x108
+#define KOI_KEY_INSERT 0x109
+#define KOI_KEY_F1 0x110     /* F1..F12 are consecutive from here */
+
+#define KOI_KEY_ESCAPE 27
+#define KOI_KEY_ENTER '\n'
+#define KOI_KEY_BACKSPACE '\b'
 /* Replace the shell's own colours. Any argument outside 0-15 leaves that one
    as it was, so a program can change one colour without knowing the others.
    Returns the resulting theme packed as

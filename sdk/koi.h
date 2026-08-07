@@ -75,6 +75,27 @@ static inline int koi_getchar(void) {
     return (int)koi_call(SYS_GETCHAR, 0, 0, 0);
 }
 
+/* Is a key waiting? Does not take it - koi_getchar still does that.
+ *
+ * This is what makes a game possible: koi_getchar stops everything until
+ * somebody presses something, which is right for a prompt and wrong for
+ * anything that has to keep moving. */
+static inline int koi_keypressed(void) {
+    return (int)koi_call(SYS_KEYPRESSED, 0, 0, 0);
+}
+
+/* Wait, without spinning. Keystrokes arriving meanwhile are buffered and are
+   still there when this returns. */
+static inline void koi_sleep(long milliseconds) {
+    (void)koi_call(SYS_SLEEP, milliseconds, 0, 0);
+}
+
+/* Milliseconds since the system started. The clock a game measures itself
+   against; it never goes backwards and never stops. */
+static inline koi_uint64 koi_uptime(void) {
+    return (koi_uint64)koi_call(SYS_SYSINFO, KOI_INFO_UPTIME_MS, 0, 0);
+}
+
 static inline long koi_readline(char* buffer, long size) {
     return koi_call(SYS_READLINE, (long)buffer, size, 0);
 }

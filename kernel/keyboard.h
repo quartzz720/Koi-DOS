@@ -2,20 +2,25 @@
 #define KERNEL_KEYBOARD_H
 
 #include "../include/bootinfo.h"
+#include "../include/syscall.h"
 
 /* Keys that have no ASCII value. Returned by keyboard_getchar() as values
-   above 0xFF so a caller can switch on them alongside ordinary characters. */
-#define KEY_UP 0x100
-#define KEY_DOWN 0x101
-#define KEY_LEFT 0x102
-#define KEY_RIGHT 0x103
-#define KEY_HOME 0x104
-#define KEY_END 0x105
-#define KEY_PAGE_UP 0x106
-#define KEY_PAGE_DOWN 0x107
-#define KEY_DELETE 0x108
-#define KEY_INSERT 0x109
-#define KEY_F1 0x110  /* F1..F12 are consecutive from here. */
+   above 0xFF so a caller can switch on them alongside ordinary characters.
+ *
+ * The numbers themselves are in include/syscall.h, because programs read the
+ * arrow keys too and a second copy of a constant is how two copies drift
+ * apart. These are the kernel's names for them. */
+#define KEY_UP KOI_KEY_UP
+#define KEY_DOWN KOI_KEY_DOWN
+#define KEY_LEFT KOI_KEY_LEFT
+#define KEY_RIGHT KOI_KEY_RIGHT
+#define KEY_HOME KOI_KEY_HOME
+#define KEY_END KOI_KEY_END
+#define KEY_PAGE_UP KOI_KEY_PAGE_UP
+#define KEY_PAGE_DOWN KOI_KEY_PAGE_DOWN
+#define KEY_DELETE KOI_KEY_DELETE
+#define KEY_INSERT KOI_KEY_INSERT
+#define KEY_F1 KOI_KEY_F1  /* F1..F12 are consecutive from here. */
 
 /* What keyboard_init() found. The distinction matters: a chipset's 8042 exists
    in silicon whether or not the board wired it to a connector, and ACPI's
@@ -46,6 +51,19 @@ int keyboard_available(void);
 int keyboard_present_ps2(void);
 
 int keyboard_poll(void);
+
+/* Is a keystroke waiting right now, without taking it?
+ *
+ * The distinction from keyboard_available() is the whole point: that one says
+ * whether a keyboard exists at all, this one says whether a key has been
+ * pressed. Anything that has to keep running while it waits - a game, an
+ * animation, a long operation that should be interruptible - needs to ask the
+ * second question, and answering it with the first would report every machine
+ * with a keyboard as permanently holding a key down.
+ *
+ * Collects from USB first, because that controller's interrupt is still not
+ * routed and its keystrokes only arrive when someone goes and looks. */
+int keyboard_pending(void);
 
 /* Blocking: waits for a key. Shows the console caret while waiting. */
 int keyboard_getchar(void);

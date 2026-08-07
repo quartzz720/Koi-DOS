@@ -354,6 +354,15 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
         console_set_color((boot_uint8_t)a, (boot_uint8_t)b);
         return 0;
 
+    case SYS_KEYPRESSED:
+        return keyboard_pending() ? 1 : 0;
+
+    case SYS_SLEEP:
+        /* Clamped rather than trusted. A program that computes a delay wrongly
+           should stutter, not hang the only thread the system has. */
+        if (a > 0) timer_wait(a > 60000 ? 60000 : (boot_uint64_t)a);
+        return 0;
+
     case SYS_SETTHEME: {
         CONSOLE_THEME theme = *console_theme();
         if (a >= 0 && a < 16) theme.foreground = (boot_uint8_t)a;

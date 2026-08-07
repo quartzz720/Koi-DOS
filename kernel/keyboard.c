@@ -298,6 +298,11 @@ int keyboard_poll(void) {
     return (int)key;
 }
 
+int keyboard_pending(void) {
+    if (xhci_has_keyboard()) xhci_poll();
+    return buffer_tail != buffer_head;
+}
+
 int keyboard_getchar(void) {
     int key;
     int usb = xhci_has_keyboard();

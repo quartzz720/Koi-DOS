@@ -180,11 +180,16 @@ script, so a program can be written and built by someone who does not have the
 kernel checked out:
 
 ```bash
-cd sdk && ./koicc mytool.c        # produces MYTOOL.EXE
+cd sdk && ./koicc mytool.c              # produces MYTOOL.EXE
+./koicc main.c board.c -o mytool        # several sources, one program
 ```
 
 No special compiler: a Koi-DOS program is a freestanding ELF64 binary, and an
 ordinary x86-64 GCC produces one. `sdk/README.md` documents the ABI.
+
+Several sources are one program, not several — there is no linker step to run
+afterwards and no object files to keep. Anything larger than a single file
+needs this, and the first program that did was a games collection.
 
 **Programs you write are yours.** Including these headers does not place your
 program under this project's licence; see the LICENSE.
@@ -207,11 +212,18 @@ Programs write that file; the kernel reads it. Neither reaches into the other.
 ### System calls
 
 Programs call the kernel with `int 0x40`, in the spirit of DOS's INT 21h. `RAX` holds the
-function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Thirty calls cover
+function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Thirty-two calls cover
 console I/O, files, directory enumeration, the command line, exit codes, what the system knows
 about itself, and taking the screen; they are listed in
 [include/syscall.h](include/syscall.h), which the kernel and every program include from the same
-copy so the two cannot drift apart.
+copy so the two cannot drift apart. That file also names the keys that have no ASCII value — the
+arrows and the function keys — because a program that reads them has to name them, and two copies
+of a number is how two copies of a number drift apart.
+
+Two of those calls exist for programs that cannot afford to stop. `SYS_GETCHAR` waits, which is
+right for a prompt and wrong for anything that has to keep moving; `SYS_KEYPRESSED` asks whether a
+key is waiting without taking it, and `SYS_SLEEP` waits without spinning. Nothing with a clock in
+it — a game, an animation, an interruptible operation — can be written without both.
 
 The vector is `0x40` rather than `0x21` because in protected mode `0x21` is the keyboard IRQ.
 `INT` rather than `SYSCALL`/`SYSRET` because the whole value of `SYSRET` is a fast ring 3 to
