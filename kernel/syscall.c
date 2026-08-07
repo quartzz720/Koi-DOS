@@ -464,6 +464,27 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
         return (long)put;
     }
 
+    case SYS_SEEK: {
+        OPEN_FILE* file = handle_of(a);
+        long position;
+
+        if (!file) return SYSCALL_ERROR;
+        switch (b) {
+        case KOI_SEEK_SET: position = (long)c; break;
+        case KOI_SEEK_CURRENT: position = (long)file->position + (long)c; break;
+        case KOI_SEEK_END: position = (long)file->entry.size + (long)c; break;
+        default: return SYSCALL_ERROR;
+        }
+        /* Past the end is allowed to be asked for and clamped rather than
+           refused: a caller seeking to the end to measure a file is doing
+           something ordinary, and reading there simply returns nothing. */
+        if (position < 0) return SYSCALL_ERROR;
+        if ((boot_uint32_t)position > file->entry.size)
+            position = (long)file->entry.size;
+        file->position = (boot_uint32_t)position;
+        return position;
+    }
+
     case SYS_SIZE: {
         OPEN_FILE* file = handle_of(a);
         return file ? (long)file->entry.size : SYSCALL_ERROR;

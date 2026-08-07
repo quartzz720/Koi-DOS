@@ -49,8 +49,8 @@
  * ONCE THE INTERFACE IS FROZEN, FUNCTION NUMBERS ARE NEVER REUSED. A removed
  * call leaves a hole. This is the promise that makes old programs safe, and it
  * costs nothing to keep - there are 256 numbers and twenty are in use. */
-#define KOI_ABI_VERSION 5
-#define KOI_ABI_MINIMUM 5
+#define KOI_ABI_VERSION 6
+#define KOI_ABI_MINIMUM 6
 #define KOI_ABI_IS_ALPHA 1
 
 /* Every program begins with this, placed at its load address by the linker
@@ -143,6 +143,17 @@ typedef struct {
 #define SYS_READ 0x12        /* (handle, buffer, length) -> bytes read */
 #define SYS_WRITE 0x13       /* (handle, buffer, length) -> bytes written */
 #define SYS_SIZE 0x14        /* (handle) -> bytes */
+/* Move the read/write position.
+ *
+ * Reading a file front to back is the easy case and was the only one for a
+ * while. Anything with an index in it needs the other: a WAD is a directory of
+ * offsets and every lump read starts by jumping to one, so without this the
+ * file can be read but not used. */
+#define SYS_SEEK 0x15        /* (handle, offset, whence) -> position, or -1 */
+
+#define KOI_SEEK_SET 0       /* from the beginning */
+#define KOI_SEEK_CURRENT 1   /* from where it is now */
+#define KOI_SEEK_END 2       /* from the end, offset usually negative */
 
 /* Directory enumeration. Without these a program cannot write its own `dir`,
    which makes the shell's built-in the only way to see a directory. */

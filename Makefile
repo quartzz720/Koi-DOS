@@ -49,14 +49,19 @@ KERNEL_HEADERS = kernel/kernel.h kernel/console.h kernel/font.h kernel/serial.h 
 PROGRAM_CFLAGS = -ffreestanding -fno-stack-protector -fno-stack-check \
                  -fno-builtin -fno-pie -mno-red-zone -mgeneral-regs-only \
                  -fno-asynchronous-unwind-tables \
+                 -ffunction-sections -fdata-sections \
                  -Wall -Wextra -Werror -std=c11 -I . -I include
+# --gc-sections drops the parts of koilib.c a program never calls, so a program
+# that wants strlen does not also carry a formatter and a heap. Safe with our
+# linker script because it KEEPs .koi_abi, which nothing references and which
+# would otherwise be the first thing collected.
 PROGRAM_LDFLAGS = -nostdlib -no-pie -Wl,-T,programs/program.ld \
                   -Wl,--build-id=none -Wl,-z,max-page-size=0x1000 \
-                  -Wl,-z,noexecstack
+                  -Wl,-z,noexecstack -Wl,--gc-sections
 
 PROGRAM_SOURCES = $(wildcard programs/*.c)
 PROGRAMS = $(patsubst programs/%.c,build/%.EXE,\
-             $(filter-out programs/start.c,$(PROGRAM_SOURCES)))
+             $(filter-out programs/start.c programs/koilib.c,$(PROGRAM_SOURCES)))
 
 all: $(EFI_DIR)/BOOTX64.EFI $(KERNEL_IMAGE) $(PROGRAMS) sdk
 
@@ -75,9 +80,9 @@ $(BUILD_HEADER): FORCE
 
 FORCE:
 
-build/%.EXE: programs/%.c programs/start.c programs/koi.h programs/program.ld include/syscall.h
+build/%.EXE: programs/%.c programs/start.c programs/koilib.c programs/koi.h programs/program.ld include/syscall.h
 	mkdir -p build
-	$(KERNEL_CC) $(PROGRAM_CFLAGS) $(PROGRAM_LDFLAGS) -o $@ $< programs/start.c
+	$(KERNEL_CC) $(PROGRAM_CFLAGS) $(PROGRAM_LDFLAGS) -o $@ $< programs/start.c programs/koilib.c
 
 $(EFI_DIR)/BOOTX64.EFI: boot/bootloader.c include/efi.h include/bootinfo.h include/elf.h
 	mkdir -p $(EFI_DIR)
@@ -101,15 +106,15 @@ check: $(KERNEL_ELF)
 	@echo "--- program headers ---"
 	@readelf -lW $(KERNEL_ELF)
 
-# The SDK is a copy of the four files a third-party program needs, kept where
-# it can be handed to someone without the kernel source.
+# The SDK is a copy of the files a third-party program needs, kept where it can
+# be handed to someone without the kernel source.
 #
 # Part of `all` on purpose. Kept as a manual step it drifted within a day - the
 # linker script gained a section, the copy did not, and programs built with the
 # SDK were quietly missing it. Copying four files on every build costs nothing
 # and makes that impossible.
 sdk:
-	cp programs/koi.h programs/start.c programs/program.ld sdk/
+	cp programs/koi.h programs/start.c programs/koilib.c programs/program.ld sdk/
 	cp include/syscall.h sdk/syscall.h
 	@echo "sdk/ refreshed"
 

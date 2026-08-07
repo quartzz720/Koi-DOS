@@ -172,6 +172,12 @@ static inline long koi_write(long handle, const void* buffer, long length) {
     return koi_call(SYS_WRITE, handle, (long)buffer, length);
 }
 
+/* Move the read/write position. Returns where it ended up, or -1.
+   Anything with an index in it needs this - a WAD is a directory of offsets. */
+static inline long koi_seek(long handle, long offset, long whence) {
+    return koi_call(SYS_SEEK, handle, whence, offset);
+}
+
 static inline long koi_filesize(long handle) {
     return koi_call(SYS_SIZE, handle, 0, 0);
 }
@@ -301,6 +307,63 @@ static inline void koi_gfx_text(int x, int y, const char* text,
     (void)koi_call4(SYS_GFX_TEXT, KOI_POINT(x, y), (long)text, (long)color,
                     background);
 }
+
+/* ---- The parts of a C library a program cannot do without ---------------
+ *
+ * Defined in koilib.c, which koicc compiles in alongside start.c. Not a C
+ * library and not trying to be one: this is the subset that either the
+ * compiler requires or that any program larger than a page rewrites badly on
+ * its own.
+ *
+ * The memory four are not optional. GCC emits calls to them of its own accord
+ * even with -ffreestanding - a struct assignment is enough - so a program
+ * without them fails to link for reasons unrelated to anything it wrote. */
+void* memset(void* destination, int value, koi_uint64 count);
+void* memcpy(void* destination, const void* source, koi_uint64 count);
+void* memmove(void* destination, const void* source, koi_uint64 count);
+int memcmp(const void* left, const void* right, koi_uint64 count);
+
+koi_uint64 strlen(const char* text);
+char* strcpy(char* destination, const char* source);
+char* strncpy(char* destination, const char* source, koi_uint64 count);
+char* strcat(char* destination, const char* source);
+int strcmp(const char* left, const char* right);
+int strncmp(const char* left, const char* right, koi_uint64 count);
+char* strchr(const char* text, int character);
+char* strrchr(const char* text, int character);
+char* strstr(const char* haystack, const char* needle);
+
+int isdigit(int c);
+int isspace(int c);
+int isupper(int c);
+int islower(int c);
+int isalpha(int c);
+int isalnum(int c);
+int isprint(int c);
+int toupper(int c);
+int tolower(int c);
+
+int abs(int value);
+long strtol(const char* text, char** end, int base);
+int atoi(const char* text);
+
+/* One formatter, which the rest call. The conversions are d, i, u, x, X, c, s,
+   p and %%, with width, left alignment and zero padding. There is no %f: this
+   system has no floating point, so a program cannot have produced a value to
+   print. */
+int koi_vformat(char* out, koi_uint64 size, const char* format,
+                __builtin_va_list arguments);
+int koi_snprintf(char* out, koi_uint64 size, const char* format, ...);
+int koi_sprintf(char* out, const char* format, ...);
+int koi_printf(const char* format, ...);
+
+/* A heap, dividing up the whole pages the system hands out. First fit with
+   adjacent free blocks merged, which is the simplest arrangement that does not
+   fragment itself to death - and is what DOS's own allocator did. */
+void* malloc(koi_uint64 size);
+void* calloc(koi_uint64 count, koi_uint64 size);
+void* realloc(void* address, koi_uint64 size);
+void free(void* address);
 
 /* The processor's own name for itself.
  *

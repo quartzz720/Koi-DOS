@@ -202,6 +202,14 @@ cd sdk && ./koicc mytool.c              # produces MYTOOL.EXE
 No special compiler: a Koi-DOS program is a freestanding ELF64 binary, and an
 ordinary x86-64 GCC produces one. `sdk/README.md` documents the ABI.
 
+`koilib.c` comes with it: the memory and string primitives, character
+classification, number conversion, a `printf`-style formatter and a heap. Not
+a C library and not trying to be one — this is the subset that either the
+compiler requires or that any program larger than a page rewrites badly on its
+own. The compiler emits calls to `memcpy` and friends whatever you do, so
+those four are not optional. Unused parts are collected at link time, so a
+program that wants `strlen` does not also carry a formatter.
+
 Several sources are one program, not several — there is no linker step to run
 afterwards and no object files to keep. Anything larger than a single file
 needs this, and the first program that did was a games collection.
@@ -227,7 +235,7 @@ Programs write that file; the kernel reads it. Neither reaches into the other.
 ### System calls
 
 Programs call the kernel with `int 0x40`, in the spirit of DOS's INT 21h. `RAX` holds the
-function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Thirty-five calls cover
+function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Thirty-seven calls cover
 console I/O, files, directory enumeration, the command line, exit codes, what the system knows
 about itself, and taking the screen; they are listed in
 [include/syscall.h](include/syscall.h), which the kernel and every program include from the same

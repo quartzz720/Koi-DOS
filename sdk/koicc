@@ -60,10 +60,11 @@ CC=${CC:-gcc}
     -ffreestanding -fno-stack-protector -fno-stack-check -fno-builtin \
     -fno-pie -mno-red-zone -mgeneral-regs-only \
     -fno-asynchronous-unwind-tables \
+    -ffunction-sections -fdata-sections \
     -Wall -Wextra -std=c11 -I . \
     -nostdlib -no-pie -Wl,-T,program.ld -Wl,--build-id=none \
-    -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack \
-    -o "$OUTPUT" "${SOURCES[@]}" start.c
+    -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack -Wl,--gc-sections \
+    -o "$OUTPUT" "${SOURCES[@]}" start.c koilib.c
 
 ABI=$(sed -n 's/^#define KOI_ABI_VERSION \([0-9]*\).*/\1/p' syscall.h)
 ALPHA=$(sed -n 's/^#define KOI_ABI_IS_ALPHA \([0-9]*\).*/\1/p' syscall.h)
