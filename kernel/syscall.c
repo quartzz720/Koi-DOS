@@ -485,6 +485,39 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
         return position;
     }
 
+    case SYS_REMOVE: {
+        char absolute[WORKING_PATH_MAX];
+        if (!a || !working_volume) return SYSCALL_ERROR;
+        resolve_working((const char*)a, absolute);
+        return fat32_remove(working_volume, absolute) ? 0 : SYSCALL_ERROR;
+    }
+
+    case SYS_RENAME: {
+        char from[WORKING_PATH_MAX];
+        char to[WORKING_PATH_MAX];
+        if (!a || !b || !working_volume) return SYSCALL_ERROR;
+        resolve_working((const char*)a, from);
+        resolve_working((const char*)b, to);
+        return fat32_rename(working_volume, from, to) ? 0 : SYSCALL_ERROR;
+    }
+
+    case SYS_MKDIR: {
+        char absolute[WORKING_PATH_MAX];
+        FAT_ENTRY entry;
+        if (!a || !working_volume) return SYSCALL_ERROR;
+        resolve_working((const char*)a, absolute);
+        return fat32_create(working_volume, absolute, 1, &entry)
+               ? 0 : SYSCALL_ERROR;
+    }
+
+    case SYS_EXISTS: {
+        char absolute[WORKING_PATH_MAX];
+        FAT_ENTRY entry;
+        if (!a || !working_volume) return SYSCALL_ERROR;
+        resolve_working((const char*)a, absolute);
+        return fat32_stat(working_volume, absolute, &entry) ? 1 : 0;
+    }
+
     case SYS_SIZE: {
         OPEN_FILE* file = handle_of(a);
         return file ? (long)file->entry.size : SYSCALL_ERROR;

@@ -178,6 +178,27 @@ static inline long koi_seek(long handle, long offset, long whence) {
     return koi_call(SYS_SEEK, handle, whence, offset);
 }
 
+/* Delete, rename, and ask whether a path is there. A program that can create
+   files and never remove them fills the disk and cannot tidy up after itself. */
+static inline long koi_remove(const char* path) {
+    return koi_call(SYS_REMOVE, (long)path, 0, 0);
+}
+
+static inline long koi_rename(const char* from, const char* to) {
+    return koi_call(SYS_RENAME, (long)from, (long)to, 0);
+}
+
+/* Make a directory. An installed package keeps its own rather than emptying
+   itself into \BIN, and a relative path resolves from where the shell is
+   standing - so a program's data sits next to it. */
+static inline long koi_mkdir(const char* path) {
+    return koi_call(SYS_MKDIR, (long)path, 0, 0);
+}
+
+static inline int koi_exists(const char* path) {
+    return (int)koi_call(SYS_EXISTS, (long)path, 0, 0);
+}
+
 static inline long koi_filesize(long handle) {
     return koi_call(SYS_SIZE, handle, 0, 0);
 }

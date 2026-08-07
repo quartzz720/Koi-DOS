@@ -1,11 +1,20 @@
 #ifndef KERNEL_PROGRAM_H
 #define KERNEL_PROGRAM_H
 
-/* program_run() returns the program's exit code, or one of these.
-   PROGRAM_REFUSED means the reason has already been printed - the caller
-   should not add a second, vaguer message on top of it. */
-#define PROGRAM_NOT_LOADABLE (-1)
-#define PROGRAM_REFUSED (-2)
+/* What program_run() did, which is not the same question as what the program
+ * returned.
+ *
+ * These used to share one value with the exit code, and a program exiting -1
+ * was reported as "not a valid Koi-DOS program" - which is a perfectly
+ * ordinary thing for a program to do when it fails, and DOOM does it. There is
+ * no value that is safe to steal from a program's own return, so the two
+ * answers are separate now.
+ *
+ * PROGRAM_REFUSED means the reason has already been printed; the caller should
+ * not add a second, vaguer message on top of it. */
+#define PROGRAM_OK 0
+#define PROGRAM_NOT_LOADABLE 1
+#define PROGRAM_REFUSED 2
 
 #include "partition.h"
 
@@ -22,9 +31,13 @@
 #define PROGRAM_LIMIT 0x2000000ULL             /* 32 MiB */
 #define PROGRAM_STACK_SIZE 0x40000ULL          /* 256 KiB, at the top */
 
-/* Load and run `path`, passing `arguments` as its command line. Returns the
-   program's exit code, or -1 when it could not be started. */
-int program_run(VOLUME* volume, const char* path, const char* arguments);
+/* Load and run `path`, passing `arguments` as its command line.
+ *
+ * Returns PROGRAM_OK, PROGRAM_NOT_LOADABLE or PROGRAM_REFUSED. The program's
+ * own exit code goes into `exit_code`, which may be null when nobody cares,
+ * and is untouched unless the program actually ran. */
+int program_run(VOLUME* volume, const char* path, const char* arguments,
+                int* exit_code);
 
 /* The command line the running program was given. Backs SYS_ARGS. */
 const char* program_arguments(void);

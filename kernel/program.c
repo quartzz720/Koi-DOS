@@ -205,18 +205,19 @@ __attribute__((noreturn)) static void enter_program(boot_uint64_t entry_point,
     __builtin_unreachable();
 }
 
-int program_run(VOLUME* volume, const char* path, const char* arguments) {
+int program_run(VOLUME* volume, const char* path, const char* arguments,
+                int* exit_code_out) {
     boot_uint8_t* contents;
     boot_uint32_t length = 0;
     boot_uint64_t entry_point = 0;
 
-    if (program_running) return -1;   /* one at a time, as in DOS */
+    if (program_running) return PROGRAM_NOT_LOADABLE;   /* one at a time, as in DOS */
 
     contents = read_program(volume, path, &length);
-    if (!contents) return -1;
+    if (!contents) return PROGRAM_NOT_LOADABLE;
     if (!load_segments(contents, length, &entry_point)) {
         kfree(contents);
-        return -1;
+        return PROGRAM_NOT_LOADABLE;
     }
     kfree(contents);
 
@@ -242,7 +243,8 @@ int program_run(VOLUME* volume, const char* path, const char* arguments) {
     if (program_save(&resume)) {
         /* Arrived here through program_exit(). */
         current_arguments = "";
-        return exit_code;
+        if (exit_code_out) *exit_code_out = exit_code;
+        return PROGRAM_OK;
     }
     program_running = 1;
     enter_program(entry_point, PROGRAM_LIMIT);

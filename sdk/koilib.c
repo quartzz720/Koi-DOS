@@ -223,6 +223,23 @@ static koi_uint64 render_unsigned(koi_uint64 value, int base, int upper,
     return length;
 }
 
+/* Grow a rendered number to the precision asked for by pushing zeroes in
+   front of it. Returns the new length; leaves the digits alone when the
+   precision is absent or already met. */
+static koi_uint64 apply_precision(char* digits, koi_uint64 length,
+                                  int precision) {
+    koi_uint64 wanted;
+
+    if (precision < 0) return length;
+    wanted = (koi_uint64)precision;
+    if (wanted <= length) return length;
+    for (koi_uint64 index = length; index > 0; index--)
+        digits[index - 1 + (wanted - length)] = digits[index - 1];
+    for (koi_uint64 index = 0; index < wanted - length; index++)
+        digits[index] = '0';
+    return wanted;
+}
+
 int koi_vformat(char* out, koi_uint64 size, const char* format,
                 __builtin_va_list arguments) {
     SINK sink;
@@ -235,6 +252,7 @@ int koi_vformat(char* out, koi_uint64 size, const char* format,
     for (; *format; format++) {
         int left = 0;
         int width = 0;
+        int precision = -1;      /* -1 means none was given */
         char pad = ' ';
         int is_long = 0;
 
@@ -250,6 +268,16 @@ int koi_vformat(char* out, koi_uint64 size, const char* format,
         }
         while (isdigit((int)(unsigned char)*format))
             width = width * 10 + (*format++ - '0');
+        /* Precision. On a number it is the least number of digits, zero
+           filled; on a string it is the most characters to take. DOOM builds
+           its font lump names with "%.3d" and gets STCFN033, so a formatter
+           without this produces a name no WAD has ever contained. */
+        if (*format == '.') {
+            format++;
+            precision = 0;
+            while (isdigit((int)(unsigned char)*format))
+                precision = precision * 10 + (*format++ - '0');
+        }
         while (*format == 'l' || *format == 'h') {
             if (*format == 'l') is_long = 1;
             format++;
@@ -264,23 +292,36 @@ int koi_vformat(char* out, koi_uint64 size, const char* format,
             koi_uint64 magnitude = (koi_uint64)(negative ? -value : value);
 
             length = render_unsigned(magnitude, 10, 0, number + 1);
-            if (negative) { number[0] = '-'; length++; emit_padded(&sink, number, length, width, left, pad); }
-            else emit_padded(&sink, number + 1, length, width, left, pad);
+            length = apply_precision(number + 1, length, precision);
+            if (negative) {
+                number[0] = '-';
+                emit_padded(&sink, number, length + 1, width, left,
+                            precision >= 0 ? ' ' : pad);
+            } else {
+                emit_padded(&sink, number + 1, length, width, left,
+                            precision >= 0 ? ' ' : pad);
+            }
             break;
         }
         case 'u': {
             koi_uint64 value = is_long ? __builtin_va_arg(arguments, unsigned long)
                                        : (koi_uint64)__builtin_va_arg(arguments, unsigned int);
-            emit_padded(&sink, number, render_unsigned(value, 10, 0, number),
-                        width, left, pad);
+            emit_padded(&sink, number,
+                        apply_precision(number,
+                                        render_unsigned(value, 10, 0, number),
+                                        precision),
+                        width, left, precision >= 0 ? ' ' : pad);
             break;
         }
         case 'x': case 'X': {
             koi_uint64 value = is_long ? __builtin_va_arg(arguments, unsigned long)
                                        : (koi_uint64)__builtin_va_arg(arguments, unsigned int);
             emit_padded(&sink, number,
-                        render_unsigned(value, 16, *format == 'X', number),
-                        width, left, pad);
+                        apply_precision(number,
+                                        render_unsigned(value, 16,
+                                                        *format == 'X', number),
+                                        precision),
+                        width, left, precision >= 0 ? ' ' : pad);
             break;
         }
         case 'p': {
@@ -298,8 +339,14 @@ int koi_vformat(char* out, koi_uint64 size, const char* format,
         }
         case 's': {
             const char* text = __builtin_va_arg(arguments, const char*);
+            koi_uint64 length;
             if (!text) text = "(null)";
-            emit_padded(&sink, text, strlen(text), width, left, ' ');
+            length = strlen(text);
+            /* On a string, precision is a limit rather than a minimum - and
+               the string need not be terminated within it. */
+            if (precision >= 0 && (koi_uint64)precision < length)
+                length = (koi_uint64)precision;
+            emit_padded(&sink, text, length, width, left, ' ');
             break;
         }
         default:

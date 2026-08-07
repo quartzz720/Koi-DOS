@@ -2050,6 +2050,7 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
     int has_extension = 0;
     FAT_ENTRY entry;
     int code;
+    int exit_code = 0;
 
     if (!current_volume) return 0;
 
@@ -2100,7 +2101,7 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
     }
 
     syscall_set_location(current_volume, current_path);
-    code = program_run(current_volume, path, arguments->tail);
+    code = program_run(current_volume, path, arguments->tail, &exit_code);
     syscall_close_all();
     /* And take the screen back, whether or not the program gave it up. A
        program that returns while still holding it would otherwise leave the
@@ -2114,11 +2115,18 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
         console_use_theme();
     } else if (code == PROGRAM_REFUSED) {
         /* program_run() has already said why, in more detail than this could. */
-    } else if (code != 0) {
+    } else if (exit_code != 0) {
         /* DOS reported a non-zero exit only through ERRORLEVEL in batch files;
-           printing it is more use at an interactive prompt. */
+           printing it is more use at an interactive prompt. A negative one is
+           printed as itself rather than as a very large unsigned number: -1 is
+           what a program returns when it failed, and it should read that way. */
         print("Exit code ");
-        print_dec((boot_uint64_t)code);
+        if (exit_code < 0) {
+            put('-');
+            print_dec((boot_uint64_t)(-(long)exit_code));
+        } else {
+            print_dec((boot_uint64_t)exit_code);
+        }
         print("\n");
     }
     return 1;

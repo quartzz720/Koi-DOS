@@ -152,12 +152,45 @@ syscall_stub:
     cld
     pushq %rbp
     movq %rsp, %rbp
+
+    /* Everything the C call is allowed to destroy, saved first.
+     *
+     * The ABI says every register but RAX comes back untouched, and for a long
+     * time it did not: syscall_dispatch is an ordinary C function and may
+     * clobber RCX, RDX, RSI, RDI and R8-R11 as it pleases. Nothing noticed,
+     * because no program had kept a live value in one of them across a call -
+     * until one compiled at -O2 held a loop's destination pointer in R8 and
+     * came back to find it holding 8. It then wrote its palette to address 8
+     * and never left the loop.
+     *
+     * Sixteen bytes of pushes to make a promise true, rather than a promise
+     * quietly narrowed and every program made to know it. RBX, RBP and R12-R15
+     * are callee-saved and the C function preserves them itself. */
+    pushq %rdi
+    pushq %rsi
+    pushq %rdx
+    pushq %rcx
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+
     movq %rcx, %r8              /* argument four, before RCX is reused */
     movq %rdx, %rcx             /* argument three */
     movq %rsi, %rdx             /* argument two */
     movq %rdi, %rsi             /* argument one */
     movq %rax, %rdi             /* function number becomes parameter one */
     call syscall_dispatch
+
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rcx
+    popq %rdx
+    popq %rsi
+    popq %rdi
+
     popq %rbp
     iretq
 

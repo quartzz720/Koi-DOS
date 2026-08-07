@@ -20,7 +20,11 @@
  *   RAX  function number
  *   RDI, RSI, RDX, RCX  arguments, in that order
  *   RAX  return value
- * Every other register is preserved.
+ *
+ * Every other register is preserved - which the stub now actually does. It did
+ * not always: the dispatcher is a C function and may clobber RCX, RDX, RSI,
+ * RDI and R8-R11, and none of them were being saved. Nothing noticed until a
+ * program compiled at -O2 kept a loop pointer in R8 across a call.
  */
 #define SYSCALL_VECTOR 0x40
 
@@ -49,8 +53,8 @@
  * ONCE THE INTERFACE IS FROZEN, FUNCTION NUMBERS ARE NEVER REUSED. A removed
  * call leaves a hole. This is the promise that makes old programs safe, and it
  * costs nothing to keep - there are 256 numbers and twenty are in use. */
-#define KOI_ABI_VERSION 6
-#define KOI_ABI_MINIMUM 6
+#define KOI_ABI_VERSION 7
+#define KOI_ABI_MINIMUM 7
 #define KOI_ABI_IS_ALPHA 1
 
 /* Every program begins with this, placed at its load address by the linker
@@ -154,6 +158,22 @@ typedef struct {
 #define KOI_SEEK_SET 0       /* from the beginning */
 #define KOI_SEEK_CURRENT 1   /* from where it is now */
 #define KOI_SEEK_END 2       /* from the end, offset usually negative */
+
+/* Deleting and renaming. The filesystem has always been able to do both; the
+   shell's `del` and `ren` are these calls' older siblings. A program that can
+   create files and never remove them fills the disk and cannot tidy up after
+   itself - a saved game it replaces, a temporary file it made. */
+#define SYS_REMOVE 0x16      /* (path) -> 0, or -1 */
+#define SYS_RENAME 0x17      /* (from, to) -> 0, or -1 */
+/* Does this path exist? Cheaper to ask than to open, and the answer to "may I
+   overwrite this" without the side effect of creating it. */
+#define SYS_EXISTS 0x1B      /* (path) -> 1, 0, or -1 when there is no volume */
+/* Make a directory. An installed package keeps its own, rather than emptying
+   itself into \BIN alongside the system's own programs - which is also how a
+   program finds its data, since a relative path resolves from where the shell
+   is standing. A package manager that cannot create a directory cannot do
+   that. */
+#define SYS_MKDIR 0x1C       /* (path) -> 0, or -1 */
 
 /* Directory enumeration. Without these a program cannot write its own `dir`,
    which makes the shell's built-in the only way to see a directory. */

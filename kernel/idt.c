@@ -122,6 +122,17 @@ __attribute__((noreturn)) static void panic_with_frame(const char* message,
         report_register("RSI", frame->rsi);
         report_register("RDI", frame->rdi);
         report_register("RBP", frame->rbp);
+        /* All sixteen, not the eight that happen to have names from 1978.
+           A fault whose cause is in r15 is not diagnosable from a dump that
+           stops at rbp - which is exactly how one afternoon went. */
+        report_register("R8 ", frame->r8);
+        report_register("R9 ", frame->r9);
+        report_register("R10", frame->r10);
+        report_register("R11", frame->r11);
+        report_register("R12", frame->r12);
+        report_register("R13", frame->r13);
+        report_register("R14", frame->r14);
+        report_register("R15", frame->r15);
     }
     cpu_hang();
 }
