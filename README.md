@@ -106,6 +106,7 @@ make at all, because it used to read 100 ms as 0.
 | `setup` | install Koi-DOS onto a disk |
 | `shutdown`, `reboot` | through ACPI, which is the only way there is |
 | `beep [hz] [ms]` | a tone, if the machine has a sound device |
+| `sound` | the sound device, and which output it chose |
 | `echo`, `ver`, `cls`, `help` | the usual |
 | `Z:` | change drive |
 
@@ -203,12 +204,40 @@ Z:\> color yellow blue     text and background
 
 **HD Audio**, because AC'97 is emulated everywhere and fitted to nothing: every machine this
 could run on has an HDA controller, and QEMU emulating the easy one as well is a trap rather than
-a shortcut.
+a shortcut. **The PC speaker is not used at all** — no laptop has had one for years, and the
+thing that makes the noise is the same chip the headphone socket comes out of.
 
-The driver does one thing — it finds a codec, traces a path from a physical output jack back
-through whatever mixers and selectors are in the way to a converter, unmutes every step of it,
-and leaves a single stream of 48 kHz stereo running over a ring of memory forever. It never
-starts or stops: a stream started per sound clicks, and one that always runs does not.
+The driver does one thing — it finds a codec, traces a path from a physical output back through
+whatever mixers and selectors are in the way to a converter, unmutes every step of it, and leaves
+a single stream of 48 kHz stereo running over a ring of memory forever. It never starts or stops:
+a stream started per sound clicks, and one that always runs does not.
+
+**Which output** is decided by what is plugged in, not by what the socket is called. Ranking by
+name — line out, then headphones, then the built-in speaker — is right on a desk and wrong on a
+laptop, where it picks the headphone socket and leaves the machine silent with nothing in it. So
+a jack that reports something plugged into it wins; the built-in speaker comes next, because it
+is always there; a jack that cannot report comes after that, since guessing "empty" would silence
+a machine that works; and a jack that reports nothing plugged in is not used. External amplifiers
+are switched on where the codec has one — a laptop whose speakers are wired through one is silent
+without that while every register reads correctly.
+
+`sound` prints all of it. "There is no sound" has several completely different causes that are
+identical from a chair — no controller, a controller with no codec, a codec whose only outputs
+are digital, an empty headphone socket, or the right socket chosen and muted further along — and
+the codec's own description of its outputs is the difference between guessing and knowing:
+
+```
+Z:\> sound
+Codec           : Realtek (10EC0295)
+Output          : speaker, converter at node 2
+Rate            : 48000 Hz, stereo, 16-bit
+Volume          : 200 of 255
+Voices          : 0 of 16 playing
+
+Analogue outputs the codec describes:
+  node 20 speaker    built in                 <- in use
+  node 33 headphones nothing plugged in
+```
 
 Everything above that is [kernel/audio.c](kernel/audio.c), which has no hardware in it. Sixteen
 voices, each with its own rate, volume and pan, resampled into the ring in 32.32 fixed point —

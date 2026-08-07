@@ -95,6 +95,7 @@
 #define VERB_SET_STREAM_CHANNEL 0x706
 #define VERB_SET_PIN_CONTROL 0x707
 #define VERB_GET_CONFIG_DEFAULT 0xF1C
+#define VERB_GET_PIN_SENSE 0xF09
 #define VERB_SET_EAPD 0x70C
 #define VERB_SET_FORMAT 0x200           /* 4-bit verb 0x2, 16-bit payload */
 #define VERB_SET_AMP 0x300              /* 4-bit verb 0x3, 16-bit payload */
@@ -122,6 +123,7 @@
 #define WIDGET_CAP_DIGITAL 0x0200U
 #define WIDGET_CAP_POWER 0x0400U
 
+#define PIN_CAP_PRESENCE 0x00000004U
 #define PIN_CAP_OUTPUT 0x00000010U
 #define PIN_CAP_HEADPHONE 0x00000008U
 #define PIN_CAP_EAPD 0x00010000U
@@ -446,62 +448,143 @@ static int trace(boot_uint8_t node, int depth) {
     return 0;
 }
 
-/* How much we want a given jack. Line out first, then headphones, then the
-   built-in speaker: on a desk the first is what the speakers are in, and on a
-   laptop only the last two exist. */
-static int pin_rank(boot_uint32_t configuration) {
+/* Whether anything is plugged into a pin.
+ *
+ * A pin that is built in - a laptop's own speakers - has nothing to plug in
+ * and always counts as usable. A jack may or may not be able to tell; the ones
+ * that cannot are not unusual, and guessing "empty" for those would silence a
+ * machine that works. */
+static boot_uint8_t pin_sense(boot_uint8_t node, boot_uint32_t configuration,
+                              boot_uint32_t pin_capabilities) {
+    boot_uint32_t connectivity = (configuration >> 30) & 0x3;
+    boot_uint32_t response = 0;
+
+    if (connectivity == 2) return HDA_SENSE_FIXED;
+    if (!(pin_capabilities & PIN_CAP_PRESENCE)) return HDA_SENSE_UNKNOWN;
+    if (!command(codec_address, node, VERB_GET_PIN_SENSE, 0, &response))
+        return HDA_SENSE_UNKNOWN;
+    return (response & 0x80000000U) ? HDA_SENSE_PRESENT : HDA_SENSE_EMPTY;
+}
+
+/* How much we want a given output, which is mostly a question about laptops.
+ *
+ * Ranking by what the jack is called - line out, then headphones, then the
+ * built-in speaker - is right on a desk and wrong on a laptop, where it picks
+ * the headphone socket and leaves the machine silent with nothing plugged into
+ * it. What actually matters is whether anything is connected, so that comes
+ * first and the name only breaks ties:
+ *
+ *   a jack with something in it        7   headphones win when they are worn
+ *   the built-in speaker               4   always there, so always usable
+ *   a jack that cannot report          3   guessing empty would silence a
+ *                                          machine that works
+ *   a jack reporting nothing in it     0   there is no point sending sound
+ *                                          somewhere nobody is listening
+ */
+static int pin_rank(boot_uint32_t configuration, boot_uint8_t sense) {
     boot_uint32_t connectivity = (configuration >> 30) & 0x3;
     boot_uint32_t device = (configuration >> 20) & 0xF;
+    int base;
 
     if (connectivity == 1) return 0;    /* no physical connection at all */
     switch (device) {
-    case 0x0: return 4;                 /* line out */
-    case 0x2: return 3;                 /* headphone out */
-    case 0x1: return 2;                 /* speaker */
+    case HDA_DEVICE_LINE_OUT: base = 3; break;
+    case HDA_DEVICE_HEADPHONE: base = 3; break;
+    case HDA_DEVICE_SPEAKER: base = 2; break;
     default: return 0;                  /* an input, or something digital */
+    }
+
+    switch (sense) {
+    case HDA_SENSE_PRESENT: return base + 4;
+    case HDA_SENSE_FIXED: return base + 2;
+    case HDA_SENSE_UNKNOWN: return base;
+    default: return 0;
+    }
+}
+
+/* The same ranking with the question of what is plugged in removed, for the
+   fall-back below: better to drive a socket nobody is using than to report no
+   output at all on a machine that plainly has one. */
+static int pin_rank_regardless(boot_uint32_t configuration) {
+    return pin_rank(configuration, HDA_SENSE_UNKNOWN);
+}
+
+static HDA_PIN pins[HDA_PINS_MAX];
+static boot_uint32_t pin_count;
+
+static const char* device_name(boot_uint32_t device) {
+    switch (device) {
+    case HDA_DEVICE_LINE_OUT: return "line out";
+    case HDA_DEVICE_SPEAKER: return "speaker";
+    case HDA_DEVICE_HEADPHONE: return "headphones";
+    default: return "other";
     }
 }
 
 static int find_path(boot_uint8_t first_widget, boot_uint32_t widget_count) {
     int node;
     int last = (int)first_widget + (int)widget_count;
-    boot_uint8_t best = 0;
+    int best = -1;
     int best_rank = 0;
-    boot_uint32_t best_configuration = 0;
+    boot_uint32_t index;
 
+    pin_count = 0;
     if (last > 256) last = 256;
     for (node = first_widget; node < last; node++) {
         boot_uint32_t capabilities = parameter((boot_uint8_t)node,
                                                PARAM_WIDGET_CAP);
         boot_uint32_t pin_capabilities;
-        boot_uint32_t configuration;
-        int rank;
+        boot_uint32_t configuration = 0;
+        HDA_PIN* pin;
 
         if (WIDGET_TYPE(capabilities) != WIDGET_PIN) continue;
         if (capabilities & WIDGET_CAP_DIGITAL) continue;
-        pin_capabilities = parameter(node, PARAM_PIN_CAP);
+        pin_capabilities = parameter((boot_uint8_t)node, PARAM_PIN_CAP);
         if (!(pin_capabilities & PIN_CAP_OUTPUT)) continue;
+        if (pin_count >= HDA_PINS_MAX) break;
 
-        configuration = 0;
-        command(codec_address, node, VERB_GET_CONFIG_DEFAULT, 0,
+        command(codec_address, (boot_uint8_t)node, VERB_GET_CONFIG_DEFAULT, 0,
                 &configuration);
-        rank = pin_rank(configuration);
-        if (rank > best_rank) {
-            best_rank = rank;
-            best = node;
-            best_configuration = configuration;
-        }
+
+        pin = &pins[pin_count++];
+        pin->node = (boot_uint8_t)node;
+        pin->configuration = configuration;
+        pin->device = (boot_uint8_t)((configuration >> 20) & 0xF);
+        pin->connectivity = (boot_uint8_t)((configuration >> 30) & 0x3);
+        pin->sense = pin_sense((boot_uint8_t)node, configuration,
+                               pin_capabilities);
+        pin->rank = pin_rank(configuration, pin->sense);
+        pin->chosen = 0;
     }
 
-    if (!best_rank) {
-        log("HDA: the codec has no analogue output jack\n");
+    for (index = 0; index < pin_count; index++)
+        if (pins[index].rank > best_rank) {
+            best_rank = pins[index].rank;
+            best = (int)index;
+        }
+
+    /* Nothing is plugged in anywhere. Drive the best output there is rather
+       than none: a socket nobody is using is silent either way, and a machine
+       whose only jack cannot be sensed would otherwise never make a sound. */
+    if (best < 0) {
+        for (index = 0; index < pin_count; index++) {
+            int rank = pin_rank_regardless(pins[index].configuration);
+            if (rank > best_rank) { best_rank = rank; best = (int)index; }
+        }
+        if (best >= 0)
+            log("HDA: nothing is plugged in; using the best output anyway\n");
+    }
+
+    if (best < 0) {
+        log("HDA: the codec has no analogue output\n");
         return 0;
     }
 
-    path_pin = best;
+    pins[best].chosen = 1;
+    path_pin = pins[best].node;
     path_dac = 0;
-    if (!trace(best, 0)) {
-        log("HDA: no converter feeds the output jack\n");
+    if (!trace(path_pin, 0)) {
+        log("HDA: no converter feeds the output\n");
         return 0;
     }
 
@@ -522,11 +605,13 @@ static int find_path(boot_uint8_t first_widget, boot_uint32_t widget_count) {
             command(codec_address, path_pin, VERB_SET_EAPD, 0x02, 0);
     }
 
-    log("HDA: jack at node ");
+    log("HDA: ");
+    log(device_name(pins[best].device));
+    log(pins[best].sense == HDA_SENSE_PRESENT ? " (plugged in)"
+        : pins[best].sense == HDA_SENSE_FIXED ? " (built in)" : "");
+    log(" at node ");
     log_dec(path_pin);
-    log(" (configuration ");
-    log_hex(best_configuration);
-    log(") fed by converter at node ");
+    log(", fed by the converter at node ");
     log_dec(path_dac);
     log("\n");
     return 1;
@@ -575,12 +660,17 @@ static int find_codec(void) {
             timer_wait(2);
 
             widgets = parameter(function, PARAM_NODE_COUNT);
-            return find_path((boot_uint8_t)((widgets >> 16) & 0xFF),
-                             widgets & 0xFF);
+            if (find_path((boot_uint8_t)((widgets >> 16) & 0xFF),
+                          widgets & 0xFF))
+                return 1;
+            /* This one has nothing usable on it. Keep looking rather than
+               giving up: a controller can carry more than one codec, and the
+               first to answer is not necessarily the one the speakers are
+               wired to. */
         }
     }
 
-    log("HDA: no codec answered (state ");
+    log("HDA: no codec has an analogue output (state ");
     log_hex(present);
     log(", gctl ");
     log_hex(read32(REG_GCTL));
@@ -757,6 +847,22 @@ int hda_init(const PCI_DEVICE* controller) {
 }
 
 int hda_ready(void) { return ready; }
+
+boot_uint32_t hda_pin_count(void) { return pin_count; }
+
+const HDA_PIN* hda_pin(boot_uint32_t index) {
+    return index < pin_count ? &pins[index] : 0;
+}
+
+boot_uint8_t hda_converter(void) { return path_dac; }
+
+const char* hda_output_name(void) {
+    boot_uint32_t index;
+    if (!ready) return "none";
+    for (index = 0; index < pin_count; index++)
+        if (pins[index].chosen) return device_name(pins[index].device);
+    return "unknown";
+}
 const char* hda_codec_name(void) { return ready ? codec_name : "none"; }
 boot_uint32_t hda_codec_id(void) { return codec_vendor; }
 short* hda_ring(void) { return ready ? ring : 0; }

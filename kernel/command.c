@@ -10,6 +10,7 @@
 #include "block.h"
 #include "xhci.h"
 #include "audio.h"
+#include "hda.h"
 #include "graphics.h"
 #include "fat32.h"
 #include "partition.h"
@@ -364,6 +365,7 @@ static void command_help(void) {
     print_line("time           show the time");
     print_line("echo [text]    print text");
     print_line("beep [hz] [ms] a tone, if there is a sound device");
+    print_line("sound          the sound device, and which output it picked");
     print_line("ver            show the version");
     print_line("help           this list");
     print_line("");
@@ -525,6 +527,71 @@ static void print_hex(boot_uint64_t value, int digits) {
     for (int shift = (digits - 1) * 4; shift >= 0; shift -= 4)
         put(digit[(value >> shift) & 0xF]);
 }
+
+/* What the sound hardware is, and what it decided.
+ *
+ * "There is no sound" has several completely different causes that are
+ * identical from a chair: no controller, a controller with no codec, a codec
+ * whose only outputs are digital, a headphone socket with nothing plugged into
+ * it, or the right socket picked and muted further along. Printing the codec's
+ * own description of its outputs is the difference between guessing and
+ * knowing which of those it is. */
+static void command_sound(void) {
+    if (!audio_ready()) {
+        print_line("No sound device.");
+        print_line("");
+        print_line("Koi-DOS drives Intel HD Audio, which is the sound hardware in");
+        print_line("every machine since about 2005 - not the PC speaker, which this");
+        print_line("does not use at all. `pci` will show whether a controller is");
+        print_line("there: class 04:03 is HD Audio.");
+        return;
+    }
+
+    print("Codec           : ");
+    print(hda_codec_name());
+    print(" (");
+    print_hex(hda_codec_id(), 8);
+    print_line(")");
+    print("Output          : ");
+    print(hda_output_name());
+    print(", converter at node ");
+    print_dec(hda_converter());
+    print_line("");
+    print_field("Rate            : ", HDA_RATE, " Hz, stereo, 16-bit");
+    print_field("Volume          : ", (boot_uint64_t)audio_volume(), " of 255");
+    print("Voices          : ");
+    print_dec(audio_voices_playing());
+    print(" of ");
+    print_dec(AUDIO_VOICES);
+    print_line(" playing");
+    print_line("");
+
+    print_line("Analogue outputs the codec describes:");
+    for (boot_uint32_t index = 0; index < hda_pin_count(); index++) {
+        const HDA_PIN* pin = hda_pin(index);
+        if (!pin) continue;
+
+        print("  node ");
+        print_dec(pin->node);
+        print("  ");
+        switch (pin->device) {
+        case HDA_DEVICE_LINE_OUT: print("line out   "); break;
+        case HDA_DEVICE_SPEAKER: print("speaker    "); break;
+        case HDA_DEVICE_HEADPHONE: print("headphones "); break;
+        default: print("other      "); break;
+        }
+        switch (pin->sense) {
+        case HDA_SENSE_PRESENT: print("something is plugged in"); break;
+        case HDA_SENSE_EMPTY: print("nothing plugged in     "); break;
+        case HDA_SENSE_FIXED: print("built in               "); break;
+        default: print("cannot tell            "); break;
+        }
+        if (pin->chosen) print("  <- in use");
+        print_line("");
+    }
+    if (!hda_pin_count()) print_line("  none - every output on this codec is digital");
+}
+
 
 /* Enough of the class list to name what a DOS-like system might ever drive,
    and honest about the rest. USB is broken out by programming interface
@@ -2293,6 +2360,7 @@ static void execute(const char* input) {
     if (word_is(input, "TIME")) { command_time(); return; }
     if (word_is(input, "VER")) { command_ver(); return; }
     if (word_is(input, "BEEP")) { command_beep(&arguments); return; }
+    if (word_is(input, "SOUND")) { command_sound(); return; }
     if (word_is(input, "HELP")) { command_help(); return; }
     /* `echo.` prints a blank line - the DOS idiom for one, since a bare
        `echo` prints the on/off state instead. */

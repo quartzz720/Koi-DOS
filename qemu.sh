@@ -72,6 +72,14 @@ OVMF_VARS=${OVMF_VARS:-$(find_ovmf VARS || true)}
 # sending it to the speakers. That is how the driver was checked: a sine wave
 # is either at the frequency and amplitude that were asked for or it is not,
 # and a file can be measured where a noise in the room cannot.
+
+# Which codec is attached, because the codecs differ in the one way that
+# matters to the driver: hda-output describes a line-out jack that cannot say
+# whether anything is plugged into it, and hda-micro describes a built-in
+# speaker. Those are the two branches of how an output gets chosen, and a
+# laptop is the second one.
+HDA_CODEC=${KOI_HDA_CODEC:-hda-output}
+
 if [ -n "${KOI_AUDIO_WAV:-}" ]; then
     AUDIO_BACKEND="wav,id=koisnd,path=$KOI_AUDIO_WAV"
 else
@@ -223,7 +231,7 @@ exec qemu-system-x86_64 \
   -device nvme,drive=ssd,serial=KOI0001 \
   -audiodev "$AUDIO_BACKEND" \
   -device ich9-intel-hda,id=hda \
-  -device hda-output,bus=hda.0,audiodev=koisnd \
+  -device "$HDA_CODEC",bus=hda.0,audiodev=koisnd \
   -serial stdio \
   -net none \
   "$@"

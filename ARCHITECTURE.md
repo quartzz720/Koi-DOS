@@ -562,11 +562,35 @@ desk this was written at is an AMD HDA controller, and so is every laptop made s
 
 The controller is the easy half — two rings and a stream. The codec is not the controller: it is
 a little graph of widgets, converters and mixers and selectors and the physical jacks, and
-getting sound out of it means finding a route through that graph and unmuting every step. The
-driver ranks the output pins by what the codec says they are wired to (line out, then headphones,
-then the built-in speaker, skipping anything with no physical connection), then walks the
-connection lists backwards from that pin until it reaches a converter, unmuting behind itself.
-One muted amplifier anywhere on that path is indistinguishable from a driver that never ran.
+getting sound out of it means finding a route through that graph and unmuting every step. One
+muted amplifier anywhere on that path is indistinguishable from a driver that never ran.
+
+**Choosing the output is a question about laptops.** Ranking the pins by what the codec calls
+them — line out, then headphones, then the built-in speaker — is right on a desk and wrong on a
+laptop, where it picks the headphone socket and leaves the machine silent with nothing plugged
+into it. What decides is whether anything is connected, asked of the pin itself with
+`GET_PIN_SENSE`; the name only breaks ties:
+
+| | |
+|---|---|
+| a jack with something in it | 7 — headphones win when they are being worn |
+| the built-in speaker | 4 — always there, so always usable |
+| a jack that cannot report | 3 — guessing "empty" would silence a machine that works |
+| a jack reporting nothing in it | 0 — no point sending sound where nobody is listening |
+
+If every pin scores zero the best one is driven anyway, because a socket nobody is using is
+silent either way and reporting "no output" on a machine that plainly has one is worse. External
+amplifiers get switched on where the codec has one (`EAPD`): a laptop whose speakers are wired
+through one is silent without it while every register reads correctly.
+
+From the chosen pin the driver walks the connection lists backwards until it reaches a converter,
+unmuting behind itself and telling each selector which of its inputs to pass. A controller may
+carry more than one codec and the first to answer is not necessarily the one the speakers are on,
+so a codec with no analogue output is skipped rather than being the end of it — which is also
+what happens to the HDA controller inside a graphics card, whose outputs are all HDMI.
+
+`sound` prints the whole table, because "there is no sound" has several completely different
+causes that are identical from a chair.
 
 **The bug worth writing down.** The controller stops fetching commands once it has produced
 `RINTCNT` responses, and what releases it is software clearing the response bit in `RIRBSTS`. But

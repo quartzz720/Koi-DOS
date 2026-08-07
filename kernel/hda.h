@@ -32,6 +32,42 @@ int hda_ready(void);
 const char* hda_codec_name(void);
 boot_uint32_t hda_codec_id(void);
 
+/* Every analogue output the codec describes, and which one is in use.
+ *
+ * This exists because "there is no sound" has several completely different
+ * causes that look identical from a chair: no controller, a controller with no
+ * codec, a codec whose only outputs are digital, a headphone jack with nothing
+ * plugged into it, or the right jack chosen and muted somewhere. The `sound`
+ * command prints this, and that is the difference between guessing and
+ * knowing. */
+#define HDA_PINS_MAX 16
+
+#define HDA_DEVICE_LINE_OUT 0
+#define HDA_DEVICE_SPEAKER 1
+#define HDA_DEVICE_HEADPHONE 2
+
+#define HDA_SENSE_UNKNOWN 0    /* the pin cannot report whether it is in use */
+#define HDA_SENSE_EMPTY 1
+#define HDA_SENSE_PRESENT 2
+#define HDA_SENSE_FIXED 3      /* built in - there is nothing to plug in */
+
+typedef struct {
+    boot_uint8_t node;
+    boot_uint8_t device;           /* HDA_DEVICE_*, or something else */
+    boot_uint8_t connectivity;     /* 0 jack, 1 none, 2 fixed, 3 both */
+    boot_uint8_t sense;            /* HDA_SENSE_* */
+    boot_uint8_t chosen;
+    boot_uint32_t configuration;
+    int rank;
+} HDA_PIN;
+
+boot_uint32_t hda_pin_count(void);
+const HDA_PIN* hda_pin(boot_uint32_t index);
+
+/* The converter feeding the chosen pin, and what kind of output it is. */
+boot_uint8_t hda_converter(void);
+const char* hda_output_name(void);
+
 /* The ring the controller is reading from, as interleaved left/right pairs.
    Writing to it is how sound is made; there is no other path. */
 short* hda_ring(void);
