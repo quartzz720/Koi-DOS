@@ -3,6 +3,18 @@
 A DOS-like operating system for UEFI machines, written in freestanding C with no standard
 library.
 
+> **`[NEW]`  The first programs written for Koi-DOS with the official SDK:**
+>
+> **[DOSFETCH](https://github.com/quartzz720/DOSFETCH)** — a system summary in the spirit of
+> neofetch. No ASCII logo, on purpose.
+>
+> **[Games](https://github.com/quartzz720/Games)** — Snake, Tetris, Pong, Breakout, Reversi and
+> Minesweeper, in one program with a menu.
+>
+> Both are built with nothing but [sdk/](sdk/), in their own repositories. That is the point of
+> them: if either stops building, the SDK is broken for everybody rather than only for programs
+> that happen to live in this tree.
+
 "DOS-like" means the look and the character, not binary compatibility: drive letters, FAT32, a
 familiar command set, a monolith in ring 0 with no memory protection. Programs are native
 64-bit ones with their own system-call interface — real MS-DOS binaries are not a goal.
@@ -161,9 +173,12 @@ in [programs/](programs/):
 enough to write a listing with no privilege the shell does not also lack, and that a program can
 change how the system looks and make it stick without reaching into kernel state.
 
-A third proof lives outside this repository on purpose. **DOSFETCH** — a system summary in the
-spirit of neofetch — is built with nothing but the SDK, in its own project. If it stops building,
-the SDK is broken for everybody, rather than only for programs that happen to sit in this tree.
+Two more proofs live outside this repository on purpose, each built with nothing but the SDK:
+**[DOSFETCH](https://github.com/quartzz720/DOSFETCH)**, a system summary in the spirit of
+neofetch, and **[Games](https://github.com/quartzz720/Games)**, six of them in one program with a
+menu. If either stops building, the SDK is broken for everybody rather than only for programs
+that happen to sit in this tree — and Games is the one that proves the graphics calls, because it
+is the only thing that draws sixty times a second.
 
 ```
 Z:\> color                 show the presets and the palette
@@ -488,6 +503,25 @@ relocations (must be none, or the kernel is not actually position-fixed), and th
 
 A USB stick is now the sensible way to try it.
 
+```bash
+./deploy.sh          # find the stick, ask, copy the current build onto it
+./deploy.sh -l       # list removable disks and stop
+```
+
+`deploy.sh` finds the stick rather than being told which it is, because the letter moves between
+`sdc` and `sdf` depending on what else is plugged in and typing the wrong one once is how a disk
+gets ruined. It refuses anything that is not removable, refuses the disks the running system is
+on — asked of the kernel, not written down here, since a list of names would be wrong the first
+time the machine changed — and shows what it found before it writes a byte.
+
+**It only copies files.** It does not format, partition or touch a boot sector; preparing a stick
+is a one-off done by hand. Existing files of the same name are replaced and everything else is
+left alone. If the desktop has already mounted the stick it uses that mount rather than fighting
+it, which is where `Device or resource busy` came from.
+
+It also picks up `GAMES.EXE` and `DOSFETCH.EXE` from the sibling projects when they are checked
+out next to this one, so one command refreshes everything.
+
 The bootloader records the FAT volume serial of the device it was loaded from, and the kernel
 matches on it rather than assuming the first FAT volume it finds is the right one. That
 assumption would have been dangerous: booted off a stick, the first FAT volume the AHCI driver
@@ -586,6 +620,7 @@ sdk/                   the four files a program needs, plus koicc
 legacy/                the old UEFI Boot Services shell, kept for reference
 linker.ld              kernel layout, fixed at 1 MiB
 qemu.sh                image build + QEMU launch
+deploy.sh              find the USB stick and copy the build onto it
 ```
 
 ## License
