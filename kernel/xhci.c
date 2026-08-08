@@ -99,6 +99,7 @@
 #define USB_GET_DESCRIPTOR 6
 #define USB_SET_CONFIGURATION 9
 #define USB_CLEAR_FEATURE 1
+#define USB_SET_INTERFACE 11
 #define USB_FEATURE_ENDPOINT_HALT 0
 #define USB_DESCRIPTOR_DEVICE 1
 #define USB_DESCRIPTOR_CONFIGURATION 2
@@ -480,6 +481,7 @@ static boot_uint32_t event_endpoint(const TRB* event) {
 }
 
 static int keyboard_event(const XHCI_CONTROLLER* self, const TRB* event);
+static int network_event(const XHCI_CONTROLLER* self, const TRB* event);
 
 /* Deal with an event that is not the one being waited for.
  *
@@ -496,7 +498,7 @@ static int service_event(const XHCI_CONTROLLER* self, const TRB* event) {
     case TRB_PORT_STATUS_CHANGE:
         return 1;                    /* expected during enumeration */
     case TRB_TRANSFER_EVENT:
-        return keyboard_event(self, event);
+        return keyboard_event(self, event) || network_event(self, event);
     default:
         return 0;
     }
@@ -1531,17 +1533,18 @@ static boot_uint8_t storage_last_sense = 0xFF;
  *
  * Returns bytes transferred, -1 on failure, -2 on a stall the caller should
  * recover from. */
-static int bulk_transfer(RING* ring, boot_uint32_t dci, void* buffer,
-                         boot_uint32_t length, boot_uint64_t timeout_ms) {
-    XHCI_CONTROLLER* self = storage_device->controller;
+static int bulk_transfer(USB_DEVICE* device, RING* ring, boot_uint32_t dci,
+                         void* buffer, boot_uint32_t length,
+                         boot_uint64_t timeout_ms) {
+    XHCI_CONTROLLER* self = device->controller;
     TRB event;
     boot_uint32_t code;
 
     ring_push(ring, (boot_uint64_t)(unsigned long long)buffer, length,
               (TRB_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC);
-    ring_doorbell(self, storage_device->slot, dci);
+    ring_doorbell(self, device->slot, dci);
 
-    if (!wait_for_transfer(self, storage_device->slot, dci, &event, timeout_ms)) {
+    if (!wait_for_transfer(self, device->slot, dci, &event, timeout_ms)) {
         log_controller(self);
         log("bulk transfer produced no event\n");
         return -1;
@@ -1583,7 +1586,7 @@ static int scsi_command(const boot_uint8_t* command, boot_uint32_t command_lengt
     cbw->command_length = (boot_uint8_t)command_length;
     memcpy(cbw->command, command, command_length);
 
-    moved = bulk_transfer(&storage_out, storage_out_dci, cbw,
+    moved = bulk_transfer(storage_device, &storage_out, storage_out_dci, cbw,
                           (boot_uint32_t)sizeof(*cbw), 2000);
     if (moved != (int)sizeof(*cbw)) {
         if (moved == -2)
@@ -1596,7 +1599,7 @@ static int scsi_command(const boot_uint8_t* command, boot_uint32_t command_lengt
         RING* ring = data_in ? &storage_in : &storage_out;
         boot_uint32_t dci = data_in ? storage_in_dci : storage_out_dci;
 
-        moved = bulk_transfer(ring, dci, data, data_length, 5000);
+        moved = bulk_transfer(storage_device, ring, dci, data, data_length, 5000);
         if (moved == -2) {
             /* A stalled data stage is not fatal: the device still owes us a
                status block, and it will send one once the endpoint is clear. */
@@ -1609,13 +1612,13 @@ static int scsi_command(const boot_uint8_t* command, boot_uint32_t command_lengt
     }
 
     memset(csw, 0, sizeof(*csw));
-    moved = bulk_transfer(&storage_in, storage_in_dci, csw,
+    moved = bulk_transfer(storage_device, &storage_in, storage_in_dci, csw,
                           (boot_uint32_t)sizeof(*csw), 2000);
     if (moved == -2) {
         if (!clear_stall(storage_device, storage_in_dci, &storage_in,
                          storage_in_address))
             return 0;
-        moved = bulk_transfer(&storage_in, storage_in_dci, csw,
+        moved = bulk_transfer(storage_device, &storage_in, storage_in_dci, csw,
                               (boot_uint32_t)sizeof(*csw), 2000);
     }
     if (moved < (int)sizeof(*csw)) return 0;
@@ -2182,6 +2185,44 @@ static int find_network(const boot_uint8_t* configuration, boot_uint32_t length,
     return found->in_address && found->out_address;
 }
 
+/* The device the frames will go over. One, for now: a machine with two phones
+   plugged into it is a problem for later and a rare one. */
+static USB_DEVICE* network_device;
+static RING network_in;
+static RING network_out;
+static boot_uint32_t network_in_dci;
+static boot_uint32_t network_out_dci;
+static boot_uint32_t network_frame_limit;
+static boot_uint8_t network_in_address;
+static boot_uint8_t network_out_address;
+static boot_uint16_t network_out_packet;
+static boot_uint8_t network_mac[6];
+static int network_ready;
+
+/* The two buffers the controller does DMA into and out of. One page each:
+   pages are what this kernel allocates, and a TRB's buffer may not cross a
+   64 KiB boundary, which a single page never does. */
+static boot_uint8_t* network_receive_buffer;
+static boot_uint8_t* network_send_buffer;
+
+/* Frames that have arrived and nobody has asked for yet.
+ *
+ * A queue rather than a single buffer, because the receive TRB has to be
+ * re-armed the instant it completes - an endpoint with nothing outstanding is
+ * a device the host has stopped listening to - and re-arming overwrites the
+ * page. So the frames are copied out here, where they can wait for whatever
+ * asks. RNDIS batches several into one transfer, so one completion can fill
+ * several of these. */
+#define NETWORK_FRAME_MAX 1514
+#define NETWORK_QUEUE 16
+static boot_uint8_t network_queue[NETWORK_QUEUE][NETWORK_FRAME_MAX];
+static boot_uint16_t network_queue_length[NETWORK_QUEUE];
+static boot_uint32_t network_queue_head;
+static boot_uint32_t network_queue_tail;
+static boot_uint32_t network_dropped;
+
+static void arm_network_receive(void);
+
 static const char* network_kind_name(int kind) {
     switch (kind) {
     case NETWORK_RNDIS: return "RNDIS";
@@ -2273,10 +2314,28 @@ static int rndis_exchange(USB_DEVICE* device, boot_uint8_t interface,
  * not merely fail it, it halts endpoint zero, and every request after it fails
  * too - with a different message each time, none of them naming the one that
  * actually went wrong. Clearing the halt turns a cascade back into a single
- * failure. */
+ * failure.
+ *
+ * This was first written as a CLEAR_FEATURE sent to the device - which cannot
+ * work, because the only road to the device is the endpoint that is halted.
+ * The request to unstick it went out over the stuck thing and failed, and the
+ * log filled with "control transfer produced no event" for every request after
+ * it. Nothing here is the device's business at all: the halt that matters is
+ * the controller's idea of the endpoint, cleared by Reset Endpoint, and the
+ * dequeue pointer left parked on the TRB that stalled, moved on by hand. USB
+ * clears endpoint zero on the device side at the next SETUP with no help from
+ * us, which is exactly why there is no CLEAR_FEATURE here any more. */
 static void clear_control_halt(USB_DEVICE* device) {
-    (void)control_in(device, 0x02, USB_CLEAR_FEATURE,
-                     USB_FEATURE_ENDPOINT_HALT, 0, 0, 0);
+    XHCI_CONTROLLER* self = device->controller;
+
+    if (!run_command(self, "reset endpoint zero", 0,
+                     (TRB_RESET_ENDPOINT << TRB_TYPE_SHIFT) |
+                     (1u << 16) | (device->slot << 24)))
+        return;
+    (void)run_command(self, "set dequeue pointer",
+                      ring_position(&device->control),
+                      (TRB_SET_TR_DEQUEUE << TRB_TYPE_SHIFT) |
+                      (1u << 16) | (device->slot << 24));
 }
 
 /* Ask the device for one thing it knows about itself. */
@@ -2295,7 +2354,16 @@ static int rndis_query(USB_DEVICE* device, boot_uint8_t interface,
     put32(buffer + 8, id);
     put32(buffer + 12, oid);
     put32(buffer + 16, 0);              /* information length */
-    put32(buffer + 20, 20);             /* offset, from byte 8 */
+    /* And the offset zero with it.
+     *
+     * This said 20 - the offset of the byte after the header, which is where
+     * an information buffer would start if there were one. There is not: a
+     * query sends no data, it asks for some. A device that takes the pair
+     * seriously reads "a zero-length buffer beginning one byte past the end of
+     * the message" and stalls, which is exactly what QEMU's adapter did while
+     * the phone let it pass. The phone was the more forgiving of the two and
+     * the emulator was right. */
+    put32(buffer + 20, 0);              /* offset, from byte 8 */
     put32(buffer + 24, 0);              /* device VC handle, always zero */
 
     got = rndis_exchange(device, interface, buffer, 28, buffer, size);
@@ -2352,7 +2420,11 @@ static int rndis_initialize(USB_DEVICE* device, boot_uint8_t interface,
     put32(buffer + 8, id);
     put32(buffer + 12, 1);              /* major version */
     put32(buffer + 16, 0);              /* minor version */
-    put32(buffer + 20, 0x4000);         /* the most we will send in one go */
+    /* The most the device may send us in one bus transfer, and the number is
+       not a preference: the device batches frames up to it, and anything over
+       it arrives as babble on an endpoint that then has to be reset. Our
+       receive buffer is one page, so one page is what we promise. */
+    put32(buffer + 20, PAGE_SIZE);
 
     got = rndis_exchange(device, interface, buffer, 24, buffer, size);
     if (got < 0) {
@@ -2409,6 +2481,7 @@ static int configure_network(USB_DEVICE* device,
                              boot_uint32_t length) {
     XHCI_CONTROLLER* self = device->controller;
     USB_NETWORK network;
+    boot_uint32_t max_frame = 0;
 
     if (!find_network(configuration, length, &network)) return 0;
 
@@ -2470,6 +2543,7 @@ static int configure_network(USB_DEVICE* device,
         if (rndis_query(device, network.control, OID_802_3_PERMANENT_ADDRESS,
                         buffer, PAGE_SIZE, mac, &mac_length) &&
             mac_length == 6) {
+            memcpy(network_mac, mac, 6);
             log_controller(self);
             log("hardware address ");
             for (int index = 0; index < 6; index++) {
@@ -2488,14 +2562,233 @@ static int configure_network(USB_DEVICE* device,
             log("the packet filter was refused - it will hand over nothing\n");
         }
 
+        max_frame = max_transfer;
         free_page(buffer);
     }
 
-    log_controller(self);
-    log("talking to it; no frames move yet\n");
-    /* Claimed. The frames are not moving, but the device is ours and saying
-       "no driver for this device" after a conversation with it is a lie. */
+    /* The two bulk endpoints, which is where frames will go.
+     *
+     * The alternate setting comes first and is not a formality: a CDC data
+     * interface sitting in setting 0 has no endpoints at all, by design, and
+     * asking the controller to configure endpoints the device has not offered
+     * yet is a Configure Endpoint command that fails for a reason that reads
+     * like a driver bug. RNDIS keeps them in setting 0, so this is a no-op
+     * there and essential everywhere else. */
+    if (network.data_alternate &&
+        control_in(device, 0x01, USB_SET_INTERFACE, network.data_alternate,
+                   network.data, 0, 0) < 0) {
+        log_controller(self);
+        log("the data interface would not switch to its working setting\n");
+        return 0;
+    }
+
+    {
+        boot_uint32_t in_dci = (boot_uint32_t)(network.in_address & 0x0F) * 2 + 1;
+        boot_uint32_t out_dci = (boot_uint32_t)(network.out_address & 0x0F) * 2;
+        boot_uint32_t last = in_dci > out_dci ? in_dci : out_dci;
+        TRB* in_trbs = (TRB*)alloc_page();
+        TRB* out_trbs = (TRB*)alloc_page();
+        boot_uint8_t* input = (boot_uint8_t*)alloc_page();
+
+        network_receive_buffer = (boot_uint8_t*)alloc_page();
+        network_send_buffer = (boot_uint8_t*)alloc_page();
+        if (!in_trbs || !out_trbs || !input ||
+            !network_receive_buffer || !network_send_buffer) {
+            log_controller(self);
+            log("out of memory opening the network endpoints\n");
+            return 0;
+        }
+        memset(input, 0, PAGE_SIZE);
+        ring_init(&network_in, in_trbs);
+        ring_init(&network_out, out_trbs);
+
+        ((boot_uint32_t*)input)[1] = 1u | (1u << in_dci) | (1u << out_dci);
+        input_slot_context(self, input)[0] = (last << 27) | (device->speed << 20);
+        input_slot_context(self, input)[1] = (device->port + 1) << 16;
+        describe_endpoint(self, input, in_dci, ENDPOINT_TYPE_BULK_IN,
+                          network.in_packet, 0, &network_in);
+        describe_endpoint(self, input, out_dci, ENDPOINT_TYPE_BULK_OUT,
+                          network.out_packet, 0, &network_out);
+
+        if (!run_command(self, "configure endpoint",
+                         (boot_uint64_t)(unsigned long long)input,
+                         (TRB_CONFIGURE_ENDPOINT << TRB_TYPE_SHIFT) |
+                         (device->slot << 24))) {
+            free_page(input);
+            return 0;
+        }
+        free_page(input);
+
+        network_device = device;
+        network_in_dci = in_dci;
+        network_out_dci = out_dci;
+        network_in_address = network.in_address;
+        network_out_address = network.out_address;
+        network_out_packet = network.out_packet;
+        network_frame_limit = max_frame;
+        log_controller(self);
+        log("frame channels open, up to ");
+        log_dec(max_frame);
+        log(" bytes each\n");
+    }
+
+    network_ready = 1;
+    arm_network_receive();
     return 1;
+}
+
+/* ---- Frames -------------------------------------------------------------
+ *
+ * RNDIS carries an Ethernet frame inside a 44-byte header, and the header is
+ * mostly zeroes: what it really says is where the frame starts and how long it
+ * is. The fields that matter:
+ *
+ *    0  message type, 1 for a packet     4  total length, header included
+ *    8  data offset, counted from byte 8 (so 36 for a frame straight after)
+ *   12  data length
+ *
+ * Everything from 16 on is out-of-band data and per-packet information, which
+ * nothing here sends and nothing here needs to read.
+ */
+#define RNDIS_PACKET 0x00000001U
+#define RNDIS_PACKET_HEADER 44
+
+/* Put the frame in the queue, or count it as lost.
+ *
+ * Dropping is the right answer when the queue is full: the alternative is to
+ * stop collecting from the device, and a receive endpoint that nobody empties
+ * backs up into the phone. A count is kept because a driver that silently
+ * loses frames is indistinguishable from a network that is not working. */
+static void queue_frame(const boot_uint8_t* frame, boot_uint32_t length) {
+    boot_uint32_t next = (network_queue_tail + 1) % NETWORK_QUEUE;
+
+    if (length > NETWORK_FRAME_MAX || next == network_queue_head) {
+        network_dropped++;
+        return;
+    }
+    memcpy(network_queue[network_queue_tail], frame, length);
+    network_queue_length[network_queue_tail] = (boot_uint16_t)length;
+    network_queue_tail = next;
+}
+
+/* Split one bulk transfer into the frames it holds. */
+static void unwrap_frames(boot_uint32_t total) {
+    boot_uint32_t offset = 0;
+
+    while (offset + RNDIS_PACKET_HEADER <= total) {
+        const boot_uint8_t* message = network_receive_buffer + offset;
+        boot_uint32_t message_length = get32(message + 4);
+        boot_uint32_t data_offset = get32(message + 8);
+        boot_uint32_t data_length = get32(message + 12);
+
+        if (get32(message + 0) != RNDIS_PACKET) break;
+        /* Every one of these has been seen from something: a length that runs
+           past the transfer, an offset that points outside its own message.
+           Trusting them would be reading the kernel's memory at a device's
+           direction. */
+        if (message_length < RNDIS_PACKET_HEADER ||
+            offset + message_length > total) break;
+        if (data_offset + 8 + data_length > message_length) break;
+
+        queue_frame(message + 8 + data_offset, data_length);
+        offset += message_length;
+    }
+}
+
+/* Keep one receive request outstanding at all times.
+ *
+ * A bulk IN endpoint hands over nothing until it is asked, and it is asked by
+ * a TRB sitting on its ring. The moment one completes the next has to go down,
+ * or the device has arriving frames and nowhere to put them. */
+static void arm_network_receive(void) {
+    if (!network_ready) return;
+    ring_push(&network_in,
+              (boot_uint64_t)(unsigned long long)network_receive_buffer,
+              PAGE_SIZE, (TRB_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC);
+    ring_doorbell(network_device->controller, network_device->slot,
+                  network_in_dci);
+}
+
+/* Is this transfer event a frame arriving? Same shape as the keyboard's hook,
+   and for the same reason: these land unbidden, in the middle of whatever else
+   is going on. */
+static int network_event(const XHCI_CONTROLLER* self, const TRB* event) {
+    boot_uint32_t code;
+    boot_uint32_t moved;
+
+    if (!network_ready || !network_device) return 0;
+    if (network_device->controller != self) return 0;
+    if (event_slot(event) != network_device->slot) return 0;
+    if (event_endpoint(event) != network_in_dci) return 0;
+
+    code = event->status >> 24;
+    moved = PAGE_SIZE - (event->status & 0xFFFFFF);
+    if (code == COMPLETION_SUCCESS || code == COMPLETION_SHORT_PACKET) {
+        unwrap_frames(moved);
+    } else if (code == COMPLETION_STALL) {
+        clear_stall(network_device, network_in_dci, &network_in,
+                    network_in_address);
+    }
+    arm_network_receive();
+    return 1;
+}
+
+/* Hand over one frame, or 0 if none has arrived. Never waits: this is called
+   from the same loop that draws a prompt. */
+boot_uint32_t usb_net_receive(void* frame, boot_uint32_t size) {
+    boot_uint32_t length;
+
+    if (network_queue_head == network_queue_tail) return 0;
+    length = network_queue_length[network_queue_head];
+    if (length > size) length = size;
+    memcpy(frame, network_queue[network_queue_head], length);
+    network_queue_head = (network_queue_head + 1) % NETWORK_QUEUE;
+    return length;
+}
+
+/* Send one Ethernet frame. Returns 1 when the controller says it went. */
+int usb_net_send(const void* frame, boot_uint32_t length) {
+    boot_uint32_t total = RNDIS_PACKET_HEADER + length;
+    int moved;
+
+    if (!network_ready || !length || length > NETWORK_FRAME_MAX) return 0;
+    if (total > network_frame_limit) return 0;
+
+    memset(network_send_buffer, 0, RNDIS_PACKET_HEADER);
+    put32(network_send_buffer + 0, RNDIS_PACKET);
+    put32(network_send_buffer + 4, total);
+    put32(network_send_buffer + 8, RNDIS_PACKET_HEADER - 8);
+    put32(network_send_buffer + 12, length);
+    memcpy(network_send_buffer + RNDIS_PACKET_HEADER, frame, length);
+
+    moved = bulk_transfer(network_device, &network_out, network_out_dci,
+                          network_send_buffer, total, 1000);
+    if (moved == -2) {
+        clear_stall(network_device, network_out_dci, &network_out,
+                    network_out_address);
+        return 0;
+    }
+    if (moved < 0) return 0;
+
+    /* A transfer that is an exact multiple of the packet size does not end as
+       far as the device is concerned - it is still waiting for the short
+       packet that says "that was all of it". An empty transfer says it. */
+    if (network_out_packet && total % network_out_packet == 0)
+        (void)bulk_transfer(network_device, &network_out, network_out_dci,
+                            network_send_buffer, 0, 1000);
+    return 1;
+}
+
+int usb_net_ready(void) {
+    return network_ready;
+}
+
+const boot_uint8_t* usb_net_address(void) {
+    return network_mac;
+}
+
+boot_uint32_t usb_net_dropped(void) {
+    return network_dropped;
 }
 
 

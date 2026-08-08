@@ -80,6 +80,20 @@ OVMF_VARS=${OVMF_VARS:-$(find_ovmf VARS || true)}
 # laptop is the second one.
 HDA_CODEC=${KOI_HDA_CODEC:-hda-output}
 
+# A USB network adapter speaking RNDIS, which is the same protocol a phone
+# offers when tethering - so the driver written against a phone is testable
+# without one. Behind it is QEMU's user-mode network, and that is the useful
+# part: it runs a real DHCP server at 10.0.2.2 handing out 10.0.2.15, answers
+# DNS at 10.0.2.3, and passes pings through to the outside world. Every layer
+# above the frames has something to talk to here.
+#
+# KOI_USB_NET=0 leaves it out.
+if [ "${KOI_USB_NET:-1}" = "0" ]; then
+    NETWORK_ARGS="-net none"
+else
+    NETWORK_ARGS="-netdev user,id=koinet -device usb-net,bus=xhci1.0,netdev=koinet,id=usbnet"
+fi
+
 if [ -n "${KOI_AUDIO_WAV:-}" ]; then
     AUDIO_BACKEND="wav,id=koisnd,path=$KOI_AUDIO_WAV"
 else
@@ -238,5 +252,5 @@ exec qemu-system-x86_64 \
   -device ich9-intel-hda,id=hda \
   -device "$HDA_CODEC",bus=hda.0,audiodev=koisnd \
   -serial stdio \
-  -net none \
+  $NETWORK_ARGS \
   "$@"

@@ -12,6 +12,8 @@
 #include "audio.h"
 #include "hda.h"
 #include "graphics.h"
+#include "net.h"
+#include "timer.h"
 #include "fat32.h"
 #include "partition.h"
 #include "rtc.h"
@@ -366,6 +368,8 @@ static void command_help(void) {
     print_line("echo [text]    print text");
     print_line("beep [hz] [ms] a tone, if there is a sound device");
     print_line("sound          the sound device, and which output it picked");
+    print_line("net [start]    the network: what it is, or ask for an address");
+    print_line("ping <host>    is it there, and how far away");
     print_line("log [file]     the kernel log: on screen, or written to a file");
     print_line("ver            show the version");
     print_line("help           this list");
@@ -610,6 +614,112 @@ static void command_log(const ARGUMENTS* arguments) {
     }
     if (boot_log_truncated())
         print_line("(the log filled up; everything after this was dropped)");
+}
+
+/* Print one address as a dotted quad, or a dash when there is not one. */
+static void print_address(boot_uint32_t address) {
+    char text[16];
+
+    if (!address) { print("-"); return; }
+    net_format_address(address, text);
+    print(text);
+}
+
+static void command_net(void) {
+    if (!usb_net_ready()) {
+        print_line("No network device.");
+        print_line("");
+        print_line("Koi-DOS carries frames over a USB adapter speaking RNDIS, which");
+        print_line("is what a phone offers when it shares its connection. Plug one");
+        print_line("in and turn USB tethering on; `log` says what was found and why");
+        print_line("it was not taken.");
+        return;
+    }
+
+    print("Hardware address: ");
+    for (int index = 0; index < 6; index++) {
+        if (index) print(":");
+        print_hex(net_hardware_address()[index], 2);
+    }
+    print_line("");
+
+    if (!net_configured()) {
+        print_line("Address         : none - nobody has handed one out yet");
+        print_line("");
+        print_line("`net start` asks for one.");
+        return;
+    }
+
+    print("Address         : "); print_address(net_address()); print_line("");
+    print("Netmask         : "); print_address(net_netmask()); print_line("");
+    print("Gateway         : "); print_address(net_gateway()); print_line("");
+    print("Name server     : "); print_address(net_dns()); print_line("");
+    if (usb_net_dropped()) {
+        print("Frames dropped  : ");
+        print_dec(usb_net_dropped());
+        print_line(" (arrived with nowhere to put them)");
+    }
+}
+
+static void command_net_start(void) {
+    if (!usb_net_ready()) { print_line("No network device."); return; }
+    print_line("Asking for an address...");
+    if (!net_start()) {
+        print_line("Nobody answered. On a phone, check that USB tethering is on.");
+        return;
+    }
+    print("Address ");
+    print_address(net_address());
+    print(", gateway ");
+    print_address(net_gateway());
+    print_line("");
+}
+
+/* Four echo requests, the way every ping since 1983 has done it. */
+static void command_ping(const ARGUMENTS* arguments) {
+    boot_uint32_t address;
+    int replies = 0;
+
+    if (!arguments->tail[0]) {
+        print_line("Usage: ping <address or name>");
+        return;
+    }
+    if (!net_configured()) {
+        print_line("No address yet. Run `net start` first.");
+        return;
+    }
+    if (!net_resolve(arguments->tail, &address)) {
+        print("Could not find ");
+        print_line(arguments->tail);
+        return;
+    }
+
+    print("Pinging ");
+    print(arguments->tail);
+    print(" [");
+    print_address(address);
+    print_line("] with 32 bytes of data:");
+
+    for (int attempt = 0; attempt < 4; attempt++) {
+        int milliseconds = net_ping(address, 2000);
+
+        if (milliseconds < 0) {
+            print_line("Request timed out.");
+        } else {
+            replies++;
+            print("Reply from ");
+            print_address(address);
+            print(": time=");
+            print_dec((boot_uint64_t)milliseconds);
+            print_line("ms");
+        }
+        if (attempt < 3) timer_wait(500);
+    }
+
+    print("");
+    print_dec((boot_uint64_t)replies);
+    print(" of 4 replied");
+    print_line(replies ? "." : " - nothing came back.");
 }
 
 static void command_sound(void) {
@@ -2442,6 +2552,12 @@ static void execute(const char* input) {
     if (word_is(input, "VER")) { command_ver(); return; }
     if (word_is(input, "BEEP")) { command_beep(&arguments); return; }
     if (word_is(input, "SOUND")) { command_sound(); return; }
+    if (word_is(input, "NET")) {
+        if (word_is(arguments.operand[0], "START")) command_net_start();
+        else command_net();
+        return;
+    }
+    if (word_is(input, "PING")) { command_ping(&arguments); return; }
     if (word_is(input, "LOG")) { command_log(&arguments); return; }
     if (word_is(input, "HELP")) { command_help(); return; }
     /* `echo.` prints a blank line - the DOS idiom for one, since a bare

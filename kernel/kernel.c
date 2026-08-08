@@ -280,6 +280,7 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
             report(" PORTS IN USE");
             if (xhci_has_keyboard()) report(", KEYBOARD");
             if (xhci_has_storage()) report(", STORAGE");
+            if (usb_net_ready()) report(", NETWORK");
             report("\n");
         } else {
             report("XHCI: NOT FOUND\n");

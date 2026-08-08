@@ -159,7 +159,8 @@ the whole span is what initialises `.bss`, which has no presence in the file at 
 | [kernel/nvme.c](kernel/nvme.c) | NVMe admin and I/O queues, Identify, read/write |
 | [kernel/hpet.c](kernel/hpet.c) | The HPET, as a monotonic clock rather than a source of events |
 | [kernel/apic.c](kernel/apic.c) | Local APIC timer and I/O APIC interrupt routing |
-| [kernel/xhci.c](kernel/xhci.c) | USB 3 host controller, the HID boot keyboard and mass storage |
+| [kernel/xhci.c](kernel/xhci.c) | USB 3 host controller: the HID boot keyboard, mass storage and RNDIS networking |
+| [kernel/net.c](kernel/net.c) | ARP, IPv4, UDP, DHCP, DNS and ICMP echo — enough for `ping` |
 | [kernel/block.c](kernel/block.c) | Sector-device abstraction over any controller |
 | [kernel/partition.c](kernel/partition.c) | GPT, MBR and whole-device volumes; drive letters |
 | [kernel/fat32.c](kernel/fat32.c) | FAT32 with VFAT long names, read and write |
@@ -664,6 +665,70 @@ graphics program starting, drawing and exiting has not one silent 20 ms block in
 shots in DOOM land at the six moments the keys were sent, each the length `DSPISTOL` is at
 11025 Hz, since a wrong sample rate would show as a wrong duration; and a voice panned across
 while playing is silent in the far channel at each end and full in both at the centre.
+
+### Networking
+
+The network device is a phone. That is not a limitation being apologised for, it is the design:
+this runs on two machines, neither of which has an Ethernet socket, and both of which have a USB
+port and somebody holding a phone. A phone sharing its connection presents itself as a USB
+network adapter speaking RNDIS, so RNDIS is what is driven.
+
+**RNDIS is a remote procedure call wearing a network adapter's coat.** Configuration does not
+happen through descriptors; it happens by sending Microsoft's NDIS messages *inside control
+transfers* and fetching the answers with a second control transfer that has to be asked for
+separately. Every message carries a request id and the reply carries it back, which is the only
+thing distinguishing an answer to this question from an answer to the last one.
+
+Three mistakes on the way there, each with a symptom that pointed somewhere else:
+
+- A message byte-for-byte correct was stalled, because a class request is addressed to an
+  *interface* and a device with no configuration selected has no interfaces yet.
+- The reply's fields were read one field early, which took the device flags for the medium and
+  announced that an ordinary Ethernet adapter was not Ethernet. The offsets are written out in a
+  comment now.
+- A query carried an information-buffer offset pointing one byte past the end of a message with
+  no information buffer in it. A query sends no data; it asks for some, and the offset belongs at
+  zero. The phone let this pass and QEMU's adapter stalled it — the emulator was the stricter of
+  the two and the correct one.
+
+**A stalled control endpoint stays stalled**, and clearing it is the controller's business, not
+the device's. The first attempt sent CLEAR_FEATURE to the device, which cannot work: the only
+road to the device is the endpoint that is halted. What the log showed was every request after
+the first failing, each with a different message, none of them naming the one that actually went
+wrong. Reset Endpoint plus Set TR Dequeue Pointer puts the endpoint back; USB clears endpoint
+zero on the device side at the next SETUP without being asked.
+
+**Frames go inside a 44-byte header** whose real content is where the frame starts and how long
+it is. The device batches several into one bus transfer, up to a limit *we* state in the
+initialize message — so that limit is one page, because one page is what the receive buffer is
+and a device that sends more arrives as babble on an endpoint that then has to be reset. One
+receive request is kept outstanding at all times: a bulk IN endpoint hands over nothing until it
+is asked, and an endpoint with nothing queued is a host that has stopped listening. Completions
+are copied into a queue rather than parsed in place, because re-arming overwrites the page.
+
+Above that, [kernel/net.c](kernel/net.c) is ARP, IPv4, UDP, DHCP, DNS and ICMP echo, and stops
+there. No TCP, no sockets — those belong to whichever program first needs them. Addresses are
+held in host order throughout and swapped only at the wire, so the byte swaps live in four
+functions instead of being scattered where a wrong one looks like an address nobody recognises.
+
+Routing is one comparison: an address on this wire goes to its own hardware address, and
+everything else goes to the gateway's, with the packet's own destination unchanged. There is one
+neighbour cache entry, because there is one gateway.
+
+`ping google.com` exercises the whole stack at once — DHCP for the address, ARP for the gateway,
+DNS over UDP for the name, ICMP for the echo — which is why it is the test:
+
+```
+Z:\> net start
+Asking for an address...
+Address 10.0.2.15, gateway 10.0.2.2
+Z:\> ping google.com
+Pinging google.com [142.251.127.139] with 32 bytes of data:
+Reply from 142.251.127.139: time=48ms
+```
+
+QEMU's user-mode network is a real DHCP server, a real resolver and a path to the outside world,
+so all of that is testable without a phone plugged in — `qemu.sh` attaches one by default.
 
 ### Keyboard
 

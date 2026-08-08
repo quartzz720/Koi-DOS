@@ -56,4 +56,29 @@ void xhci_poll(void);
  * waits for a keystroke also notices a stick appearing. */
 void xhci_service(void);
 
+/* ---- The network, as far as this driver is concerned ---------------------
+ *
+ * Ethernet frames in and out, and nothing above them: what is inside one is
+ * the protocol layer's business, not the controller's. The device underneath
+ * is a phone speaking RNDIS over USB, which is a detail nobody above needs.
+ */
+
+/* Is there a network device that has agreed to carry frames? */
+int usb_net_ready(void);
+
+/* Our hardware address - six bytes, the device's own. */
+const boot_uint8_t* usb_net_address(void);
+
+/* Send one Ethernet frame. Returns 1 when it went out. */
+int usb_net_send(const void* frame, boot_uint32_t length);
+
+/* Take the oldest frame that has arrived, or 0 if none has. Never waits:
+   frames are collected by xhci_poll and queued, so this only empties a queue
+   somebody else filled. */
+boot_uint32_t usb_net_receive(void* frame, boot_uint32_t size);
+
+/* Frames that arrived with nowhere to put them. A driver that quietly loses
+   packets looks exactly like a network that is not working, so it counts. */
+boot_uint32_t usb_net_dropped(void);
+
 #endif
