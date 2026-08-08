@@ -93,6 +93,7 @@
 
 #define TRANSFER_TYPE_NO_DATA (0u << 16)
 #define TRANSFER_TYPE_IN (3u << 16)
+#define TRANSFER_TYPE_OUT (2u << 16)
 
 /* USB standard requests. */
 #define USB_GET_DESCRIPTOR 6
@@ -969,6 +970,57 @@ static int control_in(USB_DEVICE* device, boot_uint8_t request_type,
     return (int)(length - (event.status & 0xFFFFFF));
 }
 
+/* The same, the other way: send the device something.
+ *
+ * A separate function rather than a flag on the one above, because every phase
+ * changes direction with the transfer and a single function with three
+ * conditionals in it reads worse than two that each say one thing. */
+static int control_out(USB_DEVICE* device, boot_uint8_t request_type,
+                       boot_uint8_t request, boot_uint16_t value,
+                       boot_uint16_t index, const void* buffer,
+                       boot_uint16_t length) {
+    XHCI_CONTROLLER* self = device->controller;
+    boot_uint64_t setup;
+    TRB event;
+    boot_uint32_t code;
+
+    setup = (boot_uint64_t)request_type |
+            ((boot_uint64_t)request << 8) |
+            ((boot_uint64_t)value << 16) |
+            ((boot_uint64_t)index << 32) |
+            ((boot_uint64_t)length << 48);
+
+    ring_push(&device->control, setup, 8,
+              (TRB_SETUP_STAGE << TRB_TYPE_SHIFT) | TRB_IMMEDIATE_DATA |
+              (length ? TRANSFER_TYPE_OUT : TRANSFER_TYPE_NO_DATA));
+
+    if (length) {
+        ring_push(&device->control, (boot_uint64_t)(unsigned long long)buffer,
+                  length, (TRB_DATA_STAGE << TRB_TYPE_SHIFT));
+    }
+
+    /* An OUT transfer is acknowledged by an IN status stage. */
+    ring_push(&device->control, 0, 0,
+              (TRB_STATUS_STAGE << TRB_TYPE_SHIFT) | TRB_IOC | TRB_DIRECTION_IN);
+
+    ring_doorbell(self, device->slot, 1);
+
+    if (!wait_for_transfer(self, device->slot, 1, &event, 1000)) {
+        log_controller(self);
+        log("control transfer produced no event\n");
+        return -1;
+    }
+    code = event.status >> 24;
+    if (code != COMPLETION_SUCCESS && code != COMPLETION_SHORT_PACKET) {
+        log_controller(self);
+        log("control transfer failed: ");
+        log(completion_name(code));
+        log("\n");
+        return -1;
+    }
+    return (int)length;
+}
+
 /* Read the device descriptor and say what turned up. This is the first thing
    the device itself answers, as opposed to the controller answering for it. */
 static int identify_device(USB_DEVICE* device) {
@@ -1075,12 +1127,32 @@ static int clear_stall(USB_DEVICE* device, boot_uint32_t dci, RING* ring,
 
 /* ---- HID boot keyboard --------------------------------------------------- */
 
-static USB_DEVICE* keyboard_device;
-static RING keyboard_ring;
-static boot_uint32_t keyboard_dci;
-static boot_uint8_t* report_buffer;
-static boot_uint8_t previous_report[8];
-static int keyboard_ready;
+/* Keyboards, plural, and that is the whole point.
+ *
+ * This used to claim the first device with a boot-keyboard interface and log
+ * "a second keyboard is present and ignored" for the rest. On a desk with one
+ * keyboard that is fine. On a desk with a gaming mouse it is a disaster: those
+ * mice carry a boot-keyboard interface of their own for their macro keys, they
+ * enumerate before the keyboard does, and the driver ends up listening
+ * intently to a mouse. Everything reports success, nothing is typed, and the
+ * log says "keyboard ready" - which is true, and about the wrong device.
+ *
+ * So all of them are taken and all of them feed the same queue. Nothing here
+ * has to decide which one somebody is going to type on, which is good, because
+ * nothing here could. */
+#define KEYBOARD_MAX 4
+
+typedef struct {
+    USB_DEVICE* device;
+    RING ring;
+    boot_uint32_t dci;
+    boot_uint8_t* report;
+    boot_uint8_t previous[8];
+    int used;
+} USB_KEYBOARD;
+
+static USB_KEYBOARD keyboards[KEYBOARD_MAX];
+static boot_uint32_t keyboard_count;
 
 /* HID usage IDs to characters, unshifted then shifted. The boot protocol
    reports which physical key was pressed, not what it means, so this is the
@@ -1134,11 +1206,11 @@ static int hid_to_key(boot_uint8_t usage, boot_uint8_t modifiers) {
 
 /* Queue a request for the next 8-byte report. The endpoint only speaks when
    asked, so one of these has to be outstanding at all times. */
-static void queue_report_request(void) {
-    ring_push(&keyboard_ring, (boot_uint64_t)(unsigned long long)report_buffer,
+static void queue_report_request(USB_KEYBOARD* keyboard) {
+    ring_push(&keyboard->ring, (boot_uint64_t)(unsigned long long)keyboard->report,
               8, (TRB_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC);
-    ring_doorbell(keyboard_device->controller, keyboard_device->slot,
-                  keyboard_dci);
+    ring_doorbell(keyboard->device->controller, keyboard->device->slot,
+                  keyboard->dci);
 }
 
 /* Which key a usage is, ignoring what it would type. The event queue reports
@@ -1177,9 +1249,9 @@ static int report_holds(const boot_uint8_t* report, boot_uint8_t usage) {
  * the last one, which is also how key repeat is avoided without any timing.
  * Comparing the other way round gives the releases, which the same comparison
  * has always been able to see and which used to be thrown away. */
-static void handle_report(const boot_uint8_t* report) {
+static void handle_report(USB_KEYBOARD* keyboard, const boot_uint8_t* report) {
     boot_uint8_t modifiers = report[0];
-    boot_uint8_t was = previous_report[0];
+    boot_uint8_t was = keyboard->previous[0];
     static const struct { boot_uint8_t mask; int key; } modifier_keys[] = {
         { 0x22, KOI_KEY_SHIFT },     /* either shift */
         { 0x11, KOI_KEY_CONTROL },   /* either control */
@@ -1197,20 +1269,20 @@ static void handle_report(const boot_uint8_t* report) {
         boot_uint8_t usage = report[index];
 
         if (!usage || usage == 1) continue;   /* 1 means too many keys at once */
-        if (report_holds(previous_report, usage)) continue;
+        if (report_holds(keyboard->previous, usage)) continue;
 
         keyboard_submit_event(hid_identity(usage), 0);
         keyboard_submit(hid_to_key(usage, modifiers));
     }
 
     for (int index = 2; index < 8; index++) {
-        boot_uint8_t usage = previous_report[index];
+        boot_uint8_t usage = keyboard->previous[index];
 
         if (!usage || usage == 1) continue;
         if (report_holds(report, usage)) continue;
         keyboard_submit_event(hid_identity(usage), 1);
     }
-    memcpy(previous_report, report, 8);
+    memcpy(keyboard->previous, report, 8);
 }
 
 /* Is this transfer event the keyboard's? Called for every transfer event that
@@ -1219,13 +1291,18 @@ static void handle_report(const boot_uint8_t* report) {
    numbers are per-controller, so slot 1 on one is a different device from
    slot 1 on the other. */
 static int keyboard_event(const XHCI_CONTROLLER* self, const TRB* event) {
-    if (!keyboard_ready) return 0;
-    if (keyboard_device->controller != self) return 0;
-    if (event_slot(event) != keyboard_device->slot) return 0;
-    if (event_endpoint(event) != keyboard_dci) return 0;
-    handle_report(report_buffer);
-    queue_report_request();
-    return 1;
+    for (boot_uint32_t index = 0; index < keyboard_count; index++) {
+        USB_KEYBOARD* keyboard = &keyboards[index];
+
+        if (!keyboard->used) continue;
+        if (keyboard->device->controller != self) continue;
+        if (event_slot(event) != keyboard->device->slot) continue;
+        if (event_endpoint(event) != keyboard->dci) continue;
+        handle_report(keyboard, keyboard->report);
+        queue_report_request(keyboard);
+        return 1;
+    }
+    return 0;
 }
 
 void xhci_poll(void) {
@@ -1248,7 +1325,9 @@ void xhci_poll(void) {
 }
 
 int xhci_has_keyboard(void) {
-    return keyboard_ready;
+    for (boot_uint32_t index = 0; index < keyboard_count; index++)
+        if (keyboards[index].used) return 1;
+    return 0;
 }
 
 /* Walk a configuration descriptor looking for a boot-protocol keyboard, and
@@ -1319,9 +1398,9 @@ static int configure_keyboard(USB_DEVICE* device,
                        &packet, &interval))
         return 0;
 
-    if (keyboard_ready) {
+    if (keyboard_count >= KEYBOARD_MAX) {
         log_controller(self);
-        log("a second keyboard is present and ignored\n");
+        log("more keyboards than this can hold; ignoring one\n");
         return 0;
     }
 
@@ -1336,25 +1415,28 @@ static int configure_keyboard(USB_DEVICE* device,
 
     /* Endpoint 1 IN is device context index 3: two per endpoint number, plus
        one for the IN direction. */
-    keyboard_dci = endpoint * 2 + 1;
+    {
+        USB_KEYBOARD* keyboard = &keyboards[keyboard_count];
+        memset(keyboard, 0, sizeof(*keyboard));
+        keyboard->dci = endpoint * 2 + 1;
 
     trbs = (TRB*)alloc_page();
-    report_buffer = (boot_uint8_t*)alloc_page();
+    keyboard->report = (boot_uint8_t*)alloc_page();
     input = (boot_uint8_t*)alloc_page();
-    if (!trbs || !report_buffer || !input) return 0;
-    memset(report_buffer, 0, PAGE_SIZE);
+    if (!trbs || !keyboard->report || !input) return 0;
+    memset(keyboard->report, 0, PAGE_SIZE);
     memset(input, 0, PAGE_SIZE);
-    ring_init(&keyboard_ring, trbs);
+    ring_init(&keyboard->ring, trbs);
 
     /* Add the slot context and the new endpoint. The slot has to be included
        because its Context Entries field must grow to cover the new index. */
-    ((boot_uint32_t*)input)[1] = 1u | (1u << keyboard_dci);
+    ((boot_uint32_t*)input)[1] = 1u | (1u << keyboard->dci);
     input_slot_context(self, input)[0] =
-        (keyboard_dci << 27) | (device->speed << 20);
+        (keyboard->dci << 27) | (device->speed << 20);
     input_slot_context(self, input)[1] = (device->port + 1) << 16;
-    describe_endpoint(self, input, keyboard_dci, ENDPOINT_TYPE_INTERRUPT_IN,
+    describe_endpoint(self, input, keyboard->dci, ENDPOINT_TYPE_INTERRUPT_IN,
                       packet, interval_exponent(device->speed, interval),
-                      &keyboard_ring);
+                      &keyboard->ring);
 
     if (!run_command(self, "configure endpoint",
                      (boot_uint64_t)(unsigned long long)input,
@@ -1378,11 +1460,15 @@ static int configure_keyboard(USB_DEVICE* device,
         return 0;
     }
 
-    keyboard_device = device;
-    keyboard_ready = 1;
-    queue_report_request();
-    log_controller(self);
-    log("keyboard ready\n");
+        keyboard->device = device;
+        keyboard->used = 1;
+        keyboard_count++;
+        queue_report_request(keyboard);
+        log_controller(self);
+        log("keyboard ready (");
+        log_dec(keyboard_count);
+        log(" attached)\n");
+    }
     return 1;
 }
 
@@ -2104,6 +2190,217 @@ static const char* network_kind_name(int kind) {
     }
 }
 
+/* ---- RNDIS, as far as asking the device who it is -------------------------
+ *
+ * RNDIS is a remote procedure call dressed as a network protocol: messages go
+ * to the device inside a control transfer, and the answer comes back from a
+ * second control transfer that has to be asked for separately. Every message
+ * carries a request id, and the reply carries it back - which is the only way
+ * to know that an answer belongs to the question just asked rather than to the
+ * one before it.
+ */
+#define RNDIS_SEND_COMMAND 0x00         /* class request, host to device */
+#define RNDIS_GET_RESPONSE 0x01
+
+#define RNDIS_INITIALIZE 0x00000002U
+#define RNDIS_QUERY 0x00000004U
+#define RNDIS_SET 0x00000005U
+#define RNDIS_COMPLETE 0x80000000U      /* set in the reply to any of them */
+
+#define RNDIS_STATUS_SUCCESS 0x00000000U
+
+#define OID_GEN_CURRENT_PACKET_FILTER 0x0001010EU
+#define OID_802_3_PERMANENT_ADDRESS 0x01010101U
+
+/* Directed, multicast and broadcast. Without a filter the device is entitled
+   to hand over nothing at all, which looks exactly like a cable that is not
+   plugged in. */
+#define RNDIS_PACKET_FILTER 0x0000000FU
+
+/* One message buffer, reused: RNDIS is strictly one exchange at a time. */
+static boot_uint32_t rndis_request_id = 1;
+
+/* Two hex digits, always. A hardware address written with the leading zeroes
+   dropped is not a hardware address, it is a puzzle. */
+static void log_hex_byte(boot_uint8_t value) {
+    static const char digits[] = "0123456789ABCDEF";
+    char text[3];
+    text[0] = digits[(value >> 4) & 0xF];
+    text[1] = digits[value & 0xF];
+    text[2] = 0;
+    log(text);
+}
+
+static void put32(boot_uint8_t* at, boot_uint32_t value) {
+    at[0] = (boot_uint8_t)value;
+    at[1] = (boot_uint8_t)(value >> 8);
+    at[2] = (boot_uint8_t)(value >> 16);
+    at[3] = (boot_uint8_t)(value >> 24);
+}
+
+static boot_uint32_t get32(const boot_uint8_t* at) {
+    return (boot_uint32_t)at[0] | ((boot_uint32_t)at[1] << 8) |
+           ((boot_uint32_t)at[2] << 16) | ((boot_uint32_t)at[3] << 24);
+}
+
+/* Send one message and collect its reply.
+ *
+ * The reply is not offered; it has to be fetched, and a device that has not
+ * finished thinking answers the fetch with nothing. Retried a few times rather
+ * than once, because "not yet" and "never" are the same answer here and only
+ * waiting tells them apart. */
+static int rndis_exchange(USB_DEVICE* device, boot_uint8_t interface,
+                          boot_uint8_t* message, boot_uint32_t length,
+                          boot_uint8_t* reply, boot_uint32_t reply_size) {
+    int got = -1;
+
+    if (control_out(device, 0x21, RNDIS_SEND_COMMAND, 0, interface,
+                    message, (boot_uint16_t)length) < 0)
+        return -1;
+
+    for (int attempt = 0; attempt < 10; attempt++) {
+        got = control_in(device, 0xA1, RNDIS_GET_RESPONSE, 0, interface,
+                         reply, (boot_uint16_t)reply_size);
+        if (got > 0) break;
+        timer_wait(20);
+    }
+    return got;
+}
+
+/* A stalled control endpoint stays stalled.
+ *
+ * That is the part worth remembering: a device that refuses one request does
+ * not merely fail it, it halts endpoint zero, and every request after it fails
+ * too - with a different message each time, none of them naming the one that
+ * actually went wrong. Clearing the halt turns a cascade back into a single
+ * failure. */
+static void clear_control_halt(USB_DEVICE* device) {
+    (void)control_in(device, 0x02, USB_CLEAR_FEATURE,
+                     USB_FEATURE_ENDPOINT_HALT, 0, 0, 0);
+}
+
+/* Ask the device for one thing it knows about itself. */
+static int rndis_query(USB_DEVICE* device, boot_uint8_t interface,
+                       boot_uint32_t oid, boot_uint8_t* buffer,
+                       boot_uint32_t size, boot_uint8_t* out,
+                       boot_uint32_t* out_length) {
+    boot_uint32_t id = rndis_request_id++;
+    boot_uint32_t offset;
+    boot_uint32_t info;
+    int got;
+
+    memset(buffer, 0, size);
+    put32(buffer + 0, RNDIS_QUERY);
+    put32(buffer + 4, 28);              /* header only: nothing is being sent */
+    put32(buffer + 8, id);
+    put32(buffer + 12, oid);
+    put32(buffer + 16, 0);              /* information length */
+    put32(buffer + 20, 20);             /* offset, from byte 8 */
+    put32(buffer + 24, 0);              /* device VC handle, always zero */
+
+    got = rndis_exchange(device, interface, buffer, 28, buffer, size);
+    if (got < 24) { clear_control_halt(device); return 0; }
+    if (get32(buffer + 0) != (RNDIS_QUERY | RNDIS_COMPLETE)) return 0;
+    if (get32(buffer + 8) != id) return 0;
+    if (get32(buffer + 12) != RNDIS_STATUS_SUCCESS) return 0;
+
+    info = get32(buffer + 16);
+    offset = get32(buffer + 20);
+    /* The offset counts from byte 8 of the message, which is the one detail of
+       this protocol that is easiest to get wrong and hardest to see. */
+    if (offset + 8 + info > (boot_uint32_t)got) return 0;
+    if (info > *out_length) info = *out_length;
+    memcpy(out, buffer + 8 + offset, info);
+    *out_length = info;
+    return 1;
+}
+
+static int rndis_set(USB_DEVICE* device, boot_uint8_t interface,
+                     boot_uint32_t oid, boot_uint32_t value,
+                     boot_uint8_t* buffer, boot_uint32_t size) {
+    boot_uint32_t id = rndis_request_id++;
+    int got;
+
+    memset(buffer, 0, size);
+    put32(buffer + 0, RNDIS_SET);
+    put32(buffer + 4, 32);
+    put32(buffer + 8, id);
+    put32(buffer + 12, oid);
+    put32(buffer + 16, 4);              /* four bytes of information */
+    put32(buffer + 20, 20);
+    put32(buffer + 24, 0);
+    put32(buffer + 28, value);
+
+    got = rndis_exchange(device, interface, buffer, 32, buffer, size);
+    if (got < 16) { clear_control_halt(device); return 0; }
+    if (get32(buffer + 0) != (RNDIS_SET | RNDIS_COMPLETE)) return 0;
+    if (get32(buffer + 8) != id) return 0;
+    return get32(buffer + 12) == RNDIS_STATUS_SUCCESS;
+}
+
+/* Introduce ourselves, and report what the device says it can do. */
+static int rndis_initialize(USB_DEVICE* device, boot_uint8_t interface,
+                            boot_uint8_t* buffer, boot_uint32_t size,
+                            boot_uint32_t* out_max_transfer) {
+    XHCI_CONTROLLER* self = device->controller;
+    boot_uint32_t id = rndis_request_id++;
+    int got;
+
+    memset(buffer, 0, size);
+    put32(buffer + 0, RNDIS_INITIALIZE);
+    put32(buffer + 4, 24);
+    put32(buffer + 8, id);
+    put32(buffer + 12, 1);              /* major version */
+    put32(buffer + 16, 0);              /* minor version */
+    put32(buffer + 20, 0x4000);         /* the most we will send in one go */
+
+    got = rndis_exchange(device, interface, buffer, 24, buffer, size);
+    if (got < 0) {
+        log_controller(self);
+        log("RNDIS initialize got no reply\n");
+        return 0;
+    }
+    if (got < 48 || get32(buffer + 0) != (RNDIS_INITIALIZE | RNDIS_COMPLETE) ||
+        get32(buffer + 8) != id) {
+        log_controller(self);
+        log("RNDIS initialize was answered with something else\n");
+        return 0;
+    }
+    if (get32(buffer + 12) != RNDIS_STATUS_SUCCESS) {
+        log_controller(self);
+        log("RNDIS initialize refused\n");
+        return 0;
+    }
+
+    /* The reply's fields, in the order the protocol puts them:
+     *
+     *   16 major version   20 minor version   24 device flags
+     *   28 medium          32 packets per transfer   36 max transfer size
+     *
+     * Written out because reading them one field early is a mistake with no
+     * symptom of its own: this took the device flags for the medium and
+     * announced that a perfectly ordinary Ethernet adapter was not Ethernet. */
+    if (get32(buffer + 28) != 0) {
+        log_controller(self);
+        log("RNDIS device is not Ethernet\n");
+        return 0;
+    }
+
+    *out_max_transfer = get32(buffer + 36);
+    log_controller(self);
+    log("RNDIS version ");
+    log_dec(get32(buffer + 16));
+    log(".");
+    log_dec(get32(buffer + 20));
+    log(", up to ");
+    log_dec(get32(buffer + 32));
+    log(" packet(s) and ");
+    log_dec(*out_max_transfer);
+    log(" bytes per transfer\n");
+    return 1;
+}
+
+
 /* Report what is on the other end of the cable. Opening the endpoints and
    speaking the protocol come next; being certain which shape this device is,
    and that it has agreed to be a network at all, comes first. */
@@ -2135,9 +2432,70 @@ static int configure_network(USB_DEVICE* device,
         log_dec(network.notify_address & 0x0F);
     }
     log("\n");
+
+    if (network.kind != NETWORK_RNDIS) {
+        log_controller(self);
+        log("CDC Ethernet is not driven yet\n");
+        return 0;
+    }
+
+    /* Configure the device before saying a word to it.
+     *
+     * Every class request is addressed to an interface, and a device that has
+     * not been given a configuration has no interfaces yet - so it answers
+     * with a stall, which reads as "I do not understand that" and is really
+     * "you have not told me who I am". The other two class drivers each do
+     * this; this one did not, and the reply was a stall on a message that was
+     * byte for byte correct. */
+    if (control_in(device, 0x00, USB_SET_CONFIGURATION, configuration[5],
+                   0, (void*)0, 0) < 0) {
+        log_controller(self);
+        log("the device would not take its configuration\n");
+        return 0;
+    }
+
+    {
+        boot_uint8_t* buffer = (boot_uint8_t*)alloc_page();
+        boot_uint32_t max_transfer = 0;
+        boot_uint8_t mac[6];
+        boot_uint32_t mac_length = sizeof(mac);
+
+        if (!buffer) return 0;
+        if (!rndis_initialize(device, network.control, buffer, PAGE_SIZE,
+                              &max_transfer)) {
+            free_page(buffer);
+            return 0;
+        }
+
+        if (rndis_query(device, network.control, OID_802_3_PERMANENT_ADDRESS,
+                        buffer, PAGE_SIZE, mac, &mac_length) &&
+            mac_length == 6) {
+            log_controller(self);
+            log("hardware address ");
+            for (int index = 0; index < 6; index++) {
+                if (index) log(":");
+                log_hex_byte(mac[index]);
+            }
+            log("\n");
+        } else {
+            log_controller(self);
+            log("the device would not say what its address is\n");
+        }
+
+        if (!rndis_set(device, network.control, OID_GEN_CURRENT_PACKET_FILTER,
+                       RNDIS_PACKET_FILTER, buffer, PAGE_SIZE)) {
+            log_controller(self);
+            log("the packet filter was refused - it will hand over nothing\n");
+        }
+
+        free_page(buffer);
+    }
+
     log_controller(self);
-    log("no protocol for it yet - found, not driven\n");
-    return 0;
+    log("talking to it; no frames move yet\n");
+    /* Claimed. The frames are not moving, but the device is ours and saying
+       "no driver for this device" after a conversation with it is a lie. */
+    return 1;
 }
 
 
@@ -2152,8 +2510,21 @@ static void attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
     boot_uint32_t length;
     boot_uint32_t status;
 
-    if (self->device_count >= USB_MAX_DEVICES) return;
-    if (!reset_port(self, port)) return;
+    /* Every one of these used to return without a word, which is how a laptop
+       comes to pause for half a second on a port and then say nothing at all
+       about what it found there. */
+    if (self->device_count >= USB_MAX_DEVICES) {
+        log_controller(self);
+        log("no room left for another device\n");
+        return;
+    }
+    if (!reset_port(self, port)) {
+        log_controller(self);
+        log("port ");
+        log_dec(port + 1);
+        log(" would not reset\n");
+        return;
+    }
 
     device = &self->devices[self->device_count];
     memset(device, 0, sizeof(*device));
@@ -2161,14 +2532,50 @@ static void attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
     device->controller = self;
     device->port = port;
     device->speed = (status >> PORTSC_SPEED_SHIFT) & PORTSC_SPEED_MASK;
-    device->slot = enable_slot(self);
-    if (!device->slot) return;
 
-    if (!address_device(device)) return;
-    if (!identify_device(device)) return;
+    /* Zero is not a speed.
+     *
+     * The field has four defined values - full, low, high, super - and no
+     * meaning for zero at all, yet a real controller hands it out for every
+     * port it has. It goes straight into the slot context, where the
+     * controller uses it to schedule the device's transfers, so a device
+     * addressed at speed zero can hold a whole conversation over its control
+     * endpoint and never deliver a single interrupt transfer. Which is exactly
+     * what a keyboard that reports itself ready and then types nothing looks
+     * like.
+     *
+     * Nothing here can know the real speed, so it takes the most conservative
+     * one that works for any USB 2 device and says loudly what it did. The
+     * raw register comes with it: whatever is wrong is in those bits. */
+    if (!device->speed) {
+        log_controller(self);
+        log("port ");
+        log_dec(port + 1);
+        log(" reports no speed at all (portsc ");
+        log_hex(status);
+        log("), assuming full speed\n");
+        device->speed = SPEED_FULL;
+    }
+    device->slot = enable_slot(self);
+    if (!device->slot) return;      /* enable_slot says why itself */
+
+    if (!address_device(device)) {
+        log_controller(self);
+        log("the device would not take an address\n");
+        return;
+    }
+    if (!identify_device(device)) {
+        log_controller(self);
+        log("the device would not describe itself\n");
+        return;
+    }
 
     configuration = (boot_uint8_t*)alloc_page();
-    if (!configuration) return;
+    if (!configuration) {
+        log_controller(self);
+        log("out of memory enumerating a device\n");
+        return;
+    }
     memset(configuration, 0, PAGE_SIZE);
     length = read_configuration(device, configuration);
     if (!length) {
@@ -2213,10 +2620,9 @@ static void detach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
             storage_device = (USB_DEVICE*)0;
             block_forget("usb0");
         }
-        if (device == keyboard_device) {
-            keyboard_ready = 0;
-            keyboard_device = (USB_DEVICE*)0;
-        }
+        for (boot_uint32_t slot = 0; slot < keyboard_count; slot++)
+            if (keyboards[slot].used && keyboards[slot].device == device)
+                keyboards[slot].used = 0;
 
         disable_slot(self, device->slot);
         device->used = 0;

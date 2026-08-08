@@ -2477,6 +2477,28 @@ static void execute(const char* input) {
     console_use_theme();
 }
 
+/* Put the boot log on the disk without anybody asking.
+ *
+ * A machine with no working keyboard cannot be asked to save its own log,
+ * which is exactly the machine whose log is worth having: no input, no `log`
+ * command, no explanation, and a prompt nobody can type at. So the system
+ * writes it itself, every boot, to the root of the volume it started from.
+ *
+ * Failures here are silent on purpose. This runs before the shell and is not
+ * the shell's business; a read-only stick or a full disk is not a reason to
+ * add a line of alarm to a screen that may be the only thing a user sees. */
+static void save_boot_log(void) {
+    FAT_ENTRY entry;
+    const char* path = "\\KOI.LOG";
+
+    if (!current_volume) return;
+    if (fat32_stat(current_volume, path, &entry))
+        fat32_remove(current_volume, path);
+    if (!fat32_create(current_volume, path, 0, &entry)) return;
+    (void)fat32_write(current_volume, &entry, 0, boot_log(), boot_log_length());
+}
+
+
 __attribute__((noreturn)) void command_run(void) {
     static char input[INPUT_MAX];
 
@@ -2507,9 +2529,19 @@ __attribute__((noreturn)) void command_run(void) {
         print_line("");
         print_line("No keyboard found - neither PS/2 nor USB.");
         print_line("Nothing can be typed, so the shell is not starting.");
+        /* Written after the message rather than before, so the file says this
+           too. It is the whole reason the file exists. */
+        save_boot_log();
+        print_line("");
+        print_line("The boot log has been written to KOI.LOG on this drive.");
+        print_line("Read it on another machine - it says how far this got.");
         console_use_theme();
         for (;;) __asm__ volatile ("hlt");
     }
+
+    /* And on a machine that does have a keyboard, so that a boot which went
+       wrong in some other way has still left its account of itself. */
+    save_boot_log();
 
     for (;;) {
         print_prompt();
