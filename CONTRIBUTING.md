@@ -33,7 +33,7 @@ not a polite fiction.
 Put these two lines at the end of the commit message of every commit you send:
 
 ```
-Koi-DOS-Contribution: I agree to Section 10 of KNCL, and I have the right to.
+Koi-DOS-Contribution: I grant the rights in Section 10 of KNCL, and I have the right to grant them.
 Signed-off-by: Your Name <your@email>
 ```
 
