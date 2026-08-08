@@ -3,7 +3,7 @@
 
 #include "../include/bootinfo.h"
 
-#define BLOCK_MAX_DEVICES 8
+#define BLOCK_MAX_DEVICES 16
 #define BLOCK_NAME_LENGTH 16
 
 /* A sector-addressable device. AHCI provides the only implementation today;
@@ -32,6 +32,19 @@ int block_register(const BLOCK_DEVICE* device);
  * one. Reads and writes to a forgotten device fail rather than reaching
  * whatever is in that socket now. */
 int block_forget(const char* name);
+
+/* Called whenever the set of disks changes - one appearing, one going away.
+ *
+ * The block layer is the only place that knows a disk arrived, and the volume
+ * table is rebuilt somewhere that cannot be called from a driver without
+ * dragging the filesystem into it. So the shell leaves a note here and the
+ * drivers ring it. Without this a stick plugged in after boot is a block
+ * device with no partitions looked at and no drive letter - present in `mem`,
+ * unreadable in `disk`, which is exactly how it looked. */
+void block_on_change(void (*handler)(void));
+
+/* Ring it. Safe to call when nobody is listening. */
+void block_changed(void);
 
 boot_uint32_t block_device_count(void);
 BLOCK_DEVICE* block_device(boot_uint32_t index);

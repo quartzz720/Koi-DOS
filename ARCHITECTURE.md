@@ -160,6 +160,7 @@ the whole span is what initialises `.bss`, which has no presence in the file at 
 | [kernel/hpet.c](kernel/hpet.c) | The HPET, as a monotonic clock rather than a source of events |
 | [kernel/apic.c](kernel/apic.c) | Local APIC timer and I/O APIC interrupt routing |
 | [kernel/xhci.c](kernel/xhci.c) | USB 3 host controller: the HID boot keyboard, mass storage and RNDIS networking |
+| [kernel/ehci.c](kernel/ehci.c) | USB 2.0 host controller: firmware handoff, ports, control transfers |
 | [kernel/net.c](kernel/net.c) | ARP, IPv4, UDP, DHCP, DNS and ICMP echo — enough for `ping` |
 | [kernel/block.c](kernel/block.c) | Sector-device abstraction over any controller |
 | [kernel/partition.c](kernel/partition.c) | GPT, MBR and whole-device volumes; drive letters |
@@ -235,6 +236,96 @@ bytes — safe at any size — and issues an Evaluate Context command if the ans
 SuperSpeed device reports the size as a power of two rather than a byte count, which is why that
 case is excluded rather than "corrected" to nine bytes.
 
+### EHCI, and why it is a separate driver
+
+USB 2.0 controllers, for the machines where the sockets are not wired to xHCI. On a desktop made
+in the last decade there is nothing here to do; on a laptop with two EHCI controllers in the
+chipset it is the difference between half the sockets working and none of them.
+
+Underneath it is nothing like xHCI. There are no rings and no event ring: there is a circular
+list of queue heads the controller walks whenever it has nothing better to do, and a transfer is
+finished when the Active bit in its descriptor goes away. Nothing is delivered. The only way to
+know anything is to look.
+
+Three things cost more than they look like they should.
+
+**The firmware owns the controller and will not let go unless asked.** It has been driving it
+since power-on so that a USB keyboard works in the setup screens, and it does that by watching
+the registers through a system management interrupt — which is invisible from here. A driver that
+starts writing registers without the handshake is fighting something it cannot see. The exchange
+is one bit each way through a PCI capability: set "OS owned", wait for "BIOS owned" to clear.
+Then every reason it had to be interrupted is switched off, because an SMI still firing for a
+controller nobody is watching is a machine that pauses for no reason.
+
+**EHCI cannot talk to a slow device at all.** A USB 1 device in a USB 2 socket is handled by a
+second, physically separate controller sharing that port. A low speed device announces itself
+before the reset by driving the line into K-state; a full speed one is only distinguishable
+afterwards, by the port failing to enable. Both get handed over, and both are then present,
+correct and invisible to this system — which is logged rather than left as an unexplained
+absence.
+
+**Alignment is not advisory, and it fails silently.** Every structure the controller reads must be
+32-byte aligned. The C struct for a transfer descriptor is 52 bytes — the 32 the hardware defines
+plus the upper halves of five buffer pointers — so an array of them puts the second at offset 52,
+aligned to four and nothing else. Nothing reports this. The controller reads from the address with
+the low bits masked off, lands mid-field, and the transfer never completes. That was the first
+bug, and it looked exactly like a device that does not answer.
+
+The second bug is worth keeping too. The transfer queue head was linked into the schedule before
+each transfer and unlinked after, which worked exactly once. Taking a queue head out of a running
+schedule is not a pointer assignment: the controller may be inside it, and the doorbell handshake
+for learning it has left exists precisely because there is no other way to know. A permanently
+linked queue head that sits idle between transfers has none of that problem — an idle one has
+nothing to fetch and is stepped over.
+
+Enumeration works: ports reset, speeds sorted, descriptors read and validated, addresses
+assigned. What does not work yet is anything above that. The keyboard, storage and network
+drivers live in [kernel/xhci.c](kernel/xhci.c) and speak xHCI's rings directly, so a keyboard on
+a USB 2.0 port is currently a device this system can name and not use. Making it type means
+lifting those three drivers onto a transport interface both controllers can implement, which is
+the next piece of work and the larger half of it.
+
+### USB hubs
+
+A hub is why a machine whose BIOS counts four keyboards showed this driver one. Everything
+plugged into a hub is invisible until somebody asks the hub what it has, and the hub answers
+class requests over endpoint zero — one exchange per downstream port, no register anywhere to
+read.
+
+**The route string** is how the controller reaches a device through a chain of hubs: four bits
+per tier, the downstream port number at each one, five tiers deep and no further, which is also
+USB's own limit. It goes into the slot context, and so does the root port the whole chain hangs
+off. That is the reason the slot context is now built in one function: it was written out by
+hand in four places, one per class driver plus addressing, each of them assuming a device on a
+root port because that was the only kind there was. A route added in one and forgotten in the
+other three is a device that answers every descriptor and then goes silent the moment a class
+driver configures it.
+
+**The transaction translator** is the other half. A full or low speed device cannot talk on a
+high speed bus at all: the hub speaks slowly to the device and quickly to the controller, and the
+controller has to be told which hub and which of its ports is doing that. A slow device on a slow
+hub inherits whatever was already translating further up the chain.
+
+Ports are switched on before they are looked at. A bus-powered hub may come out of reset with
+them off, and a port with no power is indistinguishable from a port with nothing in it. The
+descriptor says how long to wait afterwards, in two-millisecond units, with a floor under it
+because some hubs report an optimistic zero.
+
+Hot-plug is the same poll as the root ports, one tier down: hub ports are asked about their
+connection state on every pass, and a hub that loses a port loses everything below it — found by
+route prefix, because a device under a hub shares its route in the nibbles up to that tier.
+
+Two tiers of hub are on the test bench, deliberately: a single tier would leave the four-bit
+shifting untested. A keyboard sits behind both and a stick behind the first, because *enumerating*
+is not *working* — the failure this driver has already had once was a device that answered every
+descriptor and delivered nothing. Reading the stick's capacity and mounting its filesystem is a
+bulk transfer finding its way through a route string, which is the thing worth proving.
+
+The device lists reuse released entries. They only ever grew before, because a device only ever
+arrived; plugging the same stick in thirty-two times would then fill the table with devices that
+are not there, and nothing would notice until the thirty-third — where it would look like a limit
+rather than a leak.
+
 ### USB mass storage
 
 Bulk-only transport, which is what every USB stick made in the last two decades speaks: a 31-byte
@@ -265,6 +356,36 @@ The result registers through `block.c` as an ordinary disk, so `partition.c` and
 learn what kind of controller they are reading. Booting from a stick now assigns `Z:` to the stick
 even with an internal disk carrying its own EFI System Partition — verified in QEMU with both
 present.
+
+### One of everything, which was the bug
+
+Three drivers each held one device in file-scope variables, and each of them was saying something
+untrue about the machines this runs on: one AHCI controller with one disk on it, one NVMe drive
+with namespace 1, one USB stick. A desktop board has six SATA ports and people fill them; two M.2
+sockets is ordinary; and the USB driver *said out loud* "a second storage device is present and
+ignored", which is a strange thing for an operating system to tell somebody holding two sticks.
+
+The missing disks were not failing. They were never being looked at — which is the harder failure
+to notice, because nothing in the log is wrong.
+
+AHCI became a table of disks, each holding its own port and command structures. The controller's
+64-bit addressing flag moved in with them: two controllers can differ on it, and picking the wrong
+answer is a DMA write to a truncated address.
+
+NVMe and USB storage took a different shape, and it is worth saying why. Both have a register or
+protocol layer threaded through thirty functions, and passing a context to every one of them buys
+nothing here: neither is re-entrant, neither is interrupt-driven, and every completion is polled
+by whoever submitted it. So each keeps a "current device" pointer set at its two entry points —
+bringing a controller up, and a block transfer arriving from the layer above. `driver_data` on
+the block device carries which one, which is what that field is for.
+
+NVMe also walks its namespaces rather than assuming namespace 1. A namespace that is not there
+answers Identify with zeroes rather than an error — the controller saying "no such thing" in the
+only way the command allows — so absence is detected by a sector count of zero and reported as
+absence, not as a driver that cannot cope with a block size of 2⁰.
+
+The bench grew to match: a second SATA disk, a second NVMe drive and a second USB stick, none of
+which existed while "the first one" was the only one any of this could find.
 
 ### Storage stack
 

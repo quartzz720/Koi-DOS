@@ -21,6 +21,7 @@
 #include "apic.h"
 #include "build.h"
 #include "xhci.h"
+#include "ehci.h"
 #include "graphics.h"
 #include "audio.h"
 #include "timer.h"
@@ -205,7 +206,6 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
         report("APIC: NOT USABLE, STAYING ON THE PIT\n");
     }
     {
-        const PCI_DEVICE* controller;
         pci_scan();
         report("PCI: ");
         report_dec(pci_device_count());
@@ -219,22 +219,42 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
             report(" DEVICES DROPPED - TABLE FULL\n");
         }
 
-        controller = pci_find(PCI_CLASS_STORAGE, PCI_SUBCLASS_SATA,
-                              PCI_PROGIF_AHCI, 0);
-        if (controller && ahci_init(controller)) {
-            report("AHCI: DISK ");
-            report_dec(ahci_sector_count() / 2048U);
-            report(" MB\n");
+        /* Every storage controller on the bus, not the first of each kind.
+           A board with two SATA controllers, or a machine with a drive in each
+           M.2 socket, is ordinary - and the drive that was missing was never
+           being looked at rather than failing. */
+        for (boot_uint32_t index = 0; index < pci_device_count(); index++) {
+            const PCI_DEVICE* entry = pci_device(index);
+            if (!entry || entry->class_code != PCI_CLASS_STORAGE) continue;
+            if (entry->subclass == PCI_SUBCLASS_SATA &&
+                entry->programming_interface == PCI_PROGIF_AHCI)
+                (void)ahci_init(entry);
+            else if (entry->subclass == PCI_SUBCLASS_NVM &&
+                     entry->programming_interface == PCI_PROGIF_NVME)
+                (void)nvme_init(entry);
+        }
+
+        if (ahci_disk_count()) {
+            for (boot_uint32_t index = 0; index < ahci_disk_count(); index++) {
+                report("AHCI: DISK ");
+                report_dec(index);
+                report(", ");
+                report_dec(ahci_sector_count(index) / 2048U);
+                report(" MB\n");
+            }
         } else {
             report("AHCI: NOT FOUND\n");
         }
 
-        controller = pci_find(PCI_CLASS_STORAGE, PCI_SUBCLASS_NVM,
-                              PCI_PROGIF_NVME, 0);
-        if (controller && nvme_init(controller)) {
-            report("NVME: DISK ");
-            report_dec(nvme_sector_count() * nvme_sector_size() / 1048576U);
-            report(" MB\n");
+        if (nvme_namespace_count()) {
+            for (boot_uint32_t index = 0; index < nvme_namespace_count(); index++) {
+                report("NVME: DISK ");
+                report_dec(index);
+                report(", ");
+                report_dec(nvme_sector_count(index) *
+                           nvme_sector_size(index) / 1048576U);
+                report(" MB\n");
+            }
         } else {
             report("NVME: NOT FOUND\n");
         }
@@ -249,6 +269,39 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
             report("AUDIO: ");
             report(audio_failure());
             report("\n");
+        }
+
+        /* USB 2.0 controllers, before the USB 3 ones so that the log reads
+           in the order the machine is wired: a laptop with both has the older
+           sockets on one and the newer on the other. */
+        {
+            boot_uint32_t found = 0;
+            for (boot_uint32_t index = 0; index < pci_device_count(); index++) {
+                const PCI_DEVICE* entry = pci_device(index);
+                if (!entry || entry->class_code != PCI_CLASS_SERIAL_BUS ||
+                    entry->subclass != PCI_SUBCLASS_USB ||
+                    entry->programming_interface != 0x20)
+                    continue;
+                found++;
+                (void)ehci_init(entry);
+            }
+            if (found) {
+                report("EHCI: ");
+                report_dec(ehci_controller_count());
+                report(" OF ");
+                report_dec(found);
+                report(" CONTROLLERS, ");
+                report_dec(ehci_ports_connected());
+                report(" OF ");
+                report_dec(ehci_port_count());
+                report(" PORTS IN USE");
+                if (ehci_ports_released()) {
+                    report(", ");
+                    report_dec(ehci_ports_released());
+                    report(" TOO SLOW FOR IT");
+                }
+                report("\n");
+            }
         }
 
         /* Every xHCI controller on the bus, not the first one. A board
@@ -277,7 +330,9 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
             report_dec(xhci_ports_connected());
             report(" OF ");
             report_dec(xhci_port_count());
-            report(" PORTS IN USE");
+            report(" PORTS IN USE, ");
+            report_dec(xhci_device_count());
+            report(" DEVICES");
             if (xhci_has_keyboard()) report(", KEYBOARD");
             if (xhci_has_storage()) report(", STORAGE");
             if (usb_net_ready()) report(", NETWORK");

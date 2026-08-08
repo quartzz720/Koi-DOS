@@ -625,6 +625,8 @@ static void print_address(boot_uint32_t address) {
     print(text);
 }
 
+static void print_traffic(void);
+
 static void command_net(void) {
     if (!usb_net_ready()) {
         print_line("No network device.");
@@ -659,13 +661,43 @@ static void command_net(void) {
         print_dec(usb_net_dropped());
         print_line(" (arrived with nowhere to put them)");
     }
+    print_traffic();
+}
+
+/* What has actually moved. Printed whenever the network is discussed, because
+   the interesting case is the one where the answer is zero. */
+static void print_traffic(void) {
+    boot_uint32_t sent = 0;
+    boot_uint32_t received = 0;
+    boot_uint32_t failed = 0;
+
+    usb_net_counters(&sent, &received, &failed);
+    print("Frames sent     : ");
+    print_dec(sent);
+    if (failed) {
+        print(" (");
+        print_dec(failed);
+        print(" refused by the device)");
+    }
+    print_line("");
+    print("Frames received : ");
+    print_dec(received);
+    print_line("");
 }
 
 static void command_net_start(void) {
     if (!usb_net_ready()) { print_line("No network device."); return; }
     print_line("Asking for an address...");
     if (!net_start()) {
-        print_line("Nobody answered. On a phone, check that USB tethering is on.");
+        print_line("Nobody answered.");
+        print_traffic();
+        print_line("");
+        /* Which of these is true is the whole diagnosis, and the counters
+           above say which without another boot. */
+        print_line("Nothing sent    : the adapter is not taking frames from us.");
+        print_line("Sent, none back : the phone is not bridging - turn tethering");
+        print_line("                  off and on again, and check it stayed on.");
+        print_line("Frames received : something answered, but not a DHCP server.");
         return;
     }
     print("Address ");
@@ -921,6 +953,14 @@ static PARTITION* partition_by_name(const char* name) {
 /* Rebuild the volume table after the disks changed underneath it, and put the
    shell somewhere that certainly still exists. Every VOLUME pointer taken
    before this - including the one the user was standing on - is stale. */
+static void remount_everything(void);
+
+/* The note the block layer rings when a disk appears or goes away. Registered
+   once, at startup. */
+static void disks_changed(void) {
+    remount_everything();
+}
+
 static void remount_everything(void) {
     boot_uint32_t volumes;
 
@@ -935,6 +975,31 @@ static void remount_everything(void) {
         VOLUME* volume = volume_at(index);
         if (volume) (void)fat32_mount(volume);
     }
+
+    /* And which of them the system is installed on, which the scan cannot know
+     * on its own: it is a file, so it can only be looked for once the volumes
+     * are mounted.
+     *
+     * This was done at boot and nowhere else, because a rescan only ever
+     * happened after `format` - where losing your place was expected. Wiring
+     * it to a stick being plugged in made the omission visible immediately and
+     * absurdly: plugging in a USB stick moved the system to Y: and handed Z:
+     * to the loader's partition, which is the one volume that is meant to have
+     * no letter at all. */
+    {
+        VOLUME* loader = volume_boot();
+        for (boot_uint32_t index = 0; loader && index < volumes; index++) {
+            VOLUME* candidate = volume_at(index);
+            FAT_ENTRY entry;
+
+            if (!candidate || candidate == loader) continue;
+            if (candidate->device != loader->device) continue;
+            if (!fat32_stat(candidate, SYSTEM_VOLUME_MARKER, &entry)) continue;
+            partition_set_system_volume(candidate);
+            break;
+        }
+    }
+
     current_volume = volume_boot();
     current_path[0] = '\\';
     current_path[1] = 0;
@@ -2619,6 +2684,10 @@ __attribute__((noreturn)) void command_run(void) {
     static char input[INPUT_MAX];
 
     current_volume = volume_boot();
+    /* From here on, a disk appearing or going away rebuilds the volume table.
+       Registered now rather than at boot because remounting relocates the
+       shell, and there is no shell to relocate until there is one. */
+    block_on_change(disks_changed);
     console_use_theme();
     command_ver();
     print("\n");

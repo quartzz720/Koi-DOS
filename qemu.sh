@@ -41,6 +41,19 @@ STICK_MB=64
 NVME=nvme.img
 NVME_MB=128
 NVME_ESP_MB=48
+# A second disk on the second SATA port and a second NVMe drive, because
+# "the first one" was for a long time the only one any of these drivers found.
+# Neither carries a filesystem: what is being tested is that they are seen at
+# all, and an unformatted disk tests the "partition we cannot read" path too.
+# A second USB stick, because the driver used to say "a second storage device
+# is present and ignored" - a strange thing for an operating system to say to
+# somebody holding two of them.
+STICK2=stick2.img
+STICK2_MB=64
+SECOND=second.img
+SECOND_MB=32
+NVME2=nvme2.img
+NVME2_MB=32
 VARS=/tmp/koi-vars.fd
 
 # OVMF lives in a different place on every distribution. Probe the known
@@ -88,6 +101,25 @@ HDA_CODEC=${KOI_HDA_CODEC:-hda-output}
 # above the frames has something to talk to here.
 #
 # KOI_USB_NET=0 leaves it out.
+# A USB hub with a keyboard behind it, because a device behind a hub is
+# invisible to a driver that does not speak to hubs - which is how a machine
+# with four keyboards in its BIOS showed this driver one. Two tiers deep on
+# purpose: the route string is four bits per tier and a single tier would
+# leave the shifting untested.
+#
+# KOI_USB_HUB=0 leaves it out.
+if [ "${KOI_USB_HUB:-1}" = "0" ]; then
+    HUB_ARGS=""
+    STICK_PORT=""
+else
+    HUB_ARGS="-device usb-hub,id=hub1,bus=xhci1.0,port=3 -device usb-hub,id=hub2,bus=xhci1.0,port=3.1 -device usb-kbd,bus=xhci1.0,port=3.1.2"
+    # And the stick moves behind the first hub, so a bulk transfer has to find
+    # its way through a route string too. Enumerating is not the same as
+    # working: the device that answered every descriptor and then delivered
+    # nothing is a failure this driver has already had.
+    STICK_PORT="port=3.2,"
+fi
+
 if [ "${KOI_USB_NET:-1}" = "0" ]; then
     NETWORK_ARGS="-net none"
 else
@@ -123,11 +155,16 @@ export MTOOLS_SKIP_CHECK=1
 # known state. Set KEEP_IMAGE=1 to boot the existing one instead - that is how
 # you check whether something the guest wrote actually survives a reboot.
 if [ "${KEEP_IMAGE:-0}" = "1" ] && [ -f "$IMAGE" ] && [ -f "$STICK" ] \
-   && [ -f "$NVME" ]; then
+   && [ -f "$NVME" ] && [ -f "$SECOND" ] && [ -f "$NVME2" ] \
+   && [ -f "$STICK2" ]; then
     echo "Reusing existing $IMAGE, $STICK and $NVME"
 else
     # FAT32 needs enough clusters to be a legal FAT32 volume; 64 MiB clears it.
-    rm -f "$IMAGE" "$STICK" "$NVME"
+    rm -f "$IMAGE" "$STICK" "$NVME" "$SECOND" "$NVME2" "$STICK2"
+    dd if=/dev/zero of="$STICK2" bs=1M count="$STICK2_MB" status=none
+    mkfs.vfat -F 32 -n KOI-TWO "$STICK2" >/dev/null
+    dd if=/dev/zero of="$SECOND" bs=1M count="$SECOND_MB" status=none
+    dd if=/dev/zero of="$NVME2" bs=1M count="$NVME2_MB" status=none
     if [ "$SPLIT" = "1" ]; then
         dd if=/dev/zero of="$IMAGE" bs=1M count="$SPLIT_MB" status=none
         sgdisk -n "1:${SPLIT_BOOT_SECTOR}:+${SPLIT_BOOT_MB}M" -t 1:EF00 \
@@ -241,13 +278,24 @@ exec qemu-system-x86_64 \
   -device ich9-ahci,id=ahci \
   -drive id=disk,format=raw,file="$IMAGE",if=none \
   -device ide-hd,drive=disk,bus=ahci.0 \
+  -drive id=disk2,format=raw,file="$SECOND",if=none \
+  -device ide-hd,drive=disk2,bus=ahci.1 \
+  -device usb-ehci,id=ehci \
+  -device usb-tablet,bus=ehci.0 \
+  -device usb-kbd,bus=ehci.0 \
+  -device usb-mouse,bus=ehci.0 \
   -device qemu-xhci,id=xhci0 \
   -device usb-kbd,bus=xhci0.0 \
   -device qemu-xhci,id=xhci1 \
+  $HUB_ARGS \
   -drive id=stick,format=raw,file="$STICK",if=none \
-  -device usb-storage,bus=xhci1.0,drive=stick,id=usbstick \
+  -device usb-storage,bus=xhci1.0,${STICK_PORT:-}drive=stick,id=usbstick \
+  -drive id=stick2,format=raw,file="$STICK2",if=none \
+  -device usb-storage,bus=xhci1.0,drive=stick2,id=usbstick2 \
   -drive id=ssd,format=raw,file="$NVME",if=none \
   -device nvme,drive=ssd,serial=KOI0001 \
+  -drive id=ssd2,format=raw,file="$NVME2",if=none \
+  -device nvme,drive=ssd2,serial=KOI0002 \
   -audiodev "$AUDIO_BACKEND" \
   -device ich9-intel-hda,id=hda \
   -device "$HDA_CODEC",bus=hda.0,audiodev=koisnd \

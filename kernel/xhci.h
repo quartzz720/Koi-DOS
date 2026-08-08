@@ -28,6 +28,10 @@ boot_uint32_t xhci_controller_count(void);
 /* Root-hub ports across every running controller, and how many currently have
    something plugged into them. Zero for both when nothing came up. */
 boot_uint32_t xhci_port_count(void);
+
+/* How many devices are attached across every controller, hubs and the things
+   behind them included. */
+boot_uint32_t xhci_device_count(void);
 boot_uint32_t xhci_ports_connected(void);
 
 /* True when a USB keyboard was found and configured. */
@@ -80,5 +84,11 @@ boot_uint32_t usb_net_receive(void* frame, boot_uint32_t size);
 /* Frames that arrived with nowhere to put them. A driver that quietly loses
    packets looks exactly like a network that is not working, so it counts. */
 boot_uint32_t usb_net_dropped(void);
+
+/* Frames out, frames in, and sends the controller refused. "Nobody answered"
+   is one sentence covering three different failures, and these are what tell
+   them apart. */
+void usb_net_counters(boot_uint32_t* sent, boot_uint32_t* received,
+                      boot_uint32_t* failed);
 
 #endif

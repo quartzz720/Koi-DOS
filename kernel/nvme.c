@@ -21,7 +21,7 @@
  * sector is at stake.
  */
 
-/* Controller registers, at BAR0. */
+/* Controller current->registers, at BAR0. */
 #define REG_CAP 0x00            /* capabilities, 64-bit */
 #define REG_VS 0x08             /* version */
 #define REG_INTMS 0x0C
@@ -104,21 +104,64 @@ typedef struct {
     boot_uint32_t id;
 } NVME_QUEUE;
 
-static volatile boot_uint8_t* registers;
-static boot_uint32_t doorbell_stride;
-static boot_uint64_t ready_timeout_ms;
-static boot_uint32_t max_queue_entries;
+/* One namespace, which is what the block layer above sees as a disk. A
+   consumer drive has exactly one; enterprise hardware carves a drive into
+   several, and they differ in size and in block size. */
+#define NVME_MAX_NAMESPACES 4
 
-static NVME_QUEUE admin_queue;
-static NVME_QUEUE io_queue;
+typedef struct {
+    boot_uint32_t id;
+    boot_uint64_t sectors;
+    boot_uint32_t sector_size;
+    int used;
+} NVME_NAMESPACE;
 
-static boot_uint8_t* identify_buffer;   /* 4 KiB, for Identify results */
-static boot_uint8_t* bounce;            /* 4 KiB of transfer buffer */
+/* One controller and everything that belongs to it.
+ *
+ * All of this was file-scope, which said that a machine has one NVMe drive.
+ * Two M.2 sockets is an ordinary desktop, and the second drive was invisible -
+ * not failing, not reported, simply never looked at. */
+#define NVME_MAX_DRIVES 4
 
-static boot_uint32_t namespace_id;
-static boot_uint64_t namespace_sectors;
-static boot_uint32_t namespace_sector_size;
-static int ready;
+typedef struct {
+    volatile boot_uint8_t* registers;
+    boot_uint32_t doorbell_stride;
+    boot_uint64_t ready_timeout_ms;
+    boot_uint32_t max_queue_entries;
+
+    NVME_QUEUE admin_queue;
+    NVME_QUEUE io_queue;
+
+    boot_uint8_t* identify_buffer;   /* 4 KiB, for Identify results */
+    boot_uint8_t* bounce;            /* 4 KiB of transfer buffer */
+
+    NVME_NAMESPACE namespaces[NVME_MAX_NAMESPACES];
+    boot_uint32_t namespace_count;
+    int ready;
+} NVME_DRIVE;
+
+static NVME_DRIVE drives[NVME_MAX_DRIVES];
+static boot_uint32_t drive_count;
+
+/* Which drive the register and queue helpers below are talking to.
+ *
+ * A pointer rather than a parameter threaded through thirty functions, and
+ * that is a deliberate trade: nothing here is re-entrant and nothing here is
+ * interrupt driven - every completion is polled by the caller that submitted
+ * it - so there is exactly one conversation happening at a time. The two ways
+ * in, bringing a controller up and a block transfer, both set it first. */
+static NVME_DRIVE* current;
+
+/* Which drive a namespace belongs to. Found by range rather than stored,
+   because a namespace lives inside its drive's own table and a back pointer
+   would be a second thing to keep true. */
+static NVME_DRIVE* drive_of(const NVME_NAMESPACE* space) {
+    for (boot_uint32_t index = 0; index < drive_count; index++)
+        if (space >= drives[index].namespaces &&
+            space < drives[index].namespaces + NVME_MAX_NAMESPACES)
+            return &drives[index];
+    return (NVME_DRIVE*)0;
+}
 
 static void log(const char* text) {
     serial_write(text);
@@ -133,14 +176,14 @@ static void log_hex(boot_uint64_t value) {
 }
 
 static boot_uint32_t read32(boot_uint32_t offset) {
-    return *(volatile boot_uint32_t*)(registers + offset);
+    return *(volatile boot_uint32_t*)(current->registers + offset);
 }
 
 static void write32(boot_uint32_t offset, boot_uint32_t value) {
-    *(volatile boot_uint32_t*)(registers + offset) = value;
+    *(volatile boot_uint32_t*)(current->registers + offset) = value;
 }
 
-/* The 64-bit registers are read and written as two dwords. The spec permits
+/* The 64-bit current->registers are read and written as two dwords. The spec permits
    both widths, and halves work everywhere - a single 64-bit access to a
    register block that only decodes 32 bits does not. */
 static boot_uint64_t read64(boot_uint32_t offset) {
@@ -156,12 +199,12 @@ static void write64(boot_uint32_t offset, boot_uint64_t value) {
 /* Doorbells live past the register block, two per queue - submission tail
    first, then completion head - spaced by a stride the controller declares. */
 static void ring_submission(const NVME_QUEUE* queue) {
-    write32(REG_DOORBELL_BASE + (queue->id * 2) * doorbell_stride,
+    write32(REG_DOORBELL_BASE + (queue->id * 2) * current->doorbell_stride,
             queue->submission_tail);
 }
 
 static void ring_completion(const NVME_QUEUE* queue) {
-    write32(REG_DOORBELL_BASE + (queue->id * 2 + 1) * doorbell_stride,
+    write32(REG_DOORBELL_BASE + (queue->id * 2 + 1) * current->doorbell_stride,
             queue->completion_head);
 }
 
@@ -260,7 +303,7 @@ static int disable_controller(void) {
 
     start = timer_ticks();
     while (read32(REG_CSTS) & CSTS_READY) {
-        if (timer_expired(start, ready_timeout_ms)) {
+        if (timer_expired(start, current->ready_timeout_ms)) {
             log("NVME: controller would not disable\n");
             return 0;
         }
@@ -290,7 +333,7 @@ static int enable_controller(void) {
             log("NVME: controller reported a fatal error while starting\n");
             return 0;
         }
-        if (timer_expired(start, ready_timeout_ms)) {
+        if (timer_expired(start, current->ready_timeout_ms)) {
             log("NVME: controller never became ready\n");
             return 0;
         }
@@ -316,11 +359,11 @@ static int identify(boot_uint32_t selector, boot_uint32_t nsid) {
     memset(&command, 0, sizeof(command));
     command.command = ADMIN_IDENTIFY;
     command.namespace_id = nsid;
-    command.prp1 = (boot_uint64_t)(unsigned long long)identify_buffer;
+    command.prp1 = (boot_uint64_t)(unsigned long long)current->identify_buffer;
     command.dword10 = selector;
 
-    memset(identify_buffer, 0, PAGE_SIZE);
-    return submit(&admin_queue, &command, 0, 5000);
+    memset(current->identify_buffer, 0, PAGE_SIZE);
+    return submit(&current->admin_queue, &command, 0, 5000);
 }
 
 /* The checkpoint. A model string coming back means the queues, the doorbells
@@ -332,14 +375,14 @@ static int identify_controller(void) {
         return 0;
     }
     log("NVME: ");
-    log_padded(identify_buffer + 24, 40);      /* model */
+    log_padded(current->identify_buffer + 24, 40);      /* model */
     log(", firmware ");
-    log_padded(identify_buffer + 64, 8);
+    log_padded(current->identify_buffer + 64, 8);
     log(", ");
-    log_dec((boot_uint32_t)identify_buffer[516] |
-            ((boot_uint32_t)identify_buffer[517] << 8) |
-            ((boot_uint32_t)identify_buffer[518] << 16) |
-            ((boot_uint32_t)identify_buffer[519] << 24));
+    log_dec((boot_uint32_t)current->identify_buffer[516] |
+            ((boot_uint32_t)current->identify_buffer[517] << 8) |
+            ((boot_uint32_t)current->identify_buffer[518] << 16) |
+            ((boot_uint32_t)current->identify_buffer[519] << 24));
     log(" namespace(s)\n");
     return 1;
 }
@@ -350,10 +393,12 @@ static int identify_controller(void) {
  * using; the block size is the base-two logarithm held in that format, not a
  * byte count. Reading the wrong format's entry gives a plausible-looking
  * number that is wrong by a factor of eight. */
-static int identify_namespace(boot_uint32_t nsid) {
+static int identify_namespace(boot_uint32_t nsid, NVME_NAMESPACE* out) {
     boot_uint32_t format_index;
     boot_uint32_t format;
     boot_uint32_t data_shift;
+    boot_uint64_t namespace_sectors;
+    boot_uint32_t namespace_sector_size;
 
     if (!identify(IDENTIFY_NAMESPACE, nsid)) {
         log("NVME: Identify Namespace failed\n");
@@ -362,13 +407,20 @@ static int identify_namespace(boot_uint32_t nsid) {
 
     namespace_sectors = 0;
     for (int byte = 7; byte >= 0; byte--)
-        namespace_sectors = (namespace_sectors << 8) | identify_buffer[byte];
+        namespace_sectors = (namespace_sectors << 8) | current->identify_buffer[byte];
 
-    format_index = identify_buffer[26] & 0x0F;   /* FLBAS */
-    format = (boot_uint32_t)identify_buffer[128 + format_index * 4] |
-             ((boot_uint32_t)identify_buffer[129 + format_index * 4] << 8) |
-             ((boot_uint32_t)identify_buffer[130 + format_index * 4] << 16) |
-             ((boot_uint32_t)identify_buffer[131 + format_index * 4] << 24);
+    /* A namespace that is not there answers with zeroes rather than an error,
+       which is the controller saying "no such thing" in the only way the
+       command allows. Asked before the format is looked at, because a format
+       of zero is what that same answer looks like from one field down - and
+       reported as absence rather than as a driver that cannot cope. */
+    if (!namespace_sectors) return 0;
+
+    format_index = current->identify_buffer[26] & 0x0F;   /* FLBAS */
+    format = (boot_uint32_t)current->identify_buffer[128 + format_index * 4] |
+             ((boot_uint32_t)current->identify_buffer[129 + format_index * 4] << 8) |
+             ((boot_uint32_t)current->identify_buffer[130 + format_index * 4] << 16) |
+             ((boot_uint32_t)current->identify_buffer[131 + format_index * 4] << 24);
     data_shift = (format >> 16) & 0xFF;
 
     if (data_shift < 9 || data_shift > 12) {
@@ -382,14 +434,9 @@ static int identify_namespace(boot_uint32_t nsid) {
     /* Metadata bytes per block. A namespace formatted with metadata interleaved
        into the data stream has a different layout on the wire, and reading it
        as though it were plain blocks would silently misalign everything. */
-    if (identify_buffer[128 + format_index * 4] |
-        identify_buffer[129 + format_index * 4]) {
+    if (current->identify_buffer[128 + format_index * 4] |
+        current->identify_buffer[129 + format_index * 4]) {
         log("NVME: namespace has interleaved metadata, refusing it\n");
-        return 0;
-    }
-
-    if (!namespace_sectors) {
-        log("NVME: namespace is empty\n");
         return 0;
     }
 
@@ -400,6 +447,11 @@ static int identify_namespace(boot_uint32_t nsid) {
     log(" MB, ");
     log_dec(namespace_sector_size);
     log("-byte blocks\n");
+
+    out->id = nsid;
+    out->sectors = namespace_sectors;
+    out->sector_size = namespace_sector_size;
+    out->used = 1;
     return 1;
 }
 
@@ -408,69 +460,69 @@ static int identify_namespace(boot_uint32_t nsid) {
 static int create_io_queues(void) {
     NVME_COMMAND command;
 
-    if (!queue_init(&io_queue, IO_QUEUE_ID, IO_QUEUE_SIZE)) {
+    if (!queue_init(&current->io_queue, IO_QUEUE_ID, IO_QUEUE_SIZE)) {
         log("NVME: out of memory for the I/O queues\n");
         return 0;
     }
 
     memset(&command, 0, sizeof(command));
     command.command = ADMIN_CREATE_CQ;
-    command.prp1 = (boot_uint64_t)(unsigned long long)io_queue.completions;
+    command.prp1 = (boot_uint64_t)(unsigned long long)current->io_queue.completions;
     command.dword10 = ((IO_QUEUE_SIZE - 1) << 16) | IO_QUEUE_ID;
     /* Physically contiguous, and no interrupt: completions are polled. */
     command.dword11 = 1;
-    if (!submit(&admin_queue, &command, 0, 5000)) {
+    if (!submit(&current->admin_queue, &command, 0, 5000)) {
         log("NVME: could not create the I/O completion queue\n");
         return 0;
     }
 
     memset(&command, 0, sizeof(command));
     command.command = ADMIN_CREATE_SQ;
-    command.prp1 = (boot_uint64_t)(unsigned long long)io_queue.commands;
+    command.prp1 = (boot_uint64_t)(unsigned long long)current->io_queue.commands;
     command.dword10 = ((IO_QUEUE_SIZE - 1) << 16) | IO_QUEUE_ID;
     command.dword11 = (IO_QUEUE_ID << 16) | 1;
-    if (!submit(&admin_queue, &command, 0, 5000)) {
+    if (!submit(&current->admin_queue, &command, 0, 5000)) {
         log("NVME: could not create the I/O submission queue\n");
         return 0;
     }
     return 1;
 }
 
-/* Read or write through the bounce buffer, one page at a time.
+/* Read or write through the current->bounce buffer, one page at a time.
  *
  * A transfer described by PRP1 alone may not cross a page boundary, and the
  * block layer above hands down pointers from anywhere. Bouncing costs a copy
  * per chunk and removes the question entirely - the same trade the USB storage
  * driver makes, for the same reason. Chained PRP lists would lift the limit
  * when there is a reason to want longer transfers. */
-static int transfer(boot_uint64_t lba, boot_uint32_t count, void* buffer,
-                    int write) {
+static int transfer(NVME_NAMESPACE* space, boot_uint64_t lba,
+                    boot_uint32_t count, void* buffer, int write) {
     boot_uint8_t* caller = (boot_uint8_t*)buffer;
     boot_uint32_t per_chunk;
 
-    if (!ready || !count || !buffer) return 0;
-    if (lba + count > namespace_sectors) return 0;
+    if (!current->ready || !space || !space->used || !count || !buffer) return 0;
+    if (lba + count > space->sectors) return 0;
 
-    per_chunk = (boot_uint32_t)(PAGE_SIZE / namespace_sector_size);
+    per_chunk = (boot_uint32_t)(PAGE_SIZE / space->sector_size);
     while (count) {
         boot_uint32_t chunk = count < per_chunk ? count : per_chunk;
-        boot_uint32_t bytes = chunk * namespace_sector_size;
+        boot_uint32_t bytes = chunk * space->sector_size;
         NVME_COMMAND command;
 
-        if (write) memcpy(bounce, caller, bytes);
+        if (write) memcpy(current->bounce, caller, bytes);
 
         memset(&command, 0, sizeof(command));
         command.command = write ? IO_WRITE : IO_READ;
-        command.namespace_id = namespace_id;
-        command.prp1 = (boot_uint64_t)(unsigned long long)bounce;
+        command.namespace_id = space->id;
+        command.prp1 = (boot_uint64_t)(unsigned long long)current->bounce;
         command.dword10 = (boot_uint32_t)lba;
         command.dword11 = (boot_uint32_t)(lba >> 32);
         /* The block count is written one less than it is, so zero means one
            block and a command can never ask for nothing. */
         command.dword12 = chunk - 1;
 
-        if (!submit(&io_queue, &command, 0, 10000)) return 0;
-        if (!write) memcpy(caller, bounce, bytes);
+        if (!submit(&current->io_queue, &command, 0, 10000)) return 0;
+        if (!write) memcpy(caller, current->bounce, bytes);
 
         caller += bytes;
         lba += chunk;
@@ -479,30 +531,46 @@ static int transfer(boot_uint64_t lba, boot_uint32_t count, void* buffer,
     return 1;
 }
 
+/* The two ways in from above, and the only places the current drive is
+   chosen. `driver_data` holds which namespace, and the namespace knows which
+   drive it belongs to by where it sits in the table. */
 static int nvme_block_read(BLOCK_DEVICE* device, boot_uint64_t lba,
                            boot_uint32_t count, void* buffer) {
-    (void)device;
-    return transfer(lba, count, buffer, 0);
+    NVME_NAMESPACE* space = (NVME_NAMESPACE*)device->driver_data;
+
+    current = drive_of(space);
+    if (!current) return 0;
+    return transfer(space, lba, count, buffer, 0);
 }
 
 static int nvme_block_write(BLOCK_DEVICE* device, boot_uint64_t lba,
                             boot_uint32_t count, const void* buffer) {
-    (void)device;
-    return transfer(lba, count, (void*)buffer, 1);
+    NVME_NAMESPACE* space = (NVME_NAMESPACE*)device->driver_data;
+
+    current = drive_of(space);
+    if (!current) return 0;
+    return transfer(space, lba, count, (void*)buffer, 1);
 }
 
-static int register_namespace(void) {
+static int register_namespace(NVME_NAMESPACE* space, boot_uint32_t number) {
     BLOCK_DEVICE device;
 
     memset(&device, 0, sizeof(device));
     device.name[0] = 'n'; device.name[1] = 'v'; device.name[2] = 'm';
-    device.name[3] = 'e'; device.name[4] = '0'; device.name[5] = 0;
-    device.sector_size = namespace_sector_size;
-    device.sector_count = namespace_sectors;
+    device.name[3] = 'e';
+    device.name[4] = (char)('0' + (number % 10));
+    device.name[5] = 0;
+    device.sector_size = space->sector_size;
+    device.sector_count = space->sectors;
+    device.driver_data = space;
     device.read = nvme_block_read;
     device.write = nvme_block_write;
     return block_register(&device) >= 0;
 }
+
+/* How many namespaces have been handed to the block layer in total, which is
+   what names them: nvme0, nvme1, ... across every controller. */
+static boot_uint32_t namespaces_registered;
 
 int nvme_init(const PCI_DEVICE* controller) {
     boot_uint64_t base;
@@ -510,7 +578,14 @@ int nvme_init(const PCI_DEVICE* controller) {
     boot_uint32_t version;
     boot_uint32_t minimum_page_shift;
 
-    ready = 0;
+    if (drive_count >= NVME_MAX_DRIVES) {
+        log("NVME: no room for another controller\n");
+        return 0;
+    }
+    current = &drives[drive_count];
+    memset(current, 0, sizeof(*current));
+
+    current->ready = 0;
     if (!controller) return 0;
 
     base = pci_bar_address(controller, 0);
@@ -523,17 +598,17 @@ int nvme_init(const PCI_DEVICE* controller) {
         return 0;
     }
     pci_enable_bus_mastering(controller);
-    registers = (volatile boot_uint8_t*)(unsigned long long)base;
+    current->registers = (volatile boot_uint8_t*)(unsigned long long)base;
 
     capabilities = read64(REG_CAP);
     version = read32(REG_VS);
 
-    max_queue_entries = (boot_uint32_t)(capabilities & 0xFFFF) + 1;
-    doorbell_stride = 4u << ((capabilities >> 32) & 0xF);
+    current->max_queue_entries = (boot_uint32_t)(capabilities & 0xFFFF) + 1;
+    current->doorbell_stride = 4u << ((capabilities >> 32) & 0xF);
     /* The timeout field counts half-seconds, and is how long the controller
        may take to become ready. Some take most of it. */
-    ready_timeout_ms = ((capabilities >> 24) & 0xFF) * 500ULL;
-    if (!ready_timeout_ms) ready_timeout_ms = 500;
+    current->ready_timeout_ms = ((capabilities >> 24) & 0xFF) * 500ULL;
+    if (!current->ready_timeout_ms) current->ready_timeout_ms = 500;
     minimum_page_shift = 12 + (boot_uint32_t)((capabilities >> 48) & 0xF);
 
     log("NVME: version ");
@@ -543,61 +618,96 @@ int nvme_init(const PCI_DEVICE* controller) {
     log(" at ");
     log_hex(base);
     log(", ");
-    log_dec(max_queue_entries);
+    log_dec(current->max_queue_entries);
     log(" max queue entries, ready timeout ");
-    log_dec(ready_timeout_ms);
+    log_dec(current->ready_timeout_ms);
     log(" ms\n");
 
     if (minimum_page_shift > 12) {
         log("NVME: the controller cannot address 4 KiB pages\n");
         return 0;
     }
-    if (max_queue_entries < IO_QUEUE_SIZE) {
+    if (current->max_queue_entries < IO_QUEUE_SIZE) {
         log("NVME: queues are shallower than this driver asks for\n");
         return 0;
     }
 
     if (!disable_controller()) return 0;
 
-    if (!queue_init(&admin_queue, 0, ADMIN_QUEUE_SIZE)) {
+    if (!queue_init(&current->admin_queue, 0, ADMIN_QUEUE_SIZE)) {
         log("NVME: out of memory for the admin queues\n");
         return 0;
     }
-    identify_buffer = (boot_uint8_t*)alloc_page();
-    bounce = (boot_uint8_t*)alloc_page();
-    if (!identify_buffer || !bounce) {
+    current->identify_buffer = (boot_uint8_t*)alloc_page();
+    current->bounce = (boot_uint8_t*)alloc_page();
+    if (!current->identify_buffer || !current->bounce) {
         log("NVME: out of memory for its buffers\n");
         return 0;
     }
 
     /* Both sizes are written one less than they are, in the same register. */
     write32(REG_AQA, ((ADMIN_QUEUE_SIZE - 1) << 16) | (ADMIN_QUEUE_SIZE - 1));
-    write64(REG_ASQ, (boot_uint64_t)(unsigned long long)admin_queue.commands);
-    write64(REG_ACQ, (boot_uint64_t)(unsigned long long)admin_queue.completions);
+    write64(REG_ASQ, (boot_uint64_t)(unsigned long long)current->admin_queue.commands);
+    write64(REG_ACQ, (boot_uint64_t)(unsigned long long)current->admin_queue.completions);
 
     if (!enable_controller()) return 0;
     if (!identify_controller()) return 0;
 
-    /* Namespace 1 is where a consumer drive keeps everything. Enumerating the
-       full list matters on enterprise hardware and nowhere else yet. */
-    namespace_id = 1;
-    if (!identify_namespace(namespace_id)) return 0;
     if (!create_io_queues()) return 0;
+    current->ready = 1;
 
-    ready = 1;
-    if (!register_namespace()) {
-        log("NVME: the block layer would not take the namespace\n");
-        ready = 0;
+    /* Every namespace, not just the first.
+     *
+     * A consumer drive puts everything in namespace 1 and there is nothing
+     * else to find, which is why looking only there worked. Enterprise
+     * hardware carves a drive into several, and asking about a namespace that
+     * does not exist is answered rather than fatal - so this walks the low
+     * numbers and keeps whatever answers. */
+    for (boot_uint32_t nsid = 1;
+         nsid <= NVME_MAX_NAMESPACES &&
+         current->namespace_count < NVME_MAX_NAMESPACES; nsid++) {
+        NVME_NAMESPACE* space = &current->namespaces[current->namespace_count];
+
+        memset(space, 0, sizeof(*space));
+        if (!identify_namespace(nsid, space)) continue;
+        if (!register_namespace(space, namespaces_registered)) {
+            log("NVME: the block layer would not take the namespace\n");
+            space->used = 0;
+            continue;
+        }
+        current->namespace_count++;
+        namespaces_registered++;
+    }
+
+    if (!current->namespace_count) {
+        log("NVME: the controller has no namespace this can use\n");
+        current->ready = 0;
         return 0;
     }
+
+    drive_count++;
     log("NVME: ready\n");
     return 1;
 }
 
-boot_uint64_t nvme_sector_count(void) {
-    return ready ? namespace_sectors : 0;
+boot_uint32_t nvme_namespace_count(void) {
+    return namespaces_registered;
 }
 
-boot_uint32_t nvme_sector_size(void) {
-    return ready ? namespace_sector_size : 0;
+boot_uint64_t nvme_sector_count(boot_uint32_t index) {
+    boot_uint32_t seen = 0;
+
+    for (boot_uint32_t drive = 0; drive < drive_count; drive++)
+        for (boot_uint32_t space = 0; space < drives[drive].namespace_count; space++)
+            if (seen++ == index) return drives[drive].namespaces[space].sectors;
+    return 0;
+}
+
+boot_uint32_t nvme_sector_size(boot_uint32_t index) {
+    boot_uint32_t seen = 0;
+
+    for (boot_uint32_t drive = 0; drive < drive_count; drive++)
+        for (boot_uint32_t space = 0; space < drives[drive].namespace_count; space++)
+            if (seen++ == index) return drives[drive].namespaces[space].sector_size;
+    return 0;
 }

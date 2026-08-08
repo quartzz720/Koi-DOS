@@ -3,25 +3,19 @@
 
 #include "pci.h"
 
-/* NVMe, the interface every solid-state drive made this decade speaks.
+/* Bring up one NVMe controller and register every namespace on it with the
+   block layer. Returns 1 when at least one was taken.
  *
- * Structurally the simplest of the three storage drivers, and by some way the
- * newest: no command FIS to assemble as with AHCI, no three-phase transport as
- * with USB. A command is 64 bytes written into a ring, a doorbell says how far
- * the ring has been filled, and a completion turns up in a second ring with a
- * phase bit marking whose it is. That is the whole model - and it is the same
- * model as the xHCI rings, which is why this arrives quickly after them.
- *
- * Registers through block.c like everything else, so the filesystem never
- * learns which kind of controller it is reading. */
-
-/* Bring up one NVMe controller and register its first namespace as a block
-   device. Returns 1 when a namespace is usable. */
+ * Both halves used to be singular: one controller, and namespace 1 on it. Two
+ * M.2 sockets is an ordinary desktop, and the second drive was not failing or
+ * being reported - it was never looked at. */
 int nvme_init(const PCI_DEVICE* controller);
 
-/* Sectors on the namespace that was registered, and their size. Zero when no
-   controller came up. */
-boot_uint64_t nvme_sector_count(void);
-boot_uint32_t nvme_sector_size(void);
+/* How many namespaces are registered, across every controller. */
+boot_uint32_t nvme_namespace_count(void);
+
+/* The size of one of them, by the same numbering the block layer uses. */
+boot_uint64_t nvme_sector_count(boot_uint32_t index);
+boot_uint32_t nvme_sector_size(boot_uint32_t index);
 
 #endif

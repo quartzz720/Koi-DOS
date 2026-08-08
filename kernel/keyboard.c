@@ -92,10 +92,25 @@ void keyboard_submit_event(int key, int released) {
     event_head = next;
 }
 
+/* USB is polled whenever there is a controller, not only when a keyboard is on
+ * one.
+ *
+ * This asked `xhci_has_keyboard()` because collecting keystrokes was once the
+ * only thing the poll did. It is not: it drains every controller's event ring,
+ * and it is where a device plugged in after boot gets noticed. On a machine
+ * whose keyboard is USB the two questions have the same answer and the
+ * difference never shows. On a laptop with a PS/2 keyboard it is the whole
+ * difference between plugging in a stick and nothing happening at all - which
+ * is exactly what a laptop did: the stick was found when it was present at
+ * boot, and never afterwards, because nothing was ever looking. */
+static int usb_present(void) {
+    return xhci_controller_count() != 0;
+}
+
 int keyboard_next_event(void) {
     boot_uint16_t event;
 
-    if (xhci_has_keyboard()) xhci_poll();
+    if (usb_present()) xhci_poll();
     if (event_tail == event_head) return 0;
     event = events[event_tail];
     event_tail = (event_tail + 1) % BUFFER_SIZE;
@@ -361,19 +376,24 @@ int keyboard_poll(void) {
 }
 
 int keyboard_pending(void) {
-    if (xhci_has_keyboard()) xhci_poll();
+    if (usb_present()) xhci_poll();
     return buffer_tail != buffer_head;
 }
 
 int keyboard_getchar(void) {
     int key;
     int usb = xhci_has_keyboard();
+    int controllers = usb_present();
 
     if (!keyboard_present && !usb) return 0;
     console_show_cursor(1);
     for (;;) {
         if ((key = keyboard_poll())) break;
-        if (usb) {
+        /* Before the sleep, whichever keyboard we are waiting on: this is the
+           only place a device plugged in while somebody sits at the prompt can
+           be noticed. */
+        if (controllers) xhci_poll();
+        if (usb || controllers) {
             /* The controller's interrupt is still not routed anywhere, so USB
                keystrokes have to be collected rather than waited for.
                What changed is that something else now wakes us: with the timer
@@ -388,7 +408,9 @@ int keyboard_getchar(void) {
             continue;
         }
         /* PS/2 raises IRQ1, so sleeping until the next interrupt is both
-           correct and stops an idle guest burning a host core. */
+           correct and stops an idle guest burning a host core. Only reached
+           when there is no USB controller at all; otherwise the branch above
+           has already slept, and it wakes often enough to keep looking. */
         __asm__ volatile ("hlt");
     }
     console_show_cursor(0);

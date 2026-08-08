@@ -28,6 +28,16 @@ int block_forget(const char* name) {
     return 0;
 }
 
+static void (*change_handler)(void);
+
+void block_on_change(void (*handler)(void)) {
+    change_handler = handler;
+}
+
+void block_changed(void) {
+    if (change_handler) change_handler();
+}
+
 boot_uint32_t block_device_count(void) {
     return device_count;
 }

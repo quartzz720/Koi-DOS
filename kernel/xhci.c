@@ -171,12 +171,17 @@
 /* How many plugged-in devices we drive per controller, and how many
    controllers in total. The first real machine had two - a chipset one with
    fourteen root ports and a CPU one - so one is definitively not enough. */
-#define USB_MAX_DEVICES 8
+#define USB_MAX_DEVICES 32
 
 /* Root-hub ports a controller may have. The field in HCSPARAMS1 is eight bits
    wide; nothing real has more than a couple of dozen, and the table this sizes
    is one word per port. */
 #define XHCI_MAX_PORTS 64
+
+/* Attempts on one port before it is left alone. Three is enough to ride out a
+   device that is merely slow and few enough that a broken one does not drown
+   everything else being said. */
+#define PORT_REFUSAL_LIMIT 3
 #define XHCI_MAX_CONTROLLERS 4
 
 /* A Transfer Request Block: the unit every xHCI ring is made of. */
@@ -204,11 +209,37 @@ typedef struct {
     struct XHCI_CONTROLLER* controller;
     int used;
     boot_uint32_t slot;
-    boot_uint32_t port;
+    boot_uint32_t port;          /* the root port the whole chain hangs off */
     boot_uint32_t speed;
     boot_uint32_t packet_size;   /* of endpoint zero */
     boot_uint8_t* context;       /* the output device context */
     RING control;
+
+    /* Where it is, when it is not simply on a root port.
+     *
+     * The route string is how a host controller finds a device through a
+     * chain of hubs: four bits per tier, the downstream port number at each
+     * one, up to five tiers deep. Zero means the device is on the root port
+     * itself, which is why everything worked before hubs existed.
+     *
+     * `tier` is how many hubs deep, and it is kept because the next nibble to
+     * write is at four bits per tier and computing it from the route means
+     * finding the highest non-zero nibble. */
+    boot_uint32_t route;
+    boot_uint32_t tier;
+
+    /* A full or low speed device behind a high speed hub does not talk to the
+       controller directly: the hub translates for it, and the controller has
+       to be told which hub and which of its ports is doing the translating.
+       Zero when the device speaks for itself. */
+    boot_uint32_t tt_slot;
+    boot_uint32_t tt_port;
+
+    /* Set on a hub, with the number of downstream ports, because the
+       controller schedules differently for something that has devices behind
+       it. */
+    int is_hub;
+    boot_uint32_t hub_ports;
 } USB_DEVICE;
 
 /* One host controller. Everything here was file-scope until a machine with two
@@ -229,6 +260,12 @@ typedef struct XHCI_CONTROLLER {
        difference between this and what it has now: the change bit says
        something happened, and the connect bit says which way. */
     boot_uint32_t connected[XHCI_MAX_PORTS];
+    /* How many times in a row a port has been noticed and then failed to come
+       up. A port that flaps forever is a real thing - a phone with a tired
+       socket connects, fails to reset, drops, and connects again - and without
+       a limit it fills the log with the same four lines until the machine is
+       switched off. */
+    boot_uint32_t refusals[XHCI_MAX_PORTS];
 
     boot_uint32_t port_count;
     boot_uint32_t slot_count;
@@ -803,6 +840,33 @@ static boot_uint32_t* input_endpoint_context(const XHCI_CONTROLLER* self,
     return (boot_uint32_t*)(input + self->context_size * (dci + 1));
 }
 
+/* Fill in the slot context: where the device is and how to reach it.
+ *
+ * This was written out by hand in four places - addressing a device, and each
+ * of the three class drivers opening its endpoints - and every one of them
+ * assumed a device sitting on a root port, because that was the only kind
+ * there was. A route string added in one of the four and forgotten in the
+ * other three is a device that answers its descriptors and then goes silent
+ * the moment a class driver configures it. So there is one of them now.
+ *
+ * `last_entry` is the highest device context index in use, which is what tells
+ * the controller how much of the context to read. */
+static void describe_slot(const XHCI_CONTROLLER* self, boot_uint8_t* input,
+                          const USB_DEVICE* device, boot_uint32_t last_entry) {
+    boot_uint32_t* slot = input_slot_context(self, input);
+
+    slot[0] = (last_entry << 27) | (device->speed << 20) |
+              (device->route & 0xFFFFF);
+    if (device->is_hub) slot[0] |= 1u << 26;
+
+    slot[1] = (device->port + 1) << 16;
+    if (device->is_hub) slot[1] |= (device->hub_ports & 0xFF) << 24;
+
+    /* Which hub is translating for a slow device on a fast bus, if any. */
+    slot[2] = (slot[2] & 0xFFC00000u) |
+              (device->tt_slot & 0xFF) | ((device->tt_port & 0xFF) << 8);
+}
+
 /* Fill in one endpoint context. `interval` is already in the controller's
    units - an exponent of 125 microsecond periods - and is ignored for bulk. */
 static void describe_endpoint(const XHCI_CONTROLLER* self, boot_uint8_t* input,
@@ -849,10 +913,8 @@ static int address_device(USB_DEVICE* device) {
        context we are supplying: bit 0 the slot, bit 1 endpoint zero. */
     ((boot_uint32_t*)input)[1] = 0x3;
 
-    /* Route string zero (directly on a root port), one context entry, the
-       link speed, and which root port it is on. */
-    input_slot_context(self, input)[0] = (1u << 27) | (device->speed << 20);
-    input_slot_context(self, input)[1] = (device->port + 1) << 16;
+    /* One context entry: endpoint zero and nothing else yet. */
+    describe_slot(self, input, device, 1);
 
     device->packet_size = default_packet_size(device->speed);
     describe_endpoint(self, input, 1, 4 /* control */, device->packet_size, 0,
@@ -1156,6 +1218,15 @@ typedef struct {
 static USB_KEYBOARD keyboards[KEYBOARD_MAX];
 static boot_uint32_t keyboard_count;
 
+/* How many are actually here, which is not the same as how many entries have
+   ever been used - the difference is a keyboard that has been unplugged. */
+static boot_uint32_t keyboards_attached(void) {
+    boot_uint32_t total = 0;
+    for (boot_uint32_t index = 0; index < keyboard_count; index++)
+        if (keyboards[index].used) total++;
+    return total;
+}
+
 /* HID usage IDs to characters, unshifted then shifted. The boot protocol
    reports which physical key was pressed, not what it means, so this is the
    same job the PS/2 scancode table does - only the numbering differs. */
@@ -1396,14 +1467,22 @@ static int configure_keyboard(USB_DEVICE* device,
     boot_uint16_t packet = 8;
     boot_uint8_t interval = 10;
 
+    boot_uint32_t keyboard_slot;
+
     if (!find_keyboard(configuration, length, &interface, &endpoint,
                        &packet, &interval))
         return 0;
 
-    if (keyboard_count >= KEYBOARD_MAX) {
-        log_controller(self);
-        log("more keyboards than this can hold; ignoring one\n");
-        return 0;
+    {
+        boot_uint32_t room = KEYBOARD_MAX;
+        for (boot_uint32_t index = 0; index < KEYBOARD_MAX; index++)
+            if (!keyboards[index].used) { room = index; break; }
+        if (room == KEYBOARD_MAX) {
+            log_controller(self);
+            log("more keyboards than this can hold; ignoring one\n");
+            return 0;
+        }
+        keyboard_slot = room;
     }
 
     log_controller(self);
@@ -1418,7 +1497,7 @@ static int configure_keyboard(USB_DEVICE* device,
     /* Endpoint 1 IN is device context index 3: two per endpoint number, plus
        one for the IN direction. */
     {
-        USB_KEYBOARD* keyboard = &keyboards[keyboard_count];
+        USB_KEYBOARD* keyboard = &keyboards[keyboard_slot];
         memset(keyboard, 0, sizeof(*keyboard));
         keyboard->dci = endpoint * 2 + 1;
 
@@ -1433,9 +1512,7 @@ static int configure_keyboard(USB_DEVICE* device,
     /* Add the slot context and the new endpoint. The slot has to be included
        because its Context Entries field must grow to cover the new index. */
     ((boot_uint32_t*)input)[1] = 1u | (1u << keyboard->dci);
-    input_slot_context(self, input)[0] =
-        (keyboard->dci << 27) | (device->speed << 20);
-    input_slot_context(self, input)[1] = (device->port + 1) << 16;
+    describe_slot(self, input, device, keyboard->dci);
     describe_endpoint(self, input, keyboard->dci, ENDPOINT_TYPE_INTERRUPT_IN,
                       packet, interval_exponent(device->speed, interval),
                       &keyboard->ring);
@@ -1464,11 +1541,11 @@ static int configure_keyboard(USB_DEVICE* device,
 
         keyboard->device = device;
         keyboard->used = 1;
-        keyboard_count++;
+        if (keyboard_slot >= keyboard_count) keyboard_count = keyboard_slot + 1;
         queue_report_request(keyboard);
         log_controller(self);
         log("keyboard ready (");
-        log_dec(keyboard_count);
+        log_dec(keyboards_attached());
         log(" attached)\n");
     }
     return 1;
@@ -1507,29 +1584,50 @@ typedef struct __attribute__((packed)) {
     boot_uint8_t status;
 } STATUS_BLOCK;
 
-static USB_DEVICE* storage_device;
-static RING storage_in;
-static RING storage_out;
-static boot_uint32_t storage_in_dci;
-static boot_uint32_t storage_out_dci;
-static boot_uint8_t storage_in_address;    /* endpoint address, for CLEAR_FEATURE */
-static boot_uint8_t storage_out_address;
-static boot_uint8_t* storage_blocks;       /* the command and status blocks */
-static boot_uint8_t* storage_bounce;       /* one page of transfer buffer */
-static boot_uint32_t storage_tag;
-static boot_uint32_t storage_sector_size;
-static boot_uint64_t storage_sectors;
-static int storage_ready;
-/* Why the last transfer failed, as the device explained it. 0xFF when nothing
-   has failed or the device would not say. */
-static boot_uint8_t storage_last_sense = 0xFF;
+/* One USB stick. Plural, because a machine with two of them plugged in showed
+   this driver one - and not the second one failing, the second one never being
+   looked at: everything below was a file-scope singleton, so claiming a stick
+   overwrote the one already claimed. */
+#define USB_STORAGE_MAX 4
+
+typedef struct {
+    USB_DEVICE* device;
+    RING in;
+    RING out;
+    boot_uint32_t in_dci;
+    boot_uint32_t out_dci;
+    boot_uint8_t in_address;     /* endpoint address, for CLEAR_FEATURE */
+    boot_uint8_t out_address;
+    boot_uint8_t* blocks;        /* the command and status blocks */
+    boot_uint8_t* bounce;        /* one page of transfer buffer */
+    boot_uint32_t tag;
+    boot_uint32_t sector_size;
+    boot_uint64_t sectors;
+    int ready;
+    /* Why the last transfer failed, as the device explained it. 0xFF when
+       nothing has failed or the device would not say. */
+    boot_uint8_t last_sense;
+    char name[8];
+    int used;
+} USB_STORAGE;
+
+static USB_STORAGE storages[USB_STORAGE_MAX];
+static boot_uint32_t storage_count;
+
+/* Which stick the SCSI helpers below are talking to.
+ *
+ * The same trade the NVMe driver makes and for the same reason: nothing here
+ * is re-entrant and every completion is polled by whoever submitted it, so
+ * there is one conversation at a time. Set at the two ways in - claiming a
+ * device, and a block transfer arriving from above. */
+static USB_STORAGE* storage;
 
 /* One bulk transfer: a single Normal TRB, rung and waited for.
  *
  * The buffer is always one of ours and page-aligned, which sidesteps the rule
  * that a TRB's buffer may not cross a 64 KiB boundary - a page never does. The
  * block layer's buffers come from anywhere, so reads and writes bounce through
- * `storage_bounce` rather than being handed to the controller directly.
+ * `storage->bounce` rather than being handed to the controller directly.
  *
  * Returns bytes transferred, -1 on failure, -2 on a stall the caller should
  * recover from. */
@@ -1571,40 +1669,40 @@ static int bulk_transfer(USB_DEVICE* device, RING* ring, boot_uint32_t dci,
  * Returns 1 when the device reports the command succeeded. */
 static int scsi_command(const boot_uint8_t* command, boot_uint32_t command_length,
                         void* data, boot_uint32_t data_length, int data_in) {
-    COMMAND_BLOCK* cbw = (COMMAND_BLOCK*)storage_blocks;
-    STATUS_BLOCK* csw = (STATUS_BLOCK*)(storage_blocks + 64);
+    COMMAND_BLOCK* cbw = (COMMAND_BLOCK*)storage->blocks;
+    STATUS_BLOCK* csw = (STATUS_BLOCK*)(storage->blocks + 64);
     int moved;
 
-    if (!storage_device || command_length > 16) return 0;
+    if (!storage->device || command_length > 16) return 0;
 
     memset(cbw, 0, sizeof(*cbw));
     cbw->signature = CBW_SIGNATURE;
-    cbw->tag = ++storage_tag;
+    cbw->tag = ++storage->tag;
     cbw->transfer_length = data_length;
     cbw->flags = data_length && data_in ? CBW_DIRECTION_IN : 0;
     cbw->lun = 0;
     cbw->command_length = (boot_uint8_t)command_length;
     memcpy(cbw->command, command, command_length);
 
-    moved = bulk_transfer(storage_device, &storage_out, storage_out_dci, cbw,
+    moved = bulk_transfer(storage->device, &storage->out, storage->out_dci, cbw,
                           (boot_uint32_t)sizeof(*cbw), 2000);
     if (moved != (int)sizeof(*cbw)) {
         if (moved == -2)
-            (void)clear_stall(storage_device, storage_out_dci, &storage_out,
-                              storage_out_address);
+            (void)clear_stall(storage->device, storage->out_dci, &storage->out,
+                              storage->out_address);
         return 0;
     }
 
     if (data_length) {
-        RING* ring = data_in ? &storage_in : &storage_out;
-        boot_uint32_t dci = data_in ? storage_in_dci : storage_out_dci;
+        RING* ring = data_in ? &storage->in : &storage->out;
+        boot_uint32_t dci = data_in ? storage->in_dci : storage->out_dci;
 
-        moved = bulk_transfer(storage_device, ring, dci, data, data_length, 5000);
+        moved = bulk_transfer(storage->device, ring, dci, data, data_length, 5000);
         if (moved == -2) {
             /* A stalled data stage is not fatal: the device still owes us a
                status block, and it will send one once the endpoint is clear. */
-            if (!clear_stall(storage_device, dci, ring,
-                             data_in ? storage_in_address : storage_out_address))
+            if (!clear_stall(storage->device, dci, ring,
+                             data_in ? storage->in_address : storage->out_address))
                 return 0;
         } else if (moved < 0) {
             return 0;
@@ -1612,13 +1710,13 @@ static int scsi_command(const boot_uint8_t* command, boot_uint32_t command_lengt
     }
 
     memset(csw, 0, sizeof(*csw));
-    moved = bulk_transfer(storage_device, &storage_in, storage_in_dci, csw,
+    moved = bulk_transfer(storage->device, &storage->in, storage->in_dci, csw,
                           (boot_uint32_t)sizeof(*csw), 2000);
     if (moved == -2) {
-        if (!clear_stall(storage_device, storage_in_dci, &storage_in,
-                         storage_in_address))
+        if (!clear_stall(storage->device, storage->in_dci, &storage->in,
+                         storage->in_address))
             return 0;
-        moved = bulk_transfer(storage_device, &storage_in, storage_in_dci, csw,
+        moved = bulk_transfer(storage->device, &storage->in, storage->in_dci, csw,
                               (boot_uint32_t)sizeof(*csw), 2000);
     }
     if (moved < (int)sizeof(*csw)) return 0;
@@ -1627,7 +1725,7 @@ static int scsi_command(const boot_uint8_t* command, boot_uint32_t command_lengt
         log("XHCI: status block signature is wrong\n");
         return 0;
     }
-    if (csw->tag != storage_tag) {
+    if (csw->tag != storage->tag) {
         log("XHCI: status block tag does not match\n");
         return 0;
     }
@@ -1668,18 +1766,18 @@ static boot_uint8_t request_sense(void) {
     memset(command, 0, sizeof(command));
     command[0] = SCSI_REQUEST_SENSE;
     command[4] = 18;
-    if (!scsi_command(command, sizeof(command), storage_bounce, 18, 1))
+    if (!scsi_command(command, sizeof(command), storage->bounce, 18, 1))
         return 0xFF;
 
-    key = (boot_uint8_t)(storage_bounce[2] & 0x0F);
+    key = (boot_uint8_t)(storage->bounce[2] & 0x0F);
     log("XHCI: storage says ");
     log(sense_meaning(key));
     log(" (key ");
     log_hex(key);
     log(", code ");
-    log_hex(storage_bounce[12]);
+    log_hex(storage->bounce[12]);
     log("/");
-    log_hex(storage_bounce[13]);
+    log_hex(storage->bounce[13]);
     log(")\n");
     return key;
 }
@@ -1738,19 +1836,19 @@ static int inquiry(void) {
     memset(command, 0, sizeof(command));
     command[0] = SCSI_INQUIRY;
     command[4] = 36;
-    memset(storage_bounce, 0, 64);
+    memset(storage->bounce, 0, 64);
 
-    if (!scsi_command(command, sizeof(command), storage_bounce, 36, 1)) {
+    if (!scsi_command(command, sizeof(command), storage->bounce, 36, 1)) {
         log("XHCI: INQUIRY failed\n");
         return 0;
     }
-    log_controller(storage_device->controller);
+    log_controller(storage->device->controller);
     log("storage is ");
-    log_padded(storage_bounce + 8, 8);
+    log_padded(storage->bounce + 8, 8);
     log(" ");
-    log_padded(storage_bounce + 16, 16);
+    log_padded(storage->bounce + 16, 16);
     log(" rev ");
-    log_padded(storage_bounce + 32, 4);
+    log_padded(storage->bounce + 32, 4);
     log("\n");
     return 1;
 }
@@ -1761,29 +1859,29 @@ static int read_capacity(void) {
 
     memset(command, 0, sizeof(command));
     command[0] = SCSI_READ_CAPACITY_10;
-    memset(storage_bounce, 0, 16);
+    memset(storage->bounce, 0, 16);
 
-    if (!scsi_command(command, sizeof(command), storage_bounce, 8, 1)) {
+    if (!scsi_command(command, sizeof(command), storage->bounce, 8, 1)) {
         log("XHCI: READ CAPACITY failed\n");
         return 0;
     }
     /* The first number is the address of the last block, not a count. */
-    last = read_big32(storage_bounce);
-    storage_sector_size = read_big32(storage_bounce + 4);
-    storage_sectors = (boot_uint64_t)last + 1;
+    last = read_big32(storage->bounce);
+    storage->sector_size = read_big32(storage->bounce + 4);
+    storage->sectors = (boot_uint64_t)last + 1;
 
-    if (!storage_sector_size || storage_sector_size > PAGE_SIZE ||
-        (storage_sector_size & (storage_sector_size - 1))) {
+    if (!storage->sector_size || storage->sector_size > PAGE_SIZE ||
+        (storage->sector_size & (storage->sector_size - 1))) {
         log("XHCI: sector size ");
-        log_dec(storage_sector_size);
+        log_dec(storage->sector_size);
         log(" is not something this driver can address\n");
         return 0;
     }
-    log_controller(storage_device->controller);
+    log_controller(storage->device->controller);
     log("storage ");
-    log_dec(storage_sectors * storage_sector_size / 1024U / 1024U);
+    log_dec(storage->sectors * storage->sector_size / 1024U / 1024U);
     log(" MB, ");
-    log_dec(storage_sector_size);
+    log_dec(storage->sector_size);
     log("-byte sectors\n");
     return 1;
 }
@@ -1799,14 +1897,14 @@ static int storage_transfer(boot_uint64_t lba, boot_uint32_t count,
     boot_uint8_t* caller = (boot_uint8_t*)buffer;
     boot_uint32_t per_chunk;
 
-    if (!storage_ready || !count || !buffer) return 0;
-    if (storage_sectors && lba + count > storage_sectors) return 0;
-    storage_last_sense = 0xFF;
+    if (!storage->ready || !count || !buffer) return 0;
+    if (storage->sectors && lba + count > storage->sectors) return 0;
+    storage->last_sense = 0xFF;
 
-    per_chunk = (boot_uint32_t)(PAGE_SIZE / storage_sector_size);
+    per_chunk = (boot_uint32_t)(PAGE_SIZE / storage->sector_size);
     while (count) {
         boot_uint32_t chunk = count < per_chunk ? count : per_chunk;
-        boot_uint32_t bytes = chunk * storage_sector_size;
+        boot_uint32_t bytes = chunk * storage->sector_size;
         boot_uint8_t command[10];
 
         memset(command, 0, sizeof(command));
@@ -1815,18 +1913,18 @@ static int storage_transfer(boot_uint64_t lba, boot_uint32_t count,
         command[7] = (boot_uint8_t)(chunk >> 8);
         command[8] = (boot_uint8_t)chunk;
 
-        if (write) memcpy(storage_bounce, caller, bytes);
-        if (!scsi_command(command, sizeof(command), storage_bounce, bytes, !write)) {
+        if (write) memcpy(storage->bounce, caller, bytes);
+        if (!scsi_command(command, sizeof(command), storage->bounce, bytes, !write)) {
             /* Ask why before giving up. The answer goes to the log, and the
                sense key is kept so the shell can say something better than
                that a copy failed. */
             log(write ? "XHCI: write to sector " : "XHCI: read of sector ");
             log_hex(lba);
             log(" failed\n");
-            storage_last_sense = request_sense();
+            storage->last_sense = request_sense();
             return 0;
         }
-        if (!write) memcpy(caller, storage_bounce, bytes);
+        if (!write) memcpy(caller, storage->bounce, bytes);
 
         caller += bytes;
         lba += chunk;
@@ -1835,15 +1933,19 @@ static int storage_transfer(boot_uint64_t lba, boot_uint32_t count,
     return 1;
 }
 
+/* The two ways in from above, and the only places the current stick is
+   chosen. */
 static int storage_block_read(BLOCK_DEVICE* device, boot_uint64_t lba,
                               boot_uint32_t count, void* buffer) {
-    (void)device;
+    storage = (USB_STORAGE*)device->driver_data;
+    if (!storage || !storage->used) return 0;
     return storage_transfer(lba, count, buffer, 0);
 }
 
 static int storage_block_write(BLOCK_DEVICE* device, boot_uint64_t lba,
                                boot_uint32_t count, const void* buffer) {
-    (void)device;
+    storage = (USB_STORAGE*)device->driver_data;
+    if (!storage || !storage->used) return 0;
     return storage_transfer(lba, count, (void*)buffer, 1);
 }
 
@@ -1896,14 +1998,18 @@ static int find_storage(const boot_uint8_t* configuration, boot_uint32_t length,
     return 0;
 }
 
-static int register_storage(void) {
+static int register_storage(boot_uint32_t number) {
     BLOCK_DEVICE device;
 
+    storage->name[0] = 'u'; storage->name[1] = 's'; storage->name[2] = 'b';
+    storage->name[3] = (char)('0' + (number % 10));
+    storage->name[4] = 0;
+
     memset(&device, 0, sizeof(device));
-    device.name[0] = 'u'; device.name[1] = 's'; device.name[2] = 'b';
-    device.name[3] = '0'; device.name[4] = 0;
-    device.sector_size = storage_sector_size;
-    device.sector_count = storage_sectors;
+    memcpy(device.name, storage->name, 5);
+    device.sector_size = storage->sector_size;
+    device.sector_count = storage->sectors;
+    device.driver_data = storage;
     device.read = storage_block_read;
     device.write = storage_block_write;
     return block_register(&device) >= 0;
@@ -1919,59 +2025,69 @@ static int configure_storage(USB_DEVICE* device,
     boot_uint8_t interface = 0;
     boot_uint16_t in_packet = 64;
     boot_uint16_t out_packet = 64;
+    boot_uint8_t in_address = 0;
+    boot_uint8_t out_address = 0;
 
-    if (!find_storage(configuration, length, &interface, &storage_in_address,
-                      &in_packet, &storage_out_address, &out_packet))
+    if (!find_storage(configuration, length, &interface, &in_address,
+                      &in_packet, &out_address, &out_packet))
         return 0;
 
-    if (storage_ready) {
+    /* Somewhere to put it. This used to say "a second storage device is
+       present and ignored" and mean it, which is a strange thing for an
+       operating system to say to somebody holding two USB sticks. */
+    storage = (USB_STORAGE*)0;
+    for (boot_uint32_t index = 0; index < USB_STORAGE_MAX; index++)
+        if (!storages[index].used) { storage = &storages[index]; break; }
+    if (!storage) {
         log_controller(self);
-        log("a second storage device is present and ignored\n");
+        log("more storage devices than this can hold; ignoring one\n");
         return 0;
     }
+    memset(storage, 0, sizeof(*storage));
+    storage->in_address = in_address;
+    storage->out_address = out_address;
 
     log_controller(self);
     log("mass storage on interface ");
     log_dec(interface);
     log(", endpoints in ");
-    log_dec(storage_in_address & 0x0F);
+    log_dec(storage->in_address & 0x0F);
     log(" out ");
-    log_dec(storage_out_address & 0x0F);
+    log_dec(storage->out_address & 0x0F);
     log("\n");
 
-    storage_in_dci = (boot_uint32_t)(storage_in_address & 0x0F) * 2 + 1;
-    storage_out_dci = (boot_uint32_t)(storage_out_address & 0x0F) * 2;
+    storage->in_dci = (boot_uint32_t)(storage->in_address & 0x0F) * 2 + 1;
+    storage->out_dci = (boot_uint32_t)(storage->out_address & 0x0F) * 2;
 
     in_trbs = (TRB*)alloc_page();
     out_trbs = (TRB*)alloc_page();
-    storage_blocks = (boot_uint8_t*)alloc_page();
-    storage_bounce = (boot_uint8_t*)alloc_page();
+    storage->blocks = (boot_uint8_t*)alloc_page();
+    storage->bounce = (boot_uint8_t*)alloc_page();
     input = (boot_uint8_t*)alloc_page();
-    if (!in_trbs || !out_trbs || !storage_blocks || !storage_bounce || !input) {
+    if (!in_trbs || !out_trbs || !storage->blocks || !storage->bounce || !input) {
         log_controller(self);
         log("out of memory configuring storage\n");
         return 0;
     }
-    memset(storage_blocks, 0, PAGE_SIZE);
-    memset(storage_bounce, 0, PAGE_SIZE);
+    memset(storage->blocks, 0, PAGE_SIZE);
+    memset(storage->bounce, 0, PAGE_SIZE);
     memset(input, 0, PAGE_SIZE);
-    ring_init(&storage_in, in_trbs);
-    ring_init(&storage_out, out_trbs);
+    ring_init(&storage->in, in_trbs);
+    ring_init(&storage->out, out_trbs);
 
     /* Both endpoints in one Configure Endpoint command, with the slot context
        stretched to cover whichever index is higher. */
     {
-        boot_uint32_t last = storage_in_dci > storage_out_dci ? storage_in_dci
-                                                             : storage_out_dci;
+        boot_uint32_t last = storage->in_dci > storage->out_dci ? storage->in_dci
+                                                             : storage->out_dci;
         ((boot_uint32_t*)input)[1] =
-            1u | (1u << storage_in_dci) | (1u << storage_out_dci);
-        input_slot_context(self, input)[0] = (last << 27) | (device->speed << 20);
-        input_slot_context(self, input)[1] = (device->port + 1) << 16;
+            1u | (1u << storage->in_dci) | (1u << storage->out_dci);
+        describe_slot(self, input, device, last);
     }
-    describe_endpoint(self, input, storage_in_dci, ENDPOINT_TYPE_BULK_IN,
-                      in_packet, 0, &storage_in);
-    describe_endpoint(self, input, storage_out_dci, ENDPOINT_TYPE_BULK_OUT,
-                      out_packet, 0, &storage_out);
+    describe_endpoint(self, input, storage->in_dci, ENDPOINT_TYPE_BULK_IN,
+                      in_packet, 0, &storage->in);
+    describe_endpoint(self, input, storage->out_dci, ENDPOINT_TYPE_BULK_OUT,
+                      out_packet, 0, &storage->out);
 
     if (!run_command(self, "configure endpoint",
                      (boot_uint64_t)(unsigned long long)input,
@@ -1986,32 +2102,45 @@ static int configure_storage(USB_DEVICE* device,
         return 0;
     }
 
-    storage_device = device;
-    storage_tag = 0;
-    if (!wait_until_ready()) { storage_device = 0; return 0; }
-    if (!inquiry()) { storage_device = 0; return 0; }
-    if (!read_capacity()) { storage_device = 0; return 0; }
+    storage->device = device;
+    storage->tag = 0;
+    storage->last_sense = 0xFF;
+    if (!wait_until_ready()) { storage->device = 0; return 0; }
+    if (!inquiry()) { storage->device = 0; return 0; }
+    if (!read_capacity()) { storage->device = 0; return 0; }
 
-    storage_ready = 1;
-    if (!register_storage()) {
+    storage->ready = 1;
+    if (!register_storage((boot_uint32_t)(storage - storages))) {
         log_controller(self);
         log("the block layer would not take the device\n");
-        storage_ready = 0;
-        storage_device = 0;
+        storage->ready = 0;
+        storage->device = 0;
         return 0;
     }
+    storage->used = 1;
+    if ((boot_uint32_t)(storage - storages) >= storage_count)
+        storage_count = (boot_uint32_t)(storage - storages) + 1;
     log_controller(self);
     log("storage ready\n");
+    /* And the volume table is out of date the moment this line is printed. */
+    block_changed();
     return 1;
 }
 
 int xhci_has_storage(void) {
-    return storage_ready;
+    for (boot_uint32_t index = 0; index < storage_count; index++)
+        if (storages[index].used && storages[index].ready) return 1;
+    return 0;
 }
 
+/* The most recent explanation from any of them. One message for several sticks
+   is a compromise, and the alternative - a command that takes which stick it
+   means - is not worth it while "copy failed" is the thing being improved on. */
 const char* xhci_storage_error(void) {
-    if (storage_last_sense == 0xFF) return (const char*)0;
-    return sense_meaning(storage_last_sense);
+    for (boot_uint32_t index = 0; index < storage_count; index++)
+        if (storages[index].used && storages[index].last_sense != 0xFF)
+            return sense_meaning(storages[index].last_sense);
+    return (const char*)0;
 }
 
 /* ---- USB networking, the part that comes before any protocol -------------
@@ -2220,6 +2349,16 @@ static boot_uint16_t network_queue_length[NETWORK_QUEUE];
 static boot_uint32_t network_queue_head;
 static boot_uint32_t network_queue_tail;
 static boot_uint32_t network_dropped;
+/* Frames that went out, frames that came in, and sends the controller refused.
+ *
+ * "Nobody offered an address" is one sentence for three completely different
+ * failures: nothing was sent, something was sent and nothing came back, or
+ * things came back and none of them was an answer. Without these it takes a
+ * machine and an afternoon to tell them apart; with them it takes a line. */
+static boot_uint32_t network_sent;
+static boot_uint32_t network_received;
+static boot_uint32_t network_send_failed;
+static boot_uint32_t network_receive_errors;
 
 static void arm_network_receive(void);
 
@@ -2249,6 +2388,15 @@ static const char* network_kind_name(int kind) {
 #define RNDIS_COMPLETE 0x80000000U      /* set in the reply to any of them */
 
 #define RNDIS_STATUS_SUCCESS 0x00000000U
+
+/* The message the device sends without being asked, and the two things it
+   says with it. A link that is down is not a broken driver: it is a phone
+   that has not finished bringing tethering up, and the difference is worth
+   being able to read. */
+#define RNDIS_INDICATE_STATUS 0x00000007U
+#define RNDIS_KEEPALIVE 0x00000008U
+#define RNDIS_STATUS_MEDIA_CONNECT 0x4001000BU
+#define RNDIS_STATUS_MEDIA_DISCONNECT 0x4001000CU
 
 #define OID_GEN_CURRENT_PACKET_FILTER 0x0001010EU
 #define OID_802_3_PERMANENT_ADDRESS 0x01010101U
@@ -2562,6 +2710,47 @@ static int configure_network(USB_DEVICE* device,
             log("the packet filter was refused - it will hand over nothing\n");
         }
 
+        /* And whatever the device has been holding for us.
+         *
+         * RNDIS has a second channel the other way: the device raises its
+         * interrupt endpoint to say "there is a response waiting" and the host
+         * fetches it. After initialize, Android puts a media-connect
+         * indication there and waits. Nothing here ever collected it, and a
+         * device whose response queue is never drained is a device that has
+         * said the link is up and had nobody listen - which is exactly what
+         * four frames sent and none received looks like.
+         *
+         * Drained by asking rather than by watching the interrupt endpoint.
+         * That endpoint is the proper way and is worth having; this is the
+         * cheap half of it, and it either changes the symptom or rules the
+         * whole idea out. */
+        for (int drain = 0; drain < 4; drain++) {
+            int got = control_in(device, 0xA1, RNDIS_GET_RESPONSE, 0,
+                                 network.control, buffer, PAGE_SIZE);
+            boot_uint32_t type;
+
+            if (got < 12) break;
+            type = get32(buffer + 0);
+            /* Only the two kinds a device sends unasked. A controller with
+               nothing queued may hand back the last reply it gave rather than
+               nothing at all - QEMU's does - and treating that as news would
+               be reading an echo as a message. */
+            if (type != RNDIS_INDICATE_STATUS && type != RNDIS_KEEPALIVE) break;
+
+            log_controller(self);
+            if (type == RNDIS_KEEPALIVE) {
+                log("the device asked whether we are still here\n");
+            } else {
+                boot_uint32_t status = get32(buffer + 8);
+                log("the device says the link is ");
+                if (status == RNDIS_STATUS_MEDIA_CONNECT) log("up\n");
+                else if (status == RNDIS_STATUS_MEDIA_DISCONNECT)
+                    log("down - tethering is on but not carrying anything\n");
+                else { log("in state "); log_hex(status); log("\n"); }
+            }
+            timer_wait(20);
+        }
+
         max_frame = max_transfer;
         free_page(buffer);
     }
@@ -2603,8 +2792,7 @@ static int configure_network(USB_DEVICE* device,
         ring_init(&network_out, out_trbs);
 
         ((boot_uint32_t*)input)[1] = 1u | (1u << in_dci) | (1u << out_dci);
-        input_slot_context(self, input)[0] = (last << 27) | (device->speed << 20);
-        input_slot_context(self, input)[1] = (device->port + 1) << 16;
+        describe_slot(self, input, device, last);
         describe_endpoint(self, input, in_dci, ENDPOINT_TYPE_BULK_IN,
                           network.in_packet, 0, &network_in);
         describe_endpoint(self, input, out_dci, ENDPOINT_TYPE_BULK_OUT,
@@ -2666,6 +2854,7 @@ static void queue_frame(const boot_uint8_t* frame, boot_uint32_t length) {
         network_dropped++;
         return;
     }
+    network_received++;
     memcpy(network_queue[network_queue_tail], frame, length);
     network_queue_length[network_queue_tail] = (boot_uint16_t)length;
     network_queue_tail = next;
@@ -2728,6 +2917,18 @@ static int network_event(const XHCI_CONTROLLER* self, const TRB* event) {
     } else if (code == COMPLETION_STALL) {
         clear_stall(network_device, network_in_dci, &network_in,
                     network_in_address);
+    } else {
+        /* Everything else used to be swallowed here, which meant a receive
+           endpoint failing every single time looked identical to a network
+           with nothing on it. Said once and then counted, because if it is
+           happening at all it is happening a thousand times. */
+        if (!network_receive_errors) {
+            log_controller(self);
+            log("frames are not arriving: ");
+            log(completion_name(code));
+            log("\n");
+        }
+        network_receive_errors++;
     }
     arm_network_receive();
     return 1;
@@ -2766,9 +2967,11 @@ int usb_net_send(const void* frame, boot_uint32_t length) {
     if (moved == -2) {
         clear_stall(network_device, network_out_dci, &network_out,
                     network_out_address);
+        network_send_failed++;
         return 0;
     }
-    if (moved < 0) return 0;
+    if (moved < 0) { network_send_failed++; return 0; }
+    network_sent++;
 
     /* A transfer that is an exact multiple of the packet size does not end as
        far as the device is concerned - it is still waiting for the short
@@ -2791,40 +2994,437 @@ boot_uint32_t usb_net_dropped(void) {
     return network_dropped;
 }
 
+void usb_net_counters(boot_uint32_t* sent, boot_uint32_t* received,
+                      boot_uint32_t* failed) {
+    *sent = network_sent;
+    *received = network_received;
+    *failed = network_send_failed + network_receive_errors;
+}
+
+
+/* ---- Hubs ---------------------------------------------------------------
+ *
+ * A hub is the reason a machine with four keyboards in its BIOS shows one to
+ * this driver. Everything plugged into it is invisible until somebody asks
+ * the hub what it has, and the hub is a USB device like any other: it answers
+ * class requests over endpoint zero, one per downstream port.
+ *
+ * Two things make this more than a loop over ports.
+ *
+ * The first is the route string. A host controller reaches a device through a
+ * chain of hubs by being told the path: four bits per tier, the downstream
+ * port number at each one, up to five tiers. Every command about the device
+ * carries it, which is why the slot context is now built in one place.
+ *
+ * The second is the transaction translator. A full or low speed device on a
+ * high speed bus cannot talk to the controller at all - the hub speaks to it
+ * slowly and to the controller quickly, and the controller has to be told
+ * which hub and which port is doing that. Get it wrong and the device
+ * enumerates perfectly and then never delivers a transfer, which is a failure
+ * this driver has already met once, from a different cause.
+ */
+
+#define USB_CLASS_HUB 9
+
+/* Class requests, which differ from the standard ones only in the recipient
+   and the direction bits. Everything about a port is addressed to the port. */
+#define HUB_GET_STATUS 0
+#define HUB_CLEAR_FEATURE 1
+#define HUB_SET_FEATURE 3
+#define HUB_DESCRIPTOR 0x29         /* 0x2A on a SuperSpeed hub */
+#define HUB_DESCRIPTOR_SUPER 0x2A
+
+#define PORT_CONNECTION 0
+#define PORT_ENABLE 1
+#define PORT_RESET 4
+#define PORT_POWER 8
+#define C_PORT_CONNECTION 16
+#define C_PORT_RESET 20
+
+#define PORT_STATUS_CONNECTED 0x0001
+#define PORT_STATUS_ENABLED 0x0002
+#define PORT_STATUS_RESET 0x0010
+#define PORT_STATUS_LOW_SPEED 0x0200
+#define PORT_STATUS_HIGH_SPEED 0x0400
+
+/* Five tiers is the whole of the route string, and also the whole of what USB
+   allows: beyond it the round trip is longer than the protocol's timeouts. */
+#define HUB_MAX_TIER 5
+#define HUB_MAX 8
+
+typedef struct {
+    USB_DEVICE* device;
+    boot_uint32_t ports;
+    /* Which ports we last saw something on, so a change can be noticed
+       without re-enumerating a device that has not moved. */
+    boot_uint32_t occupied;
+    int used;
+} USB_HUB;
+
+static USB_HUB hubs[HUB_MAX];
+static boot_uint32_t hub_count;
+
+static USB_DEVICE* attach_at(XHCI_CONTROLLER* self, boot_uint32_t root_port,
+                             boot_uint32_t route, boot_uint32_t tier,
+                             boot_uint32_t speed, boot_uint32_t tt_slot,
+                             boot_uint32_t tt_port);
+static void forget_below(XHCI_CONTROLLER* self, boot_uint32_t route,
+                         boot_uint32_t tier);
+
+static int hub_port_status(USB_DEVICE* device, boot_uint32_t port,
+                           boot_uint16_t* status, boot_uint16_t* change) {
+    boot_uint8_t buffer[4];
+
+    if (control_in(device, 0xA3, HUB_GET_STATUS, 0, (boot_uint16_t)port,
+                   buffer, 4) < 4)
+        return 0;
+    *status = (boot_uint16_t)(buffer[0] | (buffer[1] << 8));
+    *change = (boot_uint16_t)(buffer[2] | (buffer[3] << 8));
+    return 1;
+}
+
+static int hub_port_feature(USB_DEVICE* device, boot_uint8_t request,
+                            boot_uint16_t feature, boot_uint32_t port) {
+    return control_in(device, 0x23, request, feature, (boot_uint16_t)port,
+                      (void*)0, 0) >= 0;
+}
+
+/* Reset one downstream port and report what speed came up on it.
+ *
+ * A hub port has to be reset before the device on it will answer to address
+ * zero, exactly like a root port - and like a root port, the speed is only
+ * meaningful afterwards. Returns 0 if nothing usable came up. */
+static boot_uint32_t hub_reset_port(USB_HUB* hub, boot_uint32_t port) {
+    USB_DEVICE* device = hub->device;
+    boot_uint16_t status = 0;
+    boot_uint16_t change = 0;
+    boot_uint64_t start;
+
+    if (!hub_port_feature(device, HUB_SET_FEATURE, PORT_RESET, port)) return 0;
+
+    start = timer_ticks();
+    while (!timer_expired(start, 800)) {
+        if (!hub_port_status(device, port, &status, &change)) return 0;
+        if (!(status & PORT_STATUS_RESET) && (status & PORT_STATUS_ENABLED))
+            break;
+        timer_wait(10);
+    }
+    if (status & PORT_STATUS_RESET) return 0;
+    if (!(status & PORT_STATUS_ENABLED)) return 0;
+
+    (void)hub_port_feature(device, HUB_CLEAR_FEATURE, C_PORT_RESET, port);
+    /* USB asks for 10 ms of quiet after a reset before the device is spoken
+       to. Skipping it works on most devices and not on all of them, and the
+       ones it fails on fail at the first descriptor read. */
+    timer_wait(10);
+
+    /* A SuperSpeed hub only has SuperSpeed devices behind it; the speed bits
+       below are USB 2's and do not appear there. */
+    if (device->speed == SPEED_SUPER) return SPEED_SUPER;
+    if (status & PORT_STATUS_LOW_SPEED) return SPEED_LOW;
+    if (status & PORT_STATUS_HIGH_SPEED) return SPEED_HIGH;
+    return SPEED_FULL;
+}
+
+/* Enumerate whatever is on one downstream port. */
+static void hub_attach(USB_HUB* hub, boot_uint32_t port) {
+    USB_DEVICE* device = hub->device;
+    XHCI_CONTROLLER* self = device->controller;
+    boot_uint32_t speed;
+    boot_uint32_t route;
+    boot_uint32_t tt_slot;
+    boot_uint32_t tt_port;
+
+    if (device->tier >= HUB_MAX_TIER) {
+        log_controller(self);
+        log("a hub too many tiers deep to reach\n");
+        return;
+    }
+
+    speed = hub_reset_port(hub, port);
+    if (!speed) {
+        log_controller(self);
+        log("hub port ");
+        log_dec(port);
+        log(" would not come up\n");
+        return;
+    }
+
+    /* The port number goes into the nibble for this hub's tier. */
+    route = device->route | ((port & 0xF) << (4 * device->tier));
+
+    /* Who translates, if anybody. A slow device on a fast hub is translated
+       by that hub; a slow device on a slow hub is translated by whatever was
+       already translating for the hub, further up. */
+    if (speed == SPEED_LOW || speed == SPEED_FULL) {
+        if (device->speed == SPEED_HIGH) {
+            tt_slot = device->slot;
+            tt_port = port;
+        } else {
+            tt_slot = device->tt_slot;
+            tt_port = device->tt_port;
+        }
+    } else {
+        tt_slot = 0;
+        tt_port = 0;
+    }
+
+    log_controller(self);
+    log("hub port ");
+    log_dec(port);
+    log(" has a device, speed ");
+    log_dec(speed);
+    log("\n");
+    (void)attach_at(self, device->port, route, device->tier + 1, speed,
+                    tt_slot, tt_port);
+}
+
+/* Claim a hub: learn its shape, tell the controller about it, switch its ports
+   on, and enumerate whatever is already there. */
+static int configure_hub(USB_DEVICE* device, const boot_uint8_t* configuration,
+                         boot_uint32_t length) {
+    XHCI_CONTROLLER* self = device->controller;
+    boot_uint8_t descriptor[16];
+    boot_uint8_t* input;
+    boot_uint32_t offset = 0;
+    boot_uint32_t settle;
+    USB_HUB* hub;
+    int found = 0;
+
+    while (offset + 2 <= length) {
+        boot_uint8_t size = configuration[offset];
+
+        if (!size || offset + size > length) break;
+        if (configuration[offset + 1] == USB_DESCRIPTOR_INTERFACE && size >= 9 &&
+            configuration[offset + 5] == USB_CLASS_HUB)
+            found = 1;
+        offset += size;
+    }
+    if (!found) return 0;
+
+    hub = (USB_HUB*)0;
+    for (boot_uint32_t index = 0; index < HUB_MAX; index++)
+        if (!hubs[index].used) {
+            hub = &hubs[index];
+            if (index >= hub_count) hub_count = index + 1;
+            break;
+        }
+    if (!hub) {
+        log_controller(self);
+        log("no room for another hub\n");
+        return 0;
+    }
+
+    if (control_in(device, 0x00, USB_SET_CONFIGURATION, configuration[5],
+                   0, (void*)0, 0) < 0) {
+        log_controller(self);
+        log("the hub would not take its configuration\n");
+        return 0;
+    }
+
+    /* Both descriptor types put the port count at byte 2 and the power-on
+       settling time at byte 5, so the only thing the version changes is which
+       one the hub will admit to having. */
+    memset(descriptor, 0, sizeof(descriptor));
+    if (control_in(device, 0xA0, USB_GET_DESCRIPTOR,
+                   (boot_uint16_t)(device->speed == SPEED_SUPER
+                                       ? (HUB_DESCRIPTOR_SUPER << 8)
+                                       : (HUB_DESCRIPTOR << 8)),
+                   0, descriptor, sizeof(descriptor)) < 6) {
+        log_controller(self);
+        log("the hub would not describe itself\n");
+        return 0;
+    }
+
+    device->is_hub = 1;
+    device->hub_ports = descriptor[2];
+    if (!device->hub_ports || device->hub_ports > 15) {
+        log_controller(self);
+        log("a hub claiming ");
+        log_dec(descriptor[2]);
+        log(" ports, which cannot be right\n");
+        device->is_hub = 0;
+        return 0;
+    }
+
+    /* The controller has to know it is a hub before anything behind it can be
+       addressed: it schedules differently for a device with devices under it,
+       and the port count is how it sizes that. Configure Endpoint with only
+       the slot flag set updates the slot context and touches nothing else. */
+    input = (boot_uint8_t*)alloc_page();
+    if (!input) {
+        log_controller(self);
+        log("out of memory claiming a hub\n");
+        return 0;
+    }
+    memset(input, 0, PAGE_SIZE);
+    ((boot_uint32_t*)input)[1] = 1u;
+    describe_slot(self, input, device, 1);
+    if (!run_command(self, "configure hub",
+                     (boot_uint64_t)(unsigned long long)input,
+                     (TRB_CONFIGURE_ENDPOINT << TRB_TYPE_SHIFT) |
+                     (device->slot << 24))) {
+        free_page(input);
+        return 0;
+    }
+    free_page(input);
+
+    hub->device = device;
+    hub->ports = device->hub_ports;
+    hub->occupied = 0;
+    hub->used = 1;
+
+    log_controller(self);
+    log("hub with ");
+    log_dec(hub->ports);
+    log(" port(s) at tier ");
+    log_dec(device->tier + 1);
+    log("\n");
+
+    /* Switch the ports on. A bus-powered hub may have them off at reset, and
+       a port with no power looks exactly like a port with nothing in it. The
+       descriptor says how long to wait afterwards, in two-millisecond units;
+       the floor is because some hubs report an optimistic zero. */
+    for (boot_uint32_t port = 1; port <= hub->ports; port++)
+        (void)hub_port_feature(device, HUB_SET_FEATURE, PORT_POWER, port);
+    settle = (boot_uint32_t)descriptor[5] * 2;
+    timer_wait(settle < 100 ? 100 : settle);
+
+    {
+        boot_uint32_t occupied = 0;
+        boot_uint32_t unanswered = 0;
+
+        for (boot_uint32_t port = 1; port <= hub->ports; port++) {
+            boot_uint16_t status = 0;
+            boot_uint16_t change = 0;
+
+            if (!hub_port_status(device, port, &status, &change)) {
+                unanswered++;
+                continue;
+            }
+            if (change & 1) (void)hub_port_feature(device, HUB_CLEAR_FEATURE,
+                                                   C_PORT_CONNECTION, port);
+            if (!(status & PORT_STATUS_CONNECTED)) continue;
+            occupied++;
+            hub->occupied |= 1u << port;
+            hub_attach(hub, port);
+        }
+
+        /* Said out loud even when it is nothing, because "the hub has nothing
+           in it" and "the hub would not answer" are the same silence
+           otherwise - and they are completely different problems. */
+        log_controller(self);
+        log("hub ports: ");
+        log_dec(occupied);
+        log(" in use");
+        if (unanswered) {
+            log(", ");
+            log_dec(unanswered);
+            log(" would not say");
+        }
+        log("\n");
+    }
+    return 1;
+}
+
+/* One pass over every hub's ports, for things plugged in or pulled out since
+   the last look. The same job survey_ports does for the root hub, and it has
+   to be a poll for the same reason: no interrupt from any of this is wired to
+   anything yet. */
+static void service_hubs(void) {
+    for (boot_uint32_t index = 0; index < hub_count; index++) {
+        USB_HUB* hub = &hubs[index];
+        USB_DEVICE* device;
+
+        if (!hub->used || !hub->device || !hub->device->used) continue;
+        device = hub->device;
+
+        for (boot_uint32_t port = 1; port <= hub->ports; port++) {
+            boot_uint16_t status = 0;
+            boot_uint16_t change = 0;
+            boot_uint32_t bit = 1u << port;
+            int here;
+
+            if (!hub_port_status(device, port, &status, &change)) {
+                /* A hub that stops answering has been unplugged, or is on its
+                   way to it. Asking the other ports will not go better, and
+                   the root-port scan will notice the unplug soon enough. */
+                break;
+            }
+            if (change & 1)
+                (void)hub_port_feature(device, HUB_CLEAR_FEATURE,
+                                       C_PORT_CONNECTION, port);
+            here = (status & PORT_STATUS_CONNECTED) != 0;
+            if (here == ((hub->occupied & bit) != 0)) continue;
+
+            if (here) {
+                hub->occupied |= bit;
+                hub_attach(hub, port);
+            } else {
+                hub->occupied &= ~bit;
+                log_controller(device->controller);
+                log("hub port ");
+                log_dec(port);
+                log(" was unplugged\n");
+                forget_below(device->controller,
+                             device->route |
+                                 ((port & 0xF) << (4 * device->tier)),
+                             device->tier + 1);
+            }
+        }
+    }
+}
 
 /* ---- Bringing devices up ------------------------------------------------ */
 
-/* Enumerate whatever is plugged into one port and hand it to a class driver.
-   A device nobody claims is left addressed and idle rather than torn down:
-   it costs one slot, and saying what it was is more useful than silence. */
-static void attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
+/* Somewhere to put one.
+ *
+ * The list used to only grow, because a device only ever arrived. Plugging and
+ * unplugging the same stick thirty-two times would then fill it with entries
+ * for devices that are not there - which nothing would notice until the
+ * thirty-third, and then it would look like a limit rather than a leak. A
+ * released entry is reused. */
+static USB_DEVICE* free_device(XHCI_CONTROLLER* self) {
+    for (boot_uint32_t index = 0; index < USB_MAX_DEVICES; index++)
+        if (!self->devices[index].used) return &self->devices[index];
+    return (USB_DEVICE*)0;
+}
+
+/* Enumerate a device wherever it is, and hand it to a class driver.
+ *
+ * "Wherever it is" is the part that changed: a device used to be a root port
+ * number and nothing else, because a root port was the only place one could
+ * be. Behind a hub it is a root port plus a route through the hubs to reach
+ * it, and possibly a hub translating for it. All of that arrives here from
+ * whoever found the device - the root port scan or a hub - because only they
+ * know it.
+ *
+ * A device nobody claims is left addressed and idle rather than torn down: it
+ * costs one slot, and saying what it was is more useful than silence.
+ *
+ * Returns the device, so a hub can be told about the one it just found. */
+static USB_DEVICE* attach_at(XHCI_CONTROLLER* self, boot_uint32_t root_port,
+                             boot_uint32_t route, boot_uint32_t tier,
+                             boot_uint32_t speed, boot_uint32_t tt_slot,
+                             boot_uint32_t tt_port) {
     USB_DEVICE* device;
     boot_uint8_t* configuration;
     boot_uint32_t length;
-    boot_uint32_t status;
 
-    /* Every one of these used to return without a word, which is how a laptop
-       comes to pause for half a second on a port and then say nothing at all
-       about what it found there. */
-    if (self->device_count >= USB_MAX_DEVICES) {
+    device = free_device(self);
+    if (!device) {
         log_controller(self);
         log("no room left for another device\n");
-        return;
+        return (USB_DEVICE*)0;
     }
-    if (!reset_port(self, port)) {
-        log_controller(self);
-        log("port ");
-        log_dec(port + 1);
-        log(" would not reset\n");
-        return;
-    }
-
-    device = &self->devices[self->device_count];
     memset(device, 0, sizeof(*device));
-    status = op_read32(self, OP_PORTSC(port));
     device->controller = self;
-    device->port = port;
-    device->speed = (status >> PORTSC_SPEED_SHIFT) & PORTSC_SPEED_MASK;
+    device->port = root_port;
+    device->route = route;
+    device->tier = tier;
+    device->tt_slot = tt_slot;
+    device->tt_port = tt_port;
+    device->speed = speed;
 
     /* Zero is not a speed.
      *
@@ -2843,31 +3443,38 @@ static void attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
     if (!device->speed) {
         log_controller(self);
         log("port ");
-        log_dec(port + 1);
-        log(" reports no speed at all (portsc ");
-        log_hex(status);
-        log("), assuming full speed\n");
+        log_dec(root_port + 1);
+        log(" reports no speed at all, assuming full speed\n");
         device->speed = SPEED_FULL;
     }
     device->slot = enable_slot(self);
-    if (!device->slot) return;      /* enable_slot says why itself */
+    if (!device->slot) return (USB_DEVICE*)0;   /* enable_slot says why */
 
+    /* Every failure from here gives the slot back.
+     *
+     * They did not, and the log of a machine with a flaky socket shows it: the
+     * slot number climbing by one on every attempt, because each abandoned
+     * enumeration kept the slot the controller had handed out. A controller
+     * with thirty-two of them survives that for a while and not forever. */
     if (!address_device(device)) {
         log_controller(self);
         log("the device would not take an address\n");
-        return;
+        disable_slot(self, device->slot);
+        return (USB_DEVICE*)0;
     }
     if (!identify_device(device)) {
         log_controller(self);
         log("the device would not describe itself\n");
-        return;
+        disable_slot(self, device->slot);
+        return (USB_DEVICE*)0;
     }
 
     configuration = (boot_uint8_t*)alloc_page();
     if (!configuration) {
         log_controller(self);
         log("out of memory enumerating a device\n");
-        return;
+        disable_slot(self, device->slot);
+        return (USB_DEVICE*)0;
     }
     memset(configuration, 0, PAGE_SIZE);
     length = read_configuration(device, configuration);
@@ -2875,13 +3482,16 @@ static void attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
         log_controller(self);
         log("could not read the configuration descriptor\n");
         free_page(configuration);
-        return;
+        disable_slot(self, device->slot);
+        return (USB_DEVICE*)0;
     }
 
     device->used = 1;
-    self->device_count++;
+    if (device - self->devices >= (long)self->device_count)
+        self->device_count = (boot_uint32_t)(device - self->devices) + 1;
 
-    if (!configure_keyboard(device, configuration, length) &&
+    if (!configure_hub(device, configuration, length) &&
+        !configure_keyboard(device, configuration, length) &&
         !configure_storage(device, configuration, length) &&
         !configure_network(device, configuration, length)) {
         log_controller(self);
@@ -2889,6 +3499,49 @@ static void attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
     }
 
     free_page(configuration);
+    return device;
+}
+
+/* Everything above, for something plugged straight into the machine.
+   Returns whether a device came up, so a port that keeps failing can be
+   noticed as such rather than retried forever. */
+static int attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
+    boot_uint32_t status;
+
+    /* Three goes at it, each starting from a fresh port reset.
+     *
+     * Address Device failing once is not a broken device. A phone with a tired
+     * socket, a stick that has not finished powering up, a cable moved while
+     * the reset was in flight - all of them fail here and all of them work on
+     * the next attempt. Without a retry the device is present, connected, and
+     * gone until it is physically unplugged, because the port stays connected
+     * and nothing ever asks it again. That is what "address device failed" and
+     * then silence looked like on a real machine. */
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (attempt) {
+            log_controller(self);
+            log("port ");
+            log_dec(port + 1);
+            log(": trying again\n");
+            timer_wait(100);
+        }
+        if (!reset_port(self, port)) {
+            log_controller(self);
+            log("port ");
+            log_dec(port + 1);
+            log(" would not reset\n");
+            continue;
+        }
+        status = op_read32(self, OP_PORTSC(port));
+        if (attach_at(self, port, 0, 0,
+                      (status >> PORTSC_SPEED_SHIFT) & PORTSC_SPEED_MASK,
+                      0, 0))
+            return 1;
+        /* Anything still connected is worth another go; anything that has been
+           pulled out in the meantime is not. */
+        if (!(op_read32(self, OP_PORTSC(port)) & PORTSC_CONNECTED)) break;
+    }
+    return 0;
 }
 
 /* Something was unplugged. Let go of it before anything tries to talk to it.
@@ -2897,6 +3550,60 @@ static void attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
  * values, so nothing notices on its own: a transfer posted to a dead slot
  * simply never completes, and the caller waits out its timeout for as long as
  * the machine is on. */
+/* Let go of one device: tell every class driver that has a piece of it, then
+   hand the slot back. Split out of the root-port path because a hub can lose a
+   device too, and forgetting half of it in one of the two places is a driver
+   that talks to hardware that is not there any more. */
+static void release_device(XHCI_CONTROLLER* self, USB_DEVICE* device) {
+    for (boot_uint32_t index = 0; index < storage_count; index++) {
+        USB_STORAGE* gone = &storages[index];
+
+        if (!gone->used || gone->device != device) continue;
+        block_forget(gone->name);
+        block_changed();
+        gone->used = 0;
+        gone->ready = 0;
+        gone->device = (USB_DEVICE*)0;
+        /* The "current" pointer must not be left aimed at a stick that has
+           gone: the next block transfer sets it, but nothing else does. */
+        if (storage == gone) storage = (USB_STORAGE*)0;
+    }
+    if (device == network_device) {
+        network_ready = 0;
+        network_device = (USB_DEVICE*)0;
+    }
+    for (boot_uint32_t slot = 0; slot < keyboard_count; slot++)
+        if (keyboards[slot].used && keyboards[slot].device == device)
+            keyboards[slot].used = 0;
+    for (boot_uint32_t index = 0; index < hub_count; index++)
+        if (hubs[index].used && hubs[index].device == device)
+            hubs[index].used = 0;
+
+    disable_slot(self, device->slot);
+    device->used = 0;
+    device->slot = 0;
+}
+
+/* Everything at a route, and everything below it.
+ *
+ * A hub that loses a port loses whatever was on it - and if that was another
+ * hub, everything under that too. They are found by prefix: a device below
+ * this one has the same route in the nibbles up to this tier, whatever it has
+ * beyond them. */
+static void forget_below(XHCI_CONTROLLER* self, boot_uint32_t route,
+                         boot_uint32_t tier) {
+    boot_uint32_t mask = tier >= 5 ? 0xFFFFF : ((1u << (4 * tier)) - 1);
+
+    for (boot_uint32_t index = 0; index < self->device_count; index++) {
+        USB_DEVICE* device = &self->devices[index];
+
+        if (!device->used) continue;
+        if (device->tier < tier) continue;
+        if ((device->route & mask) != (route & mask)) continue;
+        release_device(self, device);
+    }
+}
+
 static void detach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
     for (boot_uint32_t index = 0; index < self->device_count; index++) {
         USB_DEVICE* device = &self->devices[index];
@@ -2907,19 +3614,7 @@ static void detach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
         log("port ");
         log_dec(port + 1);
         log(" was unplugged\n");
-
-        if (device == storage_device) {
-            storage_ready = 0;
-            storage_device = (USB_DEVICE*)0;
-            block_forget("usb0");
-        }
-        for (boot_uint32_t slot = 0; slot < keyboard_count; slot++)
-            if (keyboards[slot].used && keyboards[slot].device == device)
-                keyboards[slot].used = 0;
-
-        disable_slot(self, device->slot);
-        device->used = 0;
-        device->slot = 0;
+        release_device(self, device);
     }
 }
 
@@ -2950,14 +3645,27 @@ void xhci_service(void) {
             self->connected[port] = now;
 
             if (now) {
+                if (self->refusals[port] >= PORT_REFUSAL_LIMIT) continue;
                 log_controller(self);
                 log("port ");
                 log_dec(port + 1);
                 log(" has a new device, speed ");
                 log_dec((status >> PORTSC_SPEED_SHIFT) & PORTSC_SPEED_MASK);
                 log("\n");
-                attach_device(self, port);
+                if (attach_device(self, port)) {
+                    self->refusals[port] = 0;
+                } else if (++self->refusals[port] >= PORT_REFUSAL_LIMIT) {
+                    log_controller(self);
+                    log("port ");
+                    log_dec(port + 1);
+                    log(" has failed ");
+                    log_dec(PORT_REFUSAL_LIMIT);
+                    log(" times running; leaving it alone until it is quiet\n");
+                }
             } else {
+                /* Gone is as good as fixed: whatever was wrong with it, a
+                   different device deserves a clean start. */
+                self->refusals[port] = 0;
                 detach_device(self, port);
             }
             self->connected_ports = 0;
@@ -2965,6 +3673,10 @@ void xhci_service(void) {
                 self->connected_ports += self->connected[other];
         }
     }
+
+    /* And the same question of everything hanging off a hub, which has no
+       register to read and has to be asked. */
+    service_hubs();
 }
 
 static void survey_ports(XHCI_CONTROLLER* self) {
@@ -2980,7 +3692,7 @@ static void survey_ports(XHCI_CONTROLLER* self) {
         log(" has a device, speed ");
         log_dec((status >> PORTSC_SPEED_SHIFT) & PORTSC_SPEED_MASK);
         log("\n");
-        attach_device(self, port);
+        (void)attach_device(self, port);
     }
 }
 
@@ -3065,6 +3777,20 @@ int xhci_init(const PCI_DEVICE* controller) {
 
 boot_uint32_t xhci_controller_count(void) {
     return controller_count;
+}
+
+/* Every device the controllers have taken, wherever it is. The port count
+   answers a different question now that hubs exist: seven things plugged into
+   a machine can occupy one root port. */
+boot_uint32_t xhci_device_count(void) {
+    boot_uint32_t total = 0;
+
+    for (boot_uint32_t index = 0; index < controller_count; index++) {
+        XHCI_CONTROLLER* self = &controllers[index];
+        for (boot_uint32_t slot = 0; slot < self->device_count; slot++)
+            if (self->devices[slot].used) total++;
+    }
+    return total;
 }
 
 boot_uint32_t xhci_port_count(void) {

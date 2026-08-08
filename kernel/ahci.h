@@ -3,16 +3,20 @@
 
 #include "pci.h"
 
-/* Bring up the first ATA disk on the controller and register it with the
-   block layer. Returns 1 on success. */
+/* Bring up every ATA disk on one controller and register each with the block
+   layer. Returns how many were taken.
+ *
+ * Plural on both counts, and it was singular on both: one controller, and the
+ * first port on it with a disk. A desktop board has six ports and people fill
+ * them, and a machine whose system disk happened to be wired to the second
+ * socket looked to this driver like a machine with one disk that was not
+ * bootable. */
 int ahci_init(const PCI_DEVICE* controller);
 
-/* Direct access to the configured port. The block layer wraps these; call
-   those instead unless you are the wrapper. */
-int disk_read(boot_uint64_t lba, boot_uint16_t count, void* buffer);
-int disk_write(boot_uint64_t lba, boot_uint16_t count, const void* buffer);
+/* How many disks have been taken across every controller. */
+boot_uint32_t ahci_disk_count(void);
 
-/* Sector count reported by IDENTIFY DEVICE, or 0 if it could not be read. */
-boot_uint64_t ahci_sector_count(void);
+/* Sector count of one of them, as IDENTIFY DEVICE reported it, or 0. */
+boot_uint64_t ahci_sector_count(boot_uint32_t index);
 
 #endif
