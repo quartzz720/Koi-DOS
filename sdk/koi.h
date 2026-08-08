@@ -195,6 +195,16 @@ static inline long koi_mkdir(const char* path) {
     return koi_call(SYS_MKDIR, (long)path, 0, 0);
 }
 
+/* Change which drive this program's paths mean.
+ *
+ * Affects this program only - the shell stays where it was, so exiting cannot
+ * move the user's feet. The working directory returns to the root, because the
+ * one it was in belonged to a different drive. Returns 1, or -1 when there is
+ * no such drive. */
+static inline int koi_setdrive(int letter) {
+    return (int)koi_call(SYS_SETDRIVE, (long)letter, 0, 0);
+}
+
 static inline int koi_exists(const char* path) {
     return (int)koi_call(SYS_EXISTS, (long)path, 0, 0);
 }

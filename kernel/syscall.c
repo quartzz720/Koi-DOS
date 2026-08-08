@@ -698,6 +698,25 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
     case SYS_CHAIN:
         return program_chain((const char*)a) ? 1 : 0;
 
+    case SYS_SETDRIVE: {
+        int letter = (int)a;
+
+        if (letter >= 'a' && letter <= 'z') letter -= 'a' - 'A';
+        for (boot_uint32_t index = 0; index < volume_count(); index++) {
+            VOLUME* volume = volume_at(index);
+
+            if (!volume || (int)volume->letter != letter) continue;
+            working_volume = volume;
+            /* Back to the root. The directory it was standing in belonged to
+               the drive it has just left, and a path that happens to exist on
+               both drives is worse than one that exists on neither. */
+            working_path[0] = '\\';
+            working_path[1] = 0;
+            return 1;
+        }
+        return SYSCALL_ERROR;
+    }
+
     default:
         return SYSCALL_ERROR;
     }

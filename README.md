@@ -211,6 +211,14 @@ itself as arguments.
 
 0.1 does not copy, move, delete or rename, and both panels show the same drive. Those are 0.2.
 
+**Why the source is in this repository when the program is not part of the system.** Mizu is
+currently the only thing that calls `SYS_MOUSE`, `SYS_CHAIN` and `SYS_SETDRIVE`, and all three
+were added because Mizu needed them. While an interface is still moving, its only consumer has to
+be built by the same `make` — otherwise a break is found by a user rather than by the compiler.
+DOSFETCH, Games and K-DOOM live outside this tree for the opposite reason: they test that a
+*settled* SDK still works. Mizu moves out to its own repository when the interface stops moving,
+and joins them.
+
 Three more proofs live outside this repository on purpose, each built with nothing but the SDK:
 **[DOSFETCH](https://github.com/quartzz720/DOSFETCH)**, a system summary in the spirit of
 neofetch; **[Games](https://github.com/quartzz720/Games)**, six of them in one program with a

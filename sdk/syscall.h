@@ -188,6 +188,20 @@ typedef struct {
    is standing. A package manager that cannot create a directory cannot do
    that. */
 #define SYS_MKDIR 0x1C       /* (path) -> 0, or -1 */
+/* Change which drive this program's paths are resolved against.
+ *
+ * A program starts on the drive the shell was standing on and, before this,
+ * could never leave it. Which is fine for a program given a filename and fatal
+ * for a file manager: the only way to reach another drive was to ask the shell
+ * to change drive and restart - and a program that does that is asking to be
+ * restarted from a drive it is no longer on. Mizu did exactly that, changed to
+ * the USB stick, and could not find itself.
+ *
+ * Affects this program only. The shell stays where it was, and the next program
+ * to run starts where the user is standing, so a program cannot move the user's
+ * feet by exiting. The working directory returns to the root, because the one
+ * it was in belonged to a different drive. */
+#define SYS_SETDRIVE 0x1D    /* (drive letter) -> 1, or -1 when there is none */
 
 /* Directory enumeration. Without these a program cannot write its own `dir`,
    which makes the shell's built-in the only way to see a directory. */

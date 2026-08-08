@@ -79,6 +79,27 @@ static PANEL panels[2];
 static int active;
 static int running = 1;
 
+/* Two drive letters, and the difference between them is the whole of a bug
+ * that only appears with a USB stick plugged in.
+ *
+ * `home` is the drive Mizu itself was loaded from. `browse` is the drive being
+ * looked at, which koi_setdrive moves without restarting anything. They are
+ * usually the same and must not be assumed to be: a program started from the
+ * panel is reached by a path on `browse`, and Mizu is reached by a path on
+ * `home`, and running one command line on the wrong drive finds nothing. */
+static int home_letter;
+static int browse_letter;
+
+/* Which drive this program's paths currently mean. */
+static int drive_now(void) {
+    long count = koi_sysinfo(KOI_INFO_VOLUME_COUNT, 0);
+
+    for (long index = 0; index < count; index++)
+        if (koi_sysinfo(KOI_INFO_VOLUME_IS_CURRENT, index) == 1)
+            return (int)koi_sysinfo(KOI_INFO_VOLUME_LETTER, index);
+    return 0;
+}
+
 /* ---- The pointer --------------------------------------------------------
  *
  * Drawn by hand, over whatever is underneath, with the pixels it covers kept so
@@ -333,7 +354,11 @@ static void draw_panel(PANEL* panel, int is_active) {
        right place: it belongs to the panel and not to the screen. */
     koi_gfx_fill(panel->x + FRAME, panel->y + FRAME, panel->w - 2 * FRAME,
                  CHAR_H + 4, border);
-    koi_snprintf(line, sizeof(line), " %s ", panel->path);
+    /* With the drive letter, because a file manager that can change drive and
+       does not say which one it is on is showing you a directory listing with
+       the most important word missing. */
+    koi_snprintf(line, sizeof(line), " %c:%s ", (char)browse_letter,
+                 panel->path);
     text_at(panel->x + MARGIN, panel->y + FRAME + 2, line,
             is_active ? c_select_text : c_text);
 
@@ -598,21 +623,46 @@ static void own_command(char* out, koi_uint64 size) {
 
     if (koi_systext(KOI_TEXT_PROGRAM_PATH, 0, self, sizeof(self)) <= 0)
         strcpy(self, "\\MIZU\\MIZU.EXE");
-    koi_snprintf(out, size, "%s %s %s %d %d %d", self, panels[0].path,
+    koi_snprintf(out, size, "%s %s %s %d %d %d %c", self, panels[0].path,
                  panels[1].path, active, panels[0].selected,
-                 panels[1].selected);
+                 panels[1].selected, (char)browse_letter);
 }
 
 /* Run a program: ask for it, ask for this shell after it, and leave.
  *
  * The order looks backwards and is not. Requests are honoured most recent
- * first, so the one asked for last is the one that runs first. */
+ * first, so the one asked for last is the one that runs first.
+ *
+ * The drive changes are the part that is easy to leave out and impossible to
+ * notice missing until somebody plugs in a USB stick. koi_setdrive moves where
+ * THIS program's paths point; it does not move the shell, and the shell is what
+ * runs both of these command lines. So the program is reached on the drive
+ * being browsed, and Mizu is reached on the drive Mizu lives on, and when those
+ * differ the shell has to be walked from one to the other and back.
+ *
+ * Reading downwards, the requests run upwards:
+ *
+ *     browse:      change the shell to the drive being looked at
+ *     the program  which is on that drive
+ *     home:        change back to where Mizu lives
+ *     MIZU ...     which is on that one
+ */
 static void run_entry(const char* path) {
     char resume[PATH_MAX * 3];
+    char drive[8];
+    int elsewhere = browse_letter != home_letter;
 
     own_command(resume, sizeof(resume));
     koi_chain(resume);
+    if (elsewhere) {
+        koi_snprintf(drive, sizeof(drive), "%c:", (char)home_letter);
+        koi_chain(drive);
+    }
     koi_chain(path);
+    if (elsewhere) {
+        koi_snprintf(drive, sizeof(drive), "%c:", (char)browse_letter);
+        koi_chain(drive);
+    }
     cursor_hide();
     koi_gfx_leave();
     koi_exit(0);
@@ -656,40 +706,42 @@ static void open_selected(void) {
     }
 }
 
-/* Change drive, by going through the shell.
+/* Change drive.
  *
- * A program's paths are resolved against the drive the shell was standing on,
- * and there is no call to change that - so this asks for the drive change and
- * for itself, and comes back on the other drive. It is visibly a restart, which
- * is the honest way to show something that is one. */
+ * This used to ask the shell to change drive and then restart Mizu - and a
+ * program that does that is asking to be restarted from a drive it has just
+ * left. It changed to the USB stick and could not find itself:
+ *
+ *     Bad command or file name: \MIZU\mizu.EXE \ \ 1 0 0
+ *
+ * Perfectly correct behaviour from the shell, and an impossible request. Now
+ * koi_setdrive moves where this program's paths point, without restarting
+ * anything and without moving the shell, so nothing has to be found twice. */
 static void change_drive(void) {
     long count = koi_sysinfo(KOI_INFO_VOLUME_COUNT, 0);
     long here = -1;
-    long next;
-    char command[8];
-    char resume[PATH_MAX * 3];
-    char self[PATH_MAX];
+    int letter;
 
     if (count < 2) return;
     for (long index = 0; index < count; index++)
-        if (koi_sysinfo(KOI_INFO_VOLUME_IS_CURRENT, index) == 1) here = index;
+        if (koi_sysinfo(KOI_INFO_VOLUME_LETTER, index) == browse_letter)
+            here = index;
     if (here < 0) return;
 
-    next = (here + 1) % count;
-    koi_snprintf(command, sizeof(command), "%c:",
-                 (char)koi_sysinfo(KOI_INFO_VOLUME_LETTER, next));
+    letter = (int)koi_sysinfo(KOI_INFO_VOLUME_LETTER, (here + 1) % count);
+    if (letter <= 0 || koi_setdrive(letter) != 1) return;
+    browse_letter = letter;
 
-    /* Both panels start at the root again: the paths that were showing belong
-       to a drive this is about to stop standing on. */
-    if (koi_systext(KOI_TEXT_PROGRAM_PATH, 0, self, sizeof(self)) <= 0)
-        strcpy(self, "\\MIZU\\MIZU.EXE");
-    koi_snprintf(resume, sizeof(resume), "%s \\ \\ %d 0 0", self, active);
-
-    koi_chain(resume);
-    koi_chain(command);
-    cursor_hide();
-    koi_gfx_leave();
-    koi_exit(0);
+    /* Both panels go back to the root: the paths that were showing belonged to
+       a drive this is no longer on, and a path that happens to exist on both is
+       worse than one that exists on neither. */
+    for (int index = 0; index < 2; index++) {
+        strcpy(panels[index].path, "\\");
+        panels[index].selected = 0;
+        panels[index].top = 0;
+        read_directory(&panels[index]);
+    }
+    draw_all();
 }
 
 /* ---- Input --------------------------------------------------------------- */
@@ -770,12 +822,16 @@ int main(void) {
        these arguments. */
     strcpy(panels[0].path, "\\");
     strcpy(panels[1].path, "\\");
+    /* The drive Mizu itself came from, before anything moves. Every later
+       command line aimed at Mizu has to be run on this one. */
+    home_letter = drive_now();
+    browse_letter = home_letter;
     {
         const char* arguments = koi_arguments();
         char word[PATH_MAX];
         int field = 0;
 
-        while (*arguments && field < 5) {
+        while (*arguments && field < 6) {
             int length = 0;
             while (*arguments == ' ') arguments++;
             if (!*arguments) break;
@@ -788,6 +844,21 @@ int main(void) {
             else if (field == 2) active = atoi(word) ? 1 : 0;
             else if (field == 3) panels[0].selected = atoi(word);
             else if (field == 4) panels[1].selected = atoi(word);
+            else if (field == 5) {
+                /* Back to the drive that was being looked at. If it has gone -
+                   the stick was pulled out while a program was running - stay
+                   on this one rather than showing an empty screen for a volume
+                   that is not there. */
+                int letter = toupper((unsigned char)word[0]);
+                if (letter && letter != browse_letter &&
+                    koi_setdrive(letter) == 1) {
+                    browse_letter = letter;
+                } else if (letter && letter != browse_letter) {
+                    strcpy(panels[0].path, "\\");
+                    strcpy(panels[1].path, "\\");
+                    panels[0].selected = panels[1].selected = 0;
+                }
+            }
             field++;
         }
     }

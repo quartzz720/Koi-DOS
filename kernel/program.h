@@ -77,7 +77,11 @@ __attribute__((noreturn)) void program_exit(int code);
  * This is not novel. Small DOS shells did exactly this, for exactly this
  * reason: exit, let the program have the memory, and reload afterwards.
  */
-#define PROGRAM_CHAIN_DEPTH 4
+/* Four is the shape of the longest request a shell actually makes - change
+   drive, run the program, change back, restart the shell - so the limit is
+   eight, because a limit that exactly equals the known case leaves no room for
+   the next one and fails by silently dropping a request. */
+#define PROGRAM_CHAIN_DEPTH 8
 #define PROGRAM_CHAIN_MAX 256
 
 /* Ask for `command` to be run once the current program has exited. It is a
