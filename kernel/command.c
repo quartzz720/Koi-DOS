@@ -293,6 +293,21 @@ static void path_up(void) {
 static void build_program_path(const char* name, char* result, int place) {
     boot_uint64_t length;
 
+    /* A name that starts at the root is already a path, and searching for it
+       three times over would produce `\BIN\\MIZU\MIZU.EXE`. This is how an
+       installed package is run: dosget gives every package a directory of its
+       own rather than emptying it into \BIN, so `\MIZU\MIZU` is the ordinary
+       way to start one and has to work from anywhere. */
+    if (name[0] == '\\') {
+        length = 0;
+        while (name[length] && length + 1 < PATH_MAX) {
+            result[length] = name[length];
+            length++;
+        }
+        result[length] = 0;
+        return;
+    }
+
     if (place == PROGRAM_SEARCH_BIN) {
         const char* bin = "\\BIN\\";
         length = 0;
@@ -1147,14 +1162,24 @@ static void remount_everything(void) {
  * this system that is driven by something other than a keyboard. It draws
  * where the pointer is, leaves a trail where the button was held, and says how
  * many packets have arrived - because a device that was found and reports
- * nothing looks exactly like a working one that nobody is touching. */
+ * nothing looks exactly like a working one that nobody is touching.
+ *
+ * The bar down the right-hand side is the wheel, and on a laptop it is two
+ * fingers on the touchpad. It is here for the same reason as the packet count:
+ * a scroll that arrives and a scroll that does not are the same silence. */
 static void command_pointer(void) {
     GRAPHICS_SCREEN screen;
     boot_uint32_t background;
     boot_uint32_t ink;
     boot_uint32_t trail;
+    boot_uint32_t wheel_ink;
     int last_x;
     int last_y;
+    int last_scroll;
+    int started_at;
+    int bar;
+    int last_bar;
+    int bar_x;
 
     if (!mouse_present()) {
         print_line("No pointer. This machine has no PS/2 mouse or touchpad,");
@@ -1169,6 +1194,7 @@ static void command_pointer(void) {
     background = graphics_color(16, 24, 40);
     ink = graphics_color(230, 240, 255);
     trail = graphics_color(80, 160, 220);
+    wheel_ink = graphics_color(240, 200, 90);
     graphics_clear(background);
     /* And shown. Clearing draws into the back buffer, and everything after
        this presents only the small rectangle around the pointer - so without
@@ -1180,11 +1206,34 @@ static void command_pointer(void) {
     last_x = mouse_x();
     last_y = mouse_y();
 
+    started_at = mouse_scroll();
+    last_scroll = started_at;
+    bar = (int)screen.height / 2;
+    last_bar = bar;
+    bar_x = (int)screen.width - 24;
+    graphics_fill(bar_x, bar - 12, 12, 24, wheel_ink);
+    graphics_present_rect(bar_x, 0, 12, (int)screen.height);
+
     for (;;) {
         int x = mouse_x();
         int y = mouse_y();
+        int scroll = mouse_scroll();
 
         if (keyboard_pending() && keyboard_getchar() == 27) break;
+
+        if (scroll != last_scroll) {
+            /* Up on the wheel moves the marker up, which is the only mapping
+               that will not be argued with. */
+            bar -= (scroll - last_scroll) * 16;
+            if (bar < 12) bar = 12;
+            if (bar > (int)screen.height - 12) bar = (int)screen.height - 12;
+            last_scroll = scroll;
+
+            graphics_fill(bar_x, last_bar - 12, 12, 24, background);
+            graphics_fill(bar_x, bar - 12, 12, 24, wheel_ink);
+            graphics_present_rect(bar_x, 0, 12, (int)screen.height);
+            last_bar = bar;
+        }
 
         if (mouse_buttons() & 1) {
             /* Held down: draw. A line rather than a dot, because the pointer
@@ -1216,6 +1265,17 @@ static void command_pointer(void) {
     print(" after ");
     print_dec(mouse_movements());
     print_line(" packet(s).");
+
+    if (!mouse_has_wheel()) {
+        print_line("No wheel: this device answered the IntelliMouse sequence as");
+        print_line("a plain three-button mouse, so there is no scrolling to have.");
+    } else {
+        int turned = mouse_scroll() - started_at;
+        print("Wheel ");
+        print_dec((boot_uint64_t)(turned < 0 ? -turned : turned));
+        print(" notch(es) ");
+        print_line(turned > 0 ? "up." : (turned < 0 ? "down." : "- not turned."));
+    }
 }
 
 /* ---- dosget --------------------------------------------------------------
@@ -3496,6 +3556,29 @@ static void execute(const char* input) {
     console_use_theme();
 }
 
+/* Run whatever the last program asked to have run after it.
+ *
+ * A loop rather than recursion, and that is the whole reason this is a separate
+ * function called from the top level. A graphical shell that runs a program and
+ * asks to be brought back afterwards does that on every launch, all session; if
+ * each hop were a nested call the kernel stack would grow with every program
+ * the user started and the machine would fall over after a long enough evening.
+ * Here each one finishes completely before the next is taken.
+ *
+ * There is no limit on the hops. A program that chains itself and exits loops
+ * forever - but so does a program with an empty `for(;;)` in it, and the cure
+ * for both is the same one. */
+static void run_chained(void) {
+    static char line[INPUT_MAX];
+
+    while (program_chain_take(line, sizeof(line))) {
+        serial_write("CHAIN: ");
+        serial_write(line);
+        serial_write("\n");
+        if (line[0]) execute(line);
+    }
+}
+
 /* Put the boot log on the disk without anybody asking.
  *
  * A machine with no working keyboard cannot be asked to save its own log,
@@ -3537,6 +3620,7 @@ __attribute__((noreturn)) void command_run(void) {
         FAT_ENTRY entry;
         if (fat32_stat(current_volume, "\\AUTOEXEC.BAT", &entry))
             run_batch(current_volume, "\\AUTOEXEC.BAT");
+        run_chained();
     }
 
     /* Refusing to start the loop is the whole point.
@@ -3575,5 +3659,6 @@ __attribute__((noreturn)) void command_run(void) {
         serial_write(input);
         serial_write("\n");
         if (input[0]) execute(input);
+        run_chained();
     }
 }

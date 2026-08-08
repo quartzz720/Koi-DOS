@@ -1,0 +1,193 @@
+Koi-DOS LICENSE-MANIFEST
+Manifest version: 2
+For: KNCL v1.4 (see LICENSE)
+
+This file says which license applies to which material in this
+distribution, and which additional permissions that material carries. It
+is authoritative for the material it lists. It does not change the terms
+of any license; it only says which one applies.
+
+Section 1.5 of KNCL is what gives this file that effect.
+
+
+TWO KINDS OF LIST
+
+The lists below answer two different questions, and the first version of
+this file got into trouble by mixing them.
+
+  A BASE CLASSIFICATION says which license covers a file. Every file has
+  exactly one. Where more than one entry could match, precedence decides.
+
+  An ADDITIONAL PERMISSION says what else may be done with a file. A file
+  may carry any number of these, or none. They add to the base
+  classification and never replace it.
+
+So `include/syscall.h` is KNCL-covered material that is also
+redistributable inside a program and may also be reimplemented. Three
+statements, all true at once, none of them in conflict. Read as a single
+list of exclusive categories they look like a contradiction - which is
+what they were until this was written down properly.
+
+
+PRECEDENCE
+
+Precedence applies to the base classification only, because that is the
+question with exactly one answer. Where more than one base entry could
+match a file:
+
+  1. An [EXCLUDED] entry wins over everything.
+  2. An exact file entry wins over any path or directory entry.
+  3. The longest matching path prefix wins.
+  4. A directory entry.
+
+The same path must never appear twice within the base classifications. If
+it does, that is a bug in this file and not a question to be reasoned
+about.
+
+Material that matches no base entry is NOT covered by KNCL through this
+manifest. Silence is not permission in either direction: unlisted
+material is simply not licensed by this file.
+
+Additional permissions have no precedence, because they do not compete.
+An [EXCLUDED] file carries none of them - there is nothing to grant.
+
+Build outputs are covered as the sources they were built from. A kernel
+image built from kernel/ is covered; a program built from a third party's
+own source is that third party's, whatever it was compiled with.
+
+
+# =====================================================================
+# BASE CLASSIFICATION - exactly one per file
+# =====================================================================
+
+  [KNCL]
+      Covered by the license, including the non-commercial restriction,
+      and subject to the Maintainer's Commercial Licensing Right.
+
+  [KNCL-NONCOMMERCIAL-ONLY]
+      Contributions accepted without the Commercial Licensing Right
+      (Section 10.8). Distributable under KNCL like anything else, but it
+      must be removed or replaced before a commercial release.
+
+  [THIRD-PARTY]
+      Governed by another license, which is named alongside the entry.
+      "Third-party" on its own is not an answer to "may I use this", so
+      an entry without a named license is a bug in this file.
+
+  [EXCLUDED]
+      Not covered by KNCL through this manifest.
+
+
+[KNCL]
+
+boot/bootloader.c
+include/
+kernel/
+programs/
+sdk/
+legacy/
+Makefile
+linker.ld
+qemu.sh
+deploy.sh
+lan.sh
+README.md
+ARCHITECTURE.md
+CONTRIBUTING.md
+LICENSE
+LICENSE-MANIFEST
+
+
+[KNCL-NONCOMMERCIAL-ONLY]
+
+# Empty. No contribution has been accepted under Section 10.8.
+#
+# When one is, its files are listed here individually - never a whole
+# directory - and the release process must be able to build without them.
+
+
+[THIRD-PARTY]
+
+# Empty. There is no third-party material in this distribution.
+#
+# That is a deliberate result rather than an accident. kernel/font.c was
+# drawn for this project specifically because the bitmap fonts shipped
+# with a typical Linux system are GPL, which does not fit this licence.
+#
+# OVMF firmware, the compilers, mtools and QEMU are used to build and run
+# Koi-DOS and are not distributed with it. They keep their own licences
+# and are nothing to do with this file.
+
+
+[EXCLUDED]
+
+build/
+boot/efi/
+*.img
+*.fd
+*.log
+PLAN.md
+.git/
+
+
+# =====================================================================
+# ADDITIONAL PERMISSIONS - any number, layered on the base
+# =====================================================================
+
+  [REDISTRIBUTABLE-SDK]
+      Section 1.9 material. May be compiled into, linked into, and
+      distributed as part of a Program for Koi-DOS, under that program's
+      own license, including a commercial one.
+
+  [INTERFACE-ONLY]
+      Section 1.8 material. Describes an interface rather than an
+      implementation of one. Reimplementing an interface listed here does
+      not make the result a derivative work of Koi-DOS.
+
+
+[REDISTRIBUTABLE-SDK]
+
+# Everything koicc compiles into a program, and nothing else.
+#
+# koicc builds a program from the author's source PLUS start.c and
+# koilib.c, so that code is inside every .EXE ever built for Koi-DOS. If
+# it were not redistributable, no third party could ship a program at
+# all - and the three that already exist outside this repository would
+# each be a violation. Section 6 promises that programs are their
+# authors' own; these entries are what make the promise true.
+#
+# Listed file by file rather than as `sdk/`, because koicc and the SDK's
+# README are tools and documentation. They are KNCL like everything else
+# and do not go inside anybody's program.
+#
+# programs/ holds the originals; `make` copies them into sdk/. The two
+# copies are the same files and carry the same permission.
+
+include/syscall.h
+programs/koi.h
+programs/koilib.c
+programs/start.c
+programs/program.ld
+sdk/syscall.h
+sdk/koi.h
+sdk/koilib.c
+sdk/start.c
+sdk/program.ld
+
+
+[INTERFACE-ONLY]
+
+# The system call ABI. Also redistributable above, and that is two
+# different permissions rather than a contradiction:
+#
+#   REDISTRIBUTABLE-SDK - you may ship this file inside your program;
+#   INTERFACE-ONLY      - you may write your own implementation of this
+#                         interface, and the result is not a derivative
+#                         work of Koi-DOS.
+#
+# The second is what makes an independent Koi-DOS-compatible system
+# possible. Nothing here obliges anyone to use this kernel to honour this
+# ABI.
+
+include/syscall.h
+sdk/syscall.h

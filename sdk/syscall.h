@@ -58,7 +58,16 @@
  * ONCE THE INTERFACE IS FROZEN, FUNCTION NUMBERS ARE NEVER REUSED. A removed
  * call leaves a hole. This is the promise that makes old programs safe, and it
  * costs nothing to keep - there are 256 numbers and twenty are in use. */
-#define KOI_ABI_VERSION 8
+/* 9 adds the pointer (SYS_MOUSE, SYS_MOUSE_PLACE) and takes nothing away.
+ *
+ * The minimum stays at 8 for the first time, which is a decision rather than an
+ * oversight. The rule above exists because a REUSED function number does the
+ * wrong thing silently; 9 reuses none - it only fills two of the holes. And the
+ * cost of moving the minimum is now real: a system update ships the kernel and
+ * nothing else, so raising it would refuse every program already installed on a
+ * machine until each was reinstalled. A rule worth keeping is worth keeping for
+ * its reason, and the reason does not apply here. */
+#define KOI_ABI_VERSION 9
 #define KOI_ABI_MINIMUM 8
 #define KOI_ABI_IS_ALPHA 1
 
@@ -259,6 +268,10 @@ typedef struct {
 #define KOI_INFO_DISK_SECTOR_SIZE 19
 #define KOI_INFO_VOLUME_LETTER 20    /* the drive letter, as a character */
 #define KOI_INFO_VOLUME_IS_BOOT 21
+/* Which volume the program's own paths are resolved against - the drive the
+   shell was standing on. A program can enumerate the drives and could not,
+   before this, tell which one it was on. */
+#define KOI_INFO_VOLUME_IS_CURRENT 24
 /* Whether there is anything to play sound through. A program that makes noise
    has to be able to ask, because every sound call succeeding into silence and
    every one failing look identical from the inside. */
@@ -271,6 +284,15 @@ typedef struct {
 #define KOI_TEXT_DISK_NAME 2         /* index selects the disk */
 #define KOI_TEXT_VOLUME_LABEL 3      /* index selects the volume */
 #define KOI_TEXT_AUDIO_DEVICE 4      /* the codec, or "none" */
+/* The path this program was loaded from, from the root of its drive.
+ *
+ * A program cannot work this out for itself: SYS_ARGS gives it the tail of the
+ * command line and not the name it was invoked by. Which is fine until a
+ * program has to ask for itself to be run again - a shell that chains a program
+ * and wants to come back afterwards - and then guessing its own location is the
+ * difference between working and working only when installed where the guess
+ * happened to be right. */
+#define KOI_TEXT_PROGRAM_PATH 5
 
 /* Graphics.
  *
@@ -345,6 +367,71 @@ typedef struct {
     unsigned int loop;         /* non-zero to repeat until stopped */
     unsigned int reserved;
 } KOI_SOUND;
+
+/* ---- The pointer ---------------------------------------------------------
+ *
+ * One call, filling in a snapshot. Not four calls returning a coordinate each:
+ * the pointer moves between them, and a program that reads x and then y can get
+ * a position the pointer was never at. One structure, filled in one go, is a
+ * place the pointer actually was.
+ *
+ * `scroll` is a running total rather than what has arrived since the last ask.
+ * Taking would mean the first caller to look gets the notches and everyone else
+ * sees a still wheel; a total can be read by any number of callers, each
+ * remembering what it last saw and subtracting.
+ */
+#define SYS_MOUSE 0x50       /* (KOI_POINTER*) -> 1, 0 when there is none, -1 */
+/* Put the pointer somewhere. What a program does on entering graphics mode, so
+   that the pointer starts in the middle of its window rather than wherever it
+   was left by whatever ran last. */
+#define SYS_MOUSE_PLACE 0x51 /* (point) -> 0, or -1 */
+
+/* ---- Running something else ----------------------------------------------
+ *
+ * One program runs at a time, at a fixed address, in one address space - the
+ * whole of the design, and not going to change. So a program cannot call
+ * another program; it asks for one to be run AFTER it has exited, when its own
+ * memory is free and the new program can load into it.
+ *
+ * Requests run most-recent-first, which turns "run this and then bring me back"
+ * into two ordinary calls:
+ *
+ *     koi_chain("MIZU Z:\\GAMES");   asked for first, runs second
+ *     koi_chain("DOOM");             asked for last, runs first
+ *     koi_exit(0);
+ *
+ * The argument is a command line, not a path: it goes back through the shell,
+ * so the search path, drive letters, arguments and batch files behave exactly
+ * as if it had been typed.
+ *
+ * Coming back is a fresh start and not a resume. Nothing of the program
+ * survives, so anything it wants to remember it hands to itself as arguments or
+ * writes to a file first. Small DOS shells did precisely this, for precisely
+ * this reason. */
+#define SYS_CHAIN 0x52       /* (command) -> 1, or 0 when too many are waiting */
+
+#define KOI_BUTTON_LEFT 0x01
+#define KOI_BUTTON_RIGHT 0x02
+#define KOI_BUTTON_MIDDLE 0x04
+#define KOI_BUTTON_SIDE_4 0x10
+#define KOI_BUTTON_SIDE_5 0x20
+
+typedef struct {
+    int x;
+    int y;
+    unsigned int buttons;      /* KOI_BUTTON_*, as they are right now */
+    int scroll;                /* notches since boot, positive upwards */
+    unsigned int movements;    /* packets that have moved it, ever */
+    unsigned int has_wheel;    /* also: whether two-finger scrolling works */
+    /* How many times each has gone down, ever: left, right, middle.
+     *
+     * Use these for clicks, not `buttons`. A click lasts a tenth of a second
+     * at most, and a program that looks thirty times a second will sooner or
+     * later look between the press and the release and see nothing - which
+     * presents as a button that sometimes does not work rather than as a
+     * missed sample. A count cannot be missed. */
+    unsigned int presses[3];
+} KOI_POINTER;
 
 /* Two coordinates in one argument.
  *

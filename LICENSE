@@ -1,55 +1,509 @@
-Koi-DOS Non-Commercial License (KNCL) v1.1
+Koi-DOS Non-Commercial License (KNCL) v1.4
 
 Copyright (c) 2026 Koi Ayame
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software") to:
+IMPORTANT NOTICE
 
-    • use the Software;
-    • study the source code;
-    • modify the Software;
-    • distribute original or modified copies of the Software;
-    • use the Software and its source code for Artificial Intelligence (AI) and
-      Machine Learning (ML) model training, analysis, and research;
+This is a project-specific, source-available, non-commercial license.
 
-provided that:
+It is not an OSI-approved Open Source license. The Software may be used,
+studied, modified, compiled, and redistributed only in accordance with
+this license. Commercial use requires a separate written license from
+the Maintainer.
 
-    1. This copyright notice and this license are included in all copies
-       or substantial portions of the Software.
+CONTRIBUTOR NOTICE. If you contribute material to this project, you keep
+the copyright in what you wrote, and you also grant the Maintainer the
+right to include your contribution in commercially licensed versions of
+Koi-DOS. You are not required to contribute, and this notice is placed
+here rather than in the small print because a term of that kind should be
+read before it applies rather than after. Section 10 states it in full.
 
-    2. Modified versions must clearly state that they have been modified.
+1. DEFINITIONS
 
-    3. The names "Koi-DOS" and "Koi Ayame" may not be used to endorse or
-       promote derived works without prior written permission.
+1.1 "Koi Ayame" means the individual who created and publishes the
+Project.
 
-Commercial use is prohibited.
+1.2 "Maintainer" means Koi Ayame, or any successor expressly designated
+in writing by Koi Ayame or by a previously designated Maintainer.
 
-For the purposes of this license, "commercial use" means use primarily intended
-for commercial advantage or monetary compensation, including but not limited to:
+1.3 "Copyright Holder" means Koi Ayame and any other person or entity
+that owns copyright in material distributed under this license.
 
-    • selling, reselling, or sublicensing the Software or its derivatives;
-    • incorporating substantial portions of the Software into commercial
-      products;
-    • offering paid services or paid support based on the Software;
-    • redistributing the Software under a different name, or repackaged with
-      only superficial changes, in any of the above ways.
+1.4 "Project" means the Koi-DOS project maintained or designated by the
+Maintainer. The Project is not a separate legal person, and references to
+the Project mean the Maintainer acting in relation to it.
 
-Commercial use may be permitted only with prior written permission from the
-copyright holder.
+1.5 "Software" means only material that is identified as covered by this
+license by one or more of the following methods:
 
-PROGRAMS WRITTEN FOR KOI-DOS
+(a) the material contains a copyright or KNCL notice;
 
-Programs written to run on Koi-DOS are not derived works of the Software, and
-this license places no conditions on them. Including the interface headers that
-the Software provides for that purpose - the system call definitions and the
-program header they are used through - does not bring a program under this
-license. Their authors may license their own work however they wish, including
-commercially.
+(b) the material is accompanied by this license;
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM,
-OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+(c) the material is listed as covered in an official LICENSE-MANIFEST
+    file;
+
+(d) the material is located in a source repository, release archive, or
+    package directory expressly marked as KNCL-covered; or
+
+(e) official distribution metadata identifies the material as covered by
+    KNCL.
+
+Where an official LICENSE-MANIFEST accompanies a distribution, that
+manifest is authoritative for the material in that distribution.
+
+Material is not covered by this license merely because it is distributed
+in the same repository, archive, disk image, package, or download as
+Koi-DOS.
+
+Material identified as subject to another license is governed by that
+other license and is not governed by KNCL.
+
+1.6 "Modified Software" means Software, or a copy of Software, in which
+one or more covered files have been edited, translated, rearranged,
+combined with changes, or otherwise modified, including any version that
+constitutes a derivative work under applicable copyright law.
+
+A work is Modified Software only to the extent that it contains or is
+based on covered Software. Independent material remains governed by its
+own applicable license.
+
+1.7 "Program for Koi-DOS" means an independent program designed to run
+on Koi-DOS that does not include, modify, copy, or distribute covered
+implementation code from the Software other than Redistributable SDK
+Components.
+
+1.8 "Interface Component" means a header, declaration, ABI definition,
+system-call definition, protocol definition, file-format definition, or
+other material expressly marked by the Maintainer as interface-only.
+
+1.9 "Redistributable SDK Component" means material expressly identified
+by the Maintainer as permitted for inclusion in, linking into, and
+redistribution alongside Programs for Koi-DOS.
+
+Material may be identified as both an Interface Component and a
+Redistributable SDK Component. The two identifications grant different
+permissions - one to reimplement an interface, one to redistribute an
+implementation - and are cumulative rather than alternatives.
+
+Neither identification changes which license covers the material itself.
+A Redistributable SDK Component remains Software, and modifying it as
+part of Koi-DOS is governed by this license like anything else; what the
+identification adds is permission to carry it inside a Program for
+Koi-DOS.
+
+1.10 "Commercial Purpose" means a purpose primarily intended to obtain
+commercial advantage, revenue, monetary compensation, or another
+commercial benefit.
+
+1.11 "Non-Commercial Purpose" means a purpose that is not primarily
+intended to obtain a Commercial Purpose.
+
+1.12 "Contribution" means material intentionally submitted to the Project
+for possible inclusion in the Software.
+
+1.13 "Commercial Licensing Right" means the right granted by a
+contributor under Section 10.3.
+
+2. GRANT OF RIGHTS
+
+Subject to the conditions of this license, each applicable Copyright
+Holder grants you a worldwide, royalty-free, non-exclusive license to:
+
+(a) use the Software for a Non-Commercial Purpose;
+
+(b) study, inspect, and analyze the Software;
+
+(c) modify the Software;
+
+(d) compile the Software and Modified Software;
+
+(e) reproduce and distribute the Software and Modified Software for a
+    Non-Commercial Purpose;
+
+(f) use the Software for artificial intelligence, machine learning, model
+    training, analysis, evaluation, and research for a Non-Commercial
+    Purpose; and
+
+(g) create and distribute Programs for Koi-DOS under Section 6.
+
+No rights are granted except those expressly stated in this license.
+
+3. CONDITIONS FOR DISTRIBUTION
+
+When you distribute Software or Modified Software, you must:
+
+(a) retain applicable copyright notices;
+
+(b) provide a copy of this license, or a stable reference to its full
+    text;
+
+(c) identify material modifications where reasonably practicable;
+
+(d) clearly state that the distributed version has been modified; and
+
+(e) preserve applicable notices identifying third-party material.
+
+A modification notice may state:
+
+"This version contains modifications by [name or project], based on
+Koi-DOS [version, release, or commit]."
+
+You are not required to publish source code for modifications that you do
+not otherwise distribute.
+
+4. NON-COMMERCIAL LIMITATION
+
+The rights granted by Section 2 do not include use of Software or
+Modified Software for a Commercial Purpose.
+
+Without a separate written commercial license issued by the Maintainer,
+you may not:
+
+(a) sell, rent, lease, sublicense, or provide Software or Modified
+    Software as a paid product or service;
+
+(b) include Software or Modified Software in a product or service offered
+    for payment;
+
+(c) provide paid hosting, deployment, maintenance, support, consulting,
+    customization, or similar services in which Software or Modified
+    Software is a material component;
+
+(d) distribute Software or Modified Software as part of a paid device,
+    image, subscription, download, support plan, warranty, or service;
+
+(e) use Software or Modified Software in the operation of a commercial
+    product, service, infrastructure, or business process; or
+
+(f) otherwise use Software or Modified Software primarily for commercial
+    advantage or monetary compensation.
+
+Free distribution by itself does not constitute a Commercial Purpose.
+
+A person receiving a salary, scholarship, grant, or other compensation
+may use the Software for personal education, study, or research without
+that fact alone making the use commercial.
+
+However, use by an employer, company, institution, or other organization
+in connection with its products, services, infrastructure, or business
+operations may constitute a Commercial Purpose even if the individual
+user is not separately paid for that use.
+
+A commercial license issued by the Maintainer covers material subject to
+the Commercial Licensing Right. It does not cover material identified in
+the LICENSE-MANIFEST as KNCL-NONCOMMERCIAL-ONLY, which requires the
+separate permission of its copyright holder.
+
+5. PERMITTED NON-COMMERCIAL USE
+
+The following activities are permitted when they are not performed for a
+Commercial Purpose:
+
+(a) personal use, experimentation, and hobby projects;
+
+(b) downloading, running, compiling, testing, and modifying Koi-DOS;
+
+(c) free distribution of source code and binaries;
+
+(d) university coursework, teaching, academic research, and study;
+
+(e) demonstrations, reviews, benchmarks, and non-commercial videos;
+
+(f) use by individuals, student groups, hobby groups, and non-commercial
+    communities;
+
+(g) use by public educational or research institutions; and
+
+(h) use for artificial intelligence or machine-learning research that is
+    not primarily intended to create commercial advantage or revenue.
+
+6. PROGRAMS FOR KOI-DOS
+
+A Program for Koi-DOS is an independent work and is not subject to KNCL
+merely because it:
+
+(a) runs on Koi-DOS;
+
+(b) uses the Koi-DOS public ABI;
+
+(c) calls Koi-DOS system calls;
+
+(d) includes Interface Components;
+
+(e) includes Redistributable SDK Components;
+
+(f) links against a Redistributable SDK Component; or
+
+(g) implements a documented Koi-DOS protocol or file format.
+
+Programs for Koi-DOS may be distributed under any license chosen by their
+authors, including a commercial or proprietary license, and may be sold.
+
+Redistributable SDK Components may be compiled into a Program for
+Koi-DOS and distributed as part of it, in source or binary form, under
+the Program's own license. That permission covers those components as
+used in a Program for Koi-DOS, and does not permit their use as a
+general-purpose library outside that purpose.
+
+This section does not permit a Program for Koi-DOS to copy, modify,
+embed, link against, or distribute covered implementation code that is
+not a Redistributable SDK Component.
+
+A public header or interface definition is not an implementation license
+unless the Maintainer expressly identifies it as a Redistributable SDK
+Component.
+
+7. COMBINED DISTRIBUTIONS
+
+A distribution may contain both Koi-DOS and independent Programs for
+Koi-DOS.
+
+Such a distribution is permitted under KNCL when it is made for a
+Non-Commercial Purpose.
+
+The license of an independent Program remains separate from KNCL. KNCL
+does not apply to an independent Program merely because it is distributed
+in the same archive, disk image, repository, or package.
+
+Nothing in this section grants permission to use Koi-DOS or Modified
+Software for a Commercial Purpose.
+
+8. THIRD-PARTY MATERIAL
+
+KNCL applies only to material for which the applicable Copyright Holder
+has the necessary rights and that is identified as Software under
+Section 1.5.
+
+Third-party code, libraries, fonts, artwork, assets, firmware, data,
+documentation, generated material, and other components may be subject to
+separate licenses.
+
+The applicable third-party license governs each such component. Where
+third-party material is present, the LICENSE-MANIFEST names the license
+that applies to it.
+
+Nothing in KNCL grants rights to third-party material beyond the rights
+granted by its applicable license.
+
+9. PROJECT NAME, TRADEMARKS, AND ENDORSEMENT
+
+This license is a copyright license. It does not grant rights in names,
+logos, or marks, which are addressed separately.
+
+This license does not grant permission to use the names "Koi-DOS",
+"Mizu", "Koi Ayame", or associated logos, artwork, or project marks to:
+
+(a) imply endorsement, sponsorship, or approval by the Maintainer;
+
+(b) imply that a modified version is an official release;
+
+(c) present a modified version as an official, unmodified, or
+    Maintainer-approved release; or
+
+(d) use a Project mark as the primary branding of a modified version
+    without written permission.
+
+A distribution containing Modified Software must use a name that
+distinguishes it from the official Koi-DOS project, unless the Maintainer
+gives written permission otherwise.
+
+This section does not prohibit truthful descriptive statements about
+origin, compatibility, or modification, including:
+
+"Based on Koi-DOS."
+
+"Koi-DOS-compatible."
+
+"Modified from Koi-DOS [version, release, or commit]."
+
+Such statements must not imply endorsement or official status.
+
+10. CONTRIBUTIONS
+
+10.1 Copyright ownership
+
+A contributor retains ownership of copyright in their Contribution.
+
+This license does not transfer copyright ownership from a contributor to
+the Maintainer or to the Project.
+
+10.2 License to the Project
+
+By intentionally submitting a Contribution for possible inclusion in the
+Software, the contributor grants the Maintainer a perpetual, worldwide,
+non-exclusive, royalty-free, irrevocable license to:
+
+(a) reproduce the Contribution;
+
+(b) modify, adapt, translate, rearrange, and prepare derivative works
+    from the Contribution;
+
+(c) combine the Contribution with other material;
+
+(d) compile, execute, publicly display, and distribute the Contribution
+    as part of the Software or Modified Software;
+
+(e) maintain, reimplement, replace, or remove the Contribution;
+
+(f) distribute the Contribution under this license, or under a later
+    version of this license published by the Maintainer; and
+
+(g) authorize recipients to exercise the rights granted by this license,
+    solely in relation to the Contribution as included in the Software or
+    Modified Software.
+
+This license does not prevent the contributor from using, modifying,
+distributing, or separately licensing their own Contribution, including
+for a Commercial Purpose.
+
+10.3 Commercial Licensing Right
+
+The contributor grants the Maintainer a perpetual, worldwide,
+non-exclusive, royalty-free, sublicensable license to reproduce, modify,
+distribute, and authorize the commercial use of the Contribution, and to
+issue, negotiate, and administer separate written commercial licenses
+covering it.
+
+This right may be exercised only for the purpose of licensing the
+Software or Modified Software as a whole, or a substantial part of it,
+that includes the Contribution.
+
+It does not permit the Maintainer to license, sell, or otherwise
+commercially exploit the Contribution as a standalone work, as a
+general-purpose library, or as a component separated from Koi-DOS or a
+work derived from Koi-DOS.
+
+This right does not transfer ownership of copyright to the Maintainer.
+
+The contributor is not entitled to royalties, fees, or other
+compensation arising from a commercial license issued under this section
+unless the contributor and the Maintainer agree otherwise in a separate
+written agreement.
+
+10.4 Scope
+
+The rights granted by Sections 10.2 and 10.3 apply only to:
+
+(a) the Contribution;
+
+(b) modified versions of the Contribution; and
+
+(c) the Contribution as combined with the Software or Modified Software.
+
+They grant no rights in any other work owned by the contributor.
+
+10.5 Patents
+
+To the extent the contributor holds patent rights that would necessarily
+be infringed by the Contribution as submitted, or by the Contribution as
+combined with the Software, the contributor grants the Maintainer and
+recipients of the Software a perpetual, worldwide, non-exclusive,
+royalty-free patent license to make, use, and distribute the Contribution
+as part of the Software or Modified Software.
+
+This patent license applies only to the Contribution and its use within
+the Software, and terminates for any party that initiates patent
+litigation alleging that the Software infringes a patent.
+
+10.6 Contributor representations
+
+By submitting a Contribution, the contributor represents that:
+
+(a) they have the legal right to submit the Contribution;
+
+(b) they have the legal right to grant the licenses in this section, and
+    that no employer, client, or other party holds rights that would
+    prevent it;
+
+(c) to the best of their knowledge, the Contribution does not knowingly
+    violate the copyright, patent, trade-secret, or other rights of a
+    third party; and
+
+(d) any third-party material in the Contribution has been identified and
+    accompanied by its applicable license.
+
+10.7 No obligation to accept
+
+The Maintainer is not required to accept, include, maintain, or
+distribute any Contribution.
+
+10.8 Contributions without the Commercial Licensing Right
+
+A Contribution may be accepted without the Commercial Licensing Right
+only if the Maintainer expressly agrees in writing.
+
+Material accepted under such an exception must be identified in the
+LICENSE-MANIFEST as KNCL-NONCOMMERCIAL-ONLY.
+
+Software containing such material may not be distributed under a
+commercial license unless the relevant copyright holder grants the
+necessary additional permission.
+
+10.9 When these terms apply
+
+This section applies to Contributions submitted on or after the date this
+version of the license was published.
+
+A Contribution submitted earlier remains governed by the terms in effect
+when it was submitted, unless its contributor agrees otherwise in
+writing.
+
+11. VERSIONS OF THIS LICENSE
+
+The Maintainer may publish revised versions of this license. Each version
+is distinguished by a version number.
+
+Software distributed under a particular version of this license remains
+available under that version. A recipient may also choose to rely on any
+later version published by the Maintainer.
+
+12. TERMINATION
+
+The rights granted by this license terminate automatically if you
+materially violate its terms.
+
+If you receive written notice of a material violation, your rights may be
+reinstated if the violation is completely cured within thirty (30) days
+after receipt of the notice, unless the Maintainer agrees otherwise in
+writing.
+
+Termination does not affect rights lawfully granted to recipients before
+termination, to the extent those rights cannot lawfully be revoked, and
+does not affect the rights granted to the Maintainer under Section 10.
+
+13. NO WARRANTY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NONINFRINGEMENT.
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, NO COPYRIGHT HOLDER
+SHALL BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+This software is an experimental operating system. It writes to storage
+devices and runs without memory protection. It may cause loss of data.
+
+14. SEVERABILITY
+
+If any provision of this license is held to be invalid or unenforceable,
+that provision shall be enforced to the maximum extent permitted by
+applicable law, and the remaining provisions shall remain in effect.
+
+15. ENTIRE LICENSE
+
+This license states the terms under which the Copyright Holders grant
+rights in the Software.
+
+No provision of this license grants rights to use the Software or
+Modified Software for a Commercial Purpose unless expressly authorized by
+a separate written license issued by the Maintainer.
+
+A plain-language guide, README, LICENSE-MANIFEST commentary, or other
+explanatory material does not replace or modify this license. Where an
+explanatory document conflicts with this license, this license controls.
+The LICENSE-MANIFEST determines which material this license applies to;
+it does not change the terms.

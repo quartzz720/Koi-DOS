@@ -149,6 +149,7 @@ the whole span is what initialises `.bss`, which has no presence in the file at 
 | [kernel/hda.c](kernel/hda.c) | Intel HD Audio: the codec graph, and one endless output stream |
 | [kernel/audio.c](kernel/audio.c) | The mixer: voices, resampling, volume. No hardware in it |
 | [kernel/keyboard.c](kernel/keyboard.c) | PS/2 keyboard on IRQ1 |
+| [kernel/mouse.c](kernel/mouse.c) | PS/2 pointer on IRQ12: mouse, touchpad, wheel |
 | [kernel/acpi.c](kernel/acpi.c) | RSDP/XSDT walk, hardware-presence questions |
 | [kernel/string.c](kernel/string.c) | `memset`, `memcpy`, `memmove`, `memcmp`, `strlen`, `strcmp` |
 | [kernel/io.h](kernel/io.h) | Port I/O: `inb`/`outb`/`inl`/`outl` |
@@ -960,6 +961,66 @@ keyboard is usually PS/2**: it hangs off the embedded controller, which presents
 8042, and that is still true of recent machines. A **desktop with a USB keyboard is the harder
 case** — the firmware's legacy emulation generally stops working once boot services are gone. A
 desktop board with a PS/2 port and a PS/2 keyboard plugged into it works today.
+
+### Pointer
+
+The second port of the same 8042 the keyboard is on, IRQ12. On a laptop that port is the
+touchpad, which is why a machine made in a year when nothing has a PS/2 socket still declares a
+PS/2 controller.
+
+Two details cost more than the rest of the driver. The port's **clock line** is often left
+disabled by firmware, and a device whose clock is off answers nothing while looking exactly like
+a device that is absent. And the packet stream has **no framing** except one bit that is always
+set in the first byte — the only way to find a boundary, and the only way back into step after a
+byte is dropped.
+
+**The wheel, and two-finger scrolling, are the same six bytes.** A wheel mouse pretends to be a
+plain one until asked in a way a plain one cannot notice: Microsoft's IntelliMouse chose the
+sample-rate sequence 200, 100, 80, because setting the rate is something every mouse already
+understands — so an old device sees three ordinary commands and a new one sees a password. Ask
+its identity afterwards and it answers 3 rather than 0, and sends four bytes per packet from then
+on. A second knock, 200, 200, 80, gets 4: the wheel and two more buttons.
+
+A Synaptics touchpad has its own protocol carrying finger positions, pressure and how many
+fingers are down, and **none of it is needed**: the pad turns two fingers moving together into
+wheel notches itself, in its own firmware, once it is in this mode. A driver that implements the
+vendor protocol to get two-finger scrolling has done a great deal of work for the same result.
+
+**Buttons are counted, not sampled.** `mouse_presses()` reports how many times each button has
+gone down, ever, and callers compare that with what they last saw. Asking whether a button is
+down right now loses clicks: a click lasts a tenth of a second at most, and anything polling at
+thirty frames a second will sooner or later look between the press and the release and see
+nothing — which presents as a button that sometimes does not work rather than as a missed sample.
+Found exactly that way, driving Mizu from QEMU's monitor where the press and release arrive
+milliseconds apart. The wheel is a running total for the same reason, and because a total can be
+read by any number of callers where a since-you-last-asked figure can only be read by the first.
+
+### Chaining, and why a program cannot call a program
+
+One program runs at a time, at a fixed address, in one address space. That is the design and it
+is not changing — so a program cannot load another program: the second image would land on top of
+the first, including the stack the kernel is standing on while it does the loading.
+
+Which would mean a graphical shell that cannot start anything.
+
+`SYS_CHAIN` asks for a command to be run **after the calling program has exited**. By then it is
+gone, its memory is free, and the requested program loads into the space it was occupying. No
+nesting, no second image, nothing saved and restored. Requests are honoured most-recent-first, so
+"run this and then bring me back" is two ordinary calls in the order they read.
+
+The requests are stored in kernel memory rather than the program's, because the program's memory
+is about to be handed to whatever runs next — a request kept there would be read back out of a
+buffer the new program had already begun writing over, and would work perfectly until the day the
+next program happened to be large.
+
+The shell drains them in a **loop at the top level**, not by recursion. A graphical shell that
+runs a program and asks to be brought back does that on every launch, all session; if each hop
+were a nested call the kernel stack would grow with every program started and the machine would
+fall over after a long enough evening.
+
+Coming back is a fresh start and not a resume. Mizu hands itself its two paths and its selection
+as a command line; anything else would have to go to a file first. Small DOS shells did precisely
+this, for precisely this reason.
 
 ### Paging
 

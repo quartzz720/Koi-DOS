@@ -264,8 +264,21 @@ mcopy -o -i "$BOOTVOL" boot/efi/boot/KERNEL.ELF  ::/BOOT/
 mmd -i "$SYSVOL" ::/BIN 2>/dev/null || true
 for program in build/*.EXE; do
     [ -f "$program" ] || continue
+    # Mizu is not one of the system's utilities. It is a package, installed
+    # into a directory of its own by dosget, and it goes there below - both
+    # because that is where it will actually live on a real machine, and so
+    # that testing it here tests the layout it is shipped in.
+    [ "$(basename "$program")" = "mizu.EXE" ] && continue
     mcopy -o -i "$SYSVOL" "$program" "::/BIN/$(basename "$program" | tr 'a-z' 'A-Z')"
 done
+
+# Mizu, where `dosget install mizu` would have put it. On release media it is
+# absent entirely: the graphical shell arrives over the wire, and a system
+# without it is the same system.
+if [ -f build/mizu.EXE ]; then
+    mmd -i "$SYSVOL" ::/MIZU 2>/dev/null || true
+    mcopy -o -i "$SYSVOL" build/mizu.EXE ::/MIZU/MIZU.EXE
+fi
 
 # The licence, for the installer to show and for anyone who looks.
 mcopy -o -i "$SYSVOL" LICENSE ::/LICENSE

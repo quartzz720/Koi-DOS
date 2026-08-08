@@ -329,6 +329,52 @@ static inline void koi_gfx_text(int x, int y, const char* text,
                     background);
 }
 
+/* ---- Running something else ----------------------------------------------
+ *
+ * A program cannot call another program: one runs at a time, at a fixed
+ * address. It asks for one to be run after it has exited, when its own memory
+ * is free. Requests run most-recent-first, so "run this and bring me back" is
+ * two calls:
+ *
+ *     koi_chain("MIZU Z:\\GAMES");   asked for first, runs second
+ *     koi_chain("DOOM");             asked for last, runs first
+ *     koi_exit(0);
+ *
+ * The argument is a command line, so the search path, drive letters and
+ * arguments behave as if typed. Coming back is a fresh start, not a resume:
+ * save anything worth keeping before calling this. */
+static inline int koi_chain(const char* command) {
+    return (int)koi_call(SYS_CHAIN, (long)command, 0, 0);
+}
+
+/* ---- The pointer ---------------------------------------------------------
+ *
+ * One snapshot, filled in one go. Returns 1 when there is a pointer, 0 when the
+ * machine has none - and fills the structure in either case, so a program that
+ * ignores the answer reads a still cursor rather than rubbish.
+ *
+ *     KOI_POINTER pointer;
+ *     int last_scroll = 0;
+ *     while (running) {
+ *         koi_mouse(&pointer);
+ *         int wheel = pointer.scroll - last_scroll;
+ *         last_scroll = pointer.scroll;
+ *         if (wheel) scroll_the_list_by(wheel);
+ *     }
+ *
+ * `scroll` is a running total, positive upwards, so subtract what you last saw.
+ * On a laptop it is two fingers on the touchpad: the pad turns the gesture into
+ * wheel notches itself, and nothing here has to know it was fingers. */
+static inline int koi_mouse(KOI_POINTER* pointer) {
+    return (int)koi_call(SYS_MOUSE, (long)pointer, 0, 0);
+}
+
+/* Put the pointer somewhere - what to do on entering graphics mode, so that it
+   starts in the middle rather than wherever the last program left it. */
+static inline int koi_mouse_place(int x, int y) {
+    return (int)koi_call(SYS_MOUSE_PLACE, KOI_POINT(x, y), 0, 0);
+}
+
 /* ---- Sound ---------------------------------------------------------------
  *
  * There is nothing to open. One stream of 48 kHz stereo is always running and

@@ -18,6 +18,11 @@
 static const char* current_arguments = "";
 static int program_running;
 
+/* Where the running program was loaded from. Copied rather than pointed at: the
+   caller's buffer is a local in the shell's command parser and is reused for
+   the next line the moment this one finishes. */
+static char current_path[PROGRAM_CHAIN_MAX] = "";
+
 /* Where to resume when the program exits.
  *
  * SYS_EXIT is reached from inside an interrupt handler, several frames deep,
@@ -72,6 +77,50 @@ __asm__(
 const char* program_arguments(void) {
     return current_arguments;
 }
+
+const char* program_path(void) {
+    return current_path;
+}
+
+/* The chain: what to run once the running program has gone.
+ *
+ * Kernel memory, deliberately. The requesting program's own memory is about to
+ * be handed to whatever runs next, so a request stored there would be read back
+ * out of a buffer the new program has already begun writing over - and would
+ * work perfectly until the day the next program happened to be large. */
+static char chain_lines[PROGRAM_CHAIN_DEPTH][PROGRAM_CHAIN_MAX];
+static int chain_count;
+
+int program_chain(const char* command) {
+    boot_uint64_t length = 0;
+
+    if (!command || !command[0]) return 0;
+    if (chain_count >= PROGRAM_CHAIN_DEPTH) return 0;
+
+    while (command[length] && length < PROGRAM_CHAIN_MAX - 1) {
+        chain_lines[chain_count][length] = command[length];
+        length++;
+    }
+    chain_lines[chain_count][length] = 0;
+    chain_count++;
+    return 1;
+}
+
+int program_chain_take(char* command, boot_uint64_t size) {
+    const char* source;
+    boot_uint64_t index = 0;
+
+    if (!command || !size || !chain_count) return 0;
+    source = chain_lines[--chain_count];
+    while (source[index] && index < size - 1) {
+        command[index] = source[index];
+        index++;
+    }
+    command[index] = 0;
+    return 1;
+}
+
+void program_chain_clear(void) { chain_count = 0; }
 
 __attribute__((noreturn)) void program_exit(int code) {
     exit_code = code;
@@ -238,6 +287,14 @@ int program_run(VOLUME* volume, const char* path, const char* arguments,
     }
 
     current_arguments = arguments ? arguments : "";
+    {
+        boot_uint64_t index = 0;
+        while (path[index] && index < PROGRAM_CHAIN_MAX - 1) {
+            current_path[index] = path[index];
+            index++;
+        }
+        current_path[index] = 0;
+    }
     exit_code = 0;
 
     if (program_save(&resume)) {

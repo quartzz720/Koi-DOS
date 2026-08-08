@@ -14,6 +14,7 @@
 #include "pci.h"
 #include "xhci.h"
 #include "graphics.h"
+#include "mouse.h"
 #include "audio.h"
 #include "hda.h"
 #include "build.h"
@@ -343,6 +344,11 @@ static long system_info(long item, long index) {
         VOLUME* volume = volume_at((boot_uint32_t)index);
         return volume ? volume->is_boot_volume : SYSCALL_ERROR;
     }
+    case KOI_INFO_VOLUME_IS_CURRENT: {
+        VOLUME* volume = volume_at((boot_uint32_t)index);
+        if (!volume) return SYSCALL_ERROR;
+        return volume == working_volume ? 1 : 0;
+    }
     case KOI_INFO_AUDIO:
         return audio_ready() ? 1 : 0;
     case KOI_INFO_AUDIO_RATE:
@@ -380,6 +386,9 @@ static long system_text(long item, long index, char* buffer, long size) {
     }
     case KOI_TEXT_AUDIO_DEVICE:
         source = audio_device_name();
+        break;
+    case KOI_TEXT_PROGRAM_PATH:
+        source = program_path();
         break;
     default:
         return SYSCALL_ERROR;
@@ -661,6 +670,33 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
                       (boot_uint32_t)c, (boot_uint32_t)(d < 0 ? 0 : d),
                       d == KOI_TEXT_TRANSPARENT);
         return 0;
+
+    case SYS_MOUSE: {
+        KOI_POINTER* out = (KOI_POINTER*)a;
+
+        if (!out) return SYSCALL_ERROR;
+        /* Filled in even when there is no pointer, so that a program which
+           ignores the return value reads a still cursor at the origin rather
+           than whatever happened to be in its stack. */
+        out->x = mouse_present() ? mouse_x() : 0;
+        out->y = mouse_present() ? mouse_y() : 0;
+        out->buttons = mouse_present() ? (unsigned int)mouse_buttons() : 0;
+        out->scroll = mouse_present() ? mouse_scroll() : 0;
+        out->movements = mouse_present() ? mouse_movements() : 0;
+        out->has_wheel = (mouse_present() && mouse_has_wheel()) ? 1U : 0U;
+        for (int button = 0; button < 3; button++)
+            out->presses[button] = mouse_present()
+                ? (unsigned int)mouse_presses(button) : 0U;
+        return mouse_present() ? 1 : 0;
+    }
+
+    case SYS_MOUSE_PLACE:
+        if (!mouse_present()) return SYSCALL_ERROR;
+        mouse_place(KOI_POINT_X(a), KOI_POINT_Y(a));
+        return 0;
+
+    case SYS_CHAIN:
+        return program_chain((const char*)a) ? 1 : 0;
 
     default:
         return SYSCALL_ERROR;

@@ -188,6 +188,29 @@ in [programs/](programs/):
 enough to write a listing with no privilege the shell does not also lack, and that a program can
 change how the system looks and make it stick without reaching into kernel state.
 
+### Mizu
+
+**Mizu is the graphical shell, and it does not ship with the system.** It arrives with `dosget
+install mizu`, lands in `\MIZU`, is started by typing `\MIZU\MIZU`, and can be removed again — a
+graphical shell that cannot be taken off is an operating system with a graphical shell, and this
+is not one. The source is [programs/mizu.c](programs/mizu.c); it is built by the same `make` and
+uses nothing the SDK does not give everybody.
+
+Two panels side by side, which is Norton Commander's arrangement and Windows 1.0's conclusion
+from the other direction: overlapping windows on one screen hide more than they show. The pointer
+selects, twice quickly opens, the wheel scrolls whichever panel it is over — and on a laptop the
+wheel is two fingers on the touchpad, because the pad recognises the gesture itself and reports
+it as wheel notches. `Tab` switches panels, `F3` shows a file, `F9` changes drive, `F10` leaves.
+Everything with a pointer also has a key: on a machine with no touchpad the keys are the whole
+interface rather than a degraded version of one.
+
+Starting a program from it goes through `SYS_CHAIN`. Mizu asks for itself to be run, then for the
+program, and exits; the requests are honoured most-recent-first, so the program runs in the memory
+Mizu was occupying and Mizu comes back afterwards with its two paths and its selection handed to
+itself as arguments.
+
+0.1 does not copy, move, delete or rename, and both panels show the same drive. Those are 0.2.
+
 Three more proofs live outside this repository on purpose, each built with nothing but the SDK:
 **[DOSFETCH](https://github.com/quartzz720/DOSFETCH)**, a system summary in the spirit of
 neofetch; **[Games](https://github.com/quartzz720/Games)**, six of them in one program with a
@@ -349,6 +372,22 @@ idea when it stopped being — so anything where that matters, walking forward o
 holding a button, needs events rather than characters. Both drivers had the information all along
 and were discarding it one line before it could be delivered. The identity reported is the
 unshifted one, so a key reads the same going down as coming up.
+
+`SYS_MOUSE` fills in one snapshot: where the pointer is, which buttons are down, how far the
+wheel has turned, and **how many times each button has gone down**. That last one is not a
+convenience. A click lasts a tenth of a second at most, and a program that looks thirty times a
+second will sooner or later look between the press and the release and see nothing — which
+presents as a button that sometimes does not work rather than as a missed sample. A count cannot
+be missed: the reader compares it with what it last saw. The wheel is a running total for the
+same reason, and because a total can be read by any number of callers where a
+since-you-last-asked figure can only be read by the first one.
+
+`SYS_CHAIN` asks for a command to be run **after the calling program has exited**. One program
+runs at a time, at a fixed address, in one address space — so a program cannot call another
+program, and a graphical shell that cannot start anything is a picture of a shell. Requests run
+most-recent-first, which turns "run this and then bring me back" into two ordinary calls. Coming
+back is a fresh start and not a resume, so anything worth keeping travels back as arguments or
+goes to a file first. Small DOS shells did precisely this, for precisely this reason.
 
 `SYS_SOUND_PLAY` and `SYS_SOUND_TONE` put something into the one stream that is always running.
 There is nothing to open and nothing to wait for: a call hands back a voice, or -1 when every
@@ -717,6 +756,7 @@ kernel/
   font.c               8x16 CP437 font
   graphics.c           drawing primitives, and the screen a program can take
   keyboard.c           PS/2 keyboard on IRQ1
+  mouse.c              PS/2 pointer on IRQ12: mouse, touchpad, wheel
   acpi.c               RSDP/XSDT walk, hardware-presence questions
   rtc.c                CMOS clock, and FAT timestamp packing
   string.c             mem*/str*, and the glob matcher
@@ -728,6 +768,11 @@ kernel/
   hpet.c               the HPET, as a monotonic clock
   apic.c               Local APIC timer and I/O APIC interrupt routing
   xhci.c               USB 3 controller, HID boot keyboard and mass storage
+  ehci.c               USB 2 controller, so a USB 2 socket is a socket
+  hda.c audio.c        HD Audio codec, and the mixer above it
+  e1000.c              Intel gigabit Ethernet
+  net.c                ARP, IPv4, UDP, DHCP, DNS, ICMP
+  tftp.c               the file transfer dosget runs on, until there is TCP
   block.c              sector-device abstraction over any controller
   partition.c          GPT / MBR / whole device, and drive letters
   fat32.c              FAT32 with long names, read and write
@@ -740,6 +785,7 @@ programs/
   start.c              _start, calls main, turns its return into an exit
   program.ld           linker script, fixed at 16 MiB
   hello.c cat.c save.c ls.c color.c demo.c show.c
+  mizu.c               the graphical shell - built here, shipped by dosget
 sdk/                   the four files a program needs, plus koicc
 legacy/                the old UEFI Boot Services shell, kept for reference
 linker.ld              kernel layout, fixed at 1 MiB
@@ -749,7 +795,24 @@ deploy.sh              find the USB stick and copy the build onto it
 
 ## License
 
-See [LICENSE](LICENSE).
+**Koi-DOS Non-Commercial License (KNCL) v1.4** — [LICENSE](LICENSE). Source-available, not
+OSI-approved open source. Use it, study it, change it, pass it on, train models on it, run it in a
+lecture or a hobby group: all free, all fine. Selling it, or building it into something sold,
+needs a separate written licence.
+
+**Programs written for Koi-DOS are yours.** Running on Koi-DOS, calling its system calls, or
+compiling with the SDK does not make your program a derivative of it. Everything `koicc` compiles
+into a program — `koi.h`, `syscall.h`, `start.c`, `koilib.c`, `program.ld` — is redistributable
+inside your program under whatever licence you choose, commercial included. That is stated
+file-by-file in [LICENSE-MANIFEST](LICENSE-MANIFEST), which is what says which licence covers
+which file, and which is authoritative where anything is unclear.
+
+**If you send a patch**, read [CONTRIBUTING.md](CONTRIBUTING.md) first. The short version: you
+keep the copyright in what you wrote, and you give permission for it to be included if Koi-DOS is
+ever licensed commercially — as part of Koi-DOS, never sold as a piece on its own, and with no
+revenue share. It is written down there in plain words rather than left in the small print,
+because a term of that kind should be read before it applies. If it does not suit you, a
+contribution can be accepted as non-commercial-only instead.
 
 ---
 
