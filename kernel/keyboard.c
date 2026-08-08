@@ -5,6 +5,7 @@
 #include "io.h"
 #include "pic.h"
 #include "xhci.h"
+#include "net.h"
 #include "timer.h"
 
 #define PS2_DATA 0x60U
@@ -393,6 +394,13 @@ int keyboard_getchar(void) {
            only place a device plugged in while somebody sits at the prompt can
            be noticed. */
         if (controllers) xhci_poll();
+        /* And the network, for exactly the same reason and with exactly the
+           same history. Answering an ARP request or a ping is not something
+           this system decides to do - it is something it does when somebody
+           asks, and nobody was listening between commands. A machine that
+           replies only while it is running `ping` itself is a machine no other
+           machine can find. */
+        if (net_link_ready()) net_poll();
         if (usb || controllers) {
             /* The controller's interrupt is still not routed anywhere, so USB
                keystrokes have to be collected rather than waited for.

@@ -13,6 +13,7 @@
 #include "hda.h"
 #include "graphics.h"
 #include "net.h"
+#include "e1000.h"
 #include "timer.h"
 #include "fat32.h"
 #include "partition.h"
@@ -369,8 +370,10 @@ static void command_help(void) {
     print_line("beep [hz] [ms] a tone, if there is a sound device");
     print_line("sound          the sound device, and which output it picked");
     print_line("net [start]    the network: what it is, or ask for an address");
+    print_line("net set <..>   set an address by hand, for a wire with no server");
     print_line("ping <host>    is it there, and how far away");
     print_line("log [file]     the kernel log: on screen, or written to a file");
+    print_line("log net <addr> send the kernel log to another machine over UDP");
     print_line("ver            show the version");
     print_line("help           this list");
     print_line("");
@@ -559,10 +562,82 @@ static void print_hex(boot_uint64_t value, int digits) {
  * made this century has a COM1. The text is kept in memory as well, so this
  * prints it - or writes it to a file, which is the only way to get a boot log
  * off a laptop and onto something that can read it. */
+/* Ship the log to another machine, in pieces small enough to cross an
+ * Ethernet frame.
+ *
+ * No sequence numbers and no acknowledgements: this is UDP on a local network,
+ * where a lost datagram is rare, and the alternative is TCP, which this system
+ * does not have and does not need in order to hand over a text file. What it
+ * does have is a receiver as simple as `nc -lu -p 5555 > koi.log`, and that is
+ * the whole point - the machine being debugged should not require software on
+ * the other end.
+ *
+ * A pause between pieces because there is none of the pacing a real stack has,
+ * and sixty datagrams arriving back to back is how a receiver drops some. */
+#define LOG_CHUNK 1400
+
+static void send_log(const char* address_text, const char* port_text) {
+    const char* text = boot_log();
+    boot_uint32_t length = boot_log_length();
+    boot_uint32_t address = 0;
+    boot_uint32_t port = 5555;
+    boot_uint32_t at = 0;
+    boot_uint32_t pieces = 0;
+
+    if (!net_configured()) {
+        print_line("No address yet. Run `net start` first.");
+        return;
+    }
+    if (!net_parse_address(address_text, &address)) {
+        print("Not an address: ");
+        print_line(address_text);
+        return;
+    }
+    if (port_text && port_text[0]) {
+        port = 0;
+        for (const char* digit = port_text; *digit; digit++) {
+            if (*digit < '0' || *digit > '9') { port = 0; break; }
+            port = port * 10 + (boot_uint32_t)(*digit - '0');
+        }
+        if (!port || port > 65535) {
+            print_line("Not a port.");
+            return;
+        }
+    }
+
+    while (at < length) {
+        boot_uint32_t chunk = length - at;
+
+        if (chunk > LOG_CHUNK) chunk = LOG_CHUNK;
+        if (!net_send_to(address, (boot_uint16_t)port, text + at, chunk)) {
+            print_line("The log could not be sent.");
+            return;
+        }
+        at += chunk;
+        pieces++;
+        timer_wait(5);
+    }
+
+    print_dec(length);
+    print(" bytes sent to ");
+    print(address_text);
+    print(" in ");
+    print_dec(pieces);
+    print_line(pieces == 1 ? " datagram" : " datagrams");
+    print_line("Receive it with: nc -lu -p 5555 > koi.log");
+}
+
 static void command_log(const ARGUMENTS* arguments) {
     const char* text = boot_log();
     boot_uint32_t length = boot_log_length();
     char name[PATH_MAX];
+
+    /* `log net <address> [port]` before anything else, because otherwise the
+       word "net" is a perfectly good filename. */
+    if (word_is(arguments->operand[0], "NET")) {
+        send_log(arguments->operand[1], arguments->operand[2]);
+        return;
+    }
 
     single_operand(arguments, name);
 
@@ -627,8 +702,14 @@ static void print_address(boot_uint32_t address) {
 
 static void print_traffic(void);
 
+/* Hexadecimal, for the register dump below: these are bit fields, and a
+   decimal bit field is a puzzle. */
+static void print_card_number(boot_uint64_t value) {
+    print_hex((boot_uint32_t)value, 8);
+}
+
 static void command_net(void) {
-    if (!usb_net_ready()) {
+    if (!net_link_ready()) {
         print_line("No network device.");
         print_line("");
         print_line("Koi-DOS carries frames over a USB adapter speaking RNDIS, which");
@@ -638,6 +719,8 @@ static void command_net(void) {
         return;
     }
 
+    print("Carried over     : ");
+    print_line(net_link_name());
     print("Hardware address: ");
     for (int index = 0; index < 6; index++) {
         if (index) print(":");
@@ -656,12 +739,12 @@ static void command_net(void) {
     print("Netmask         : "); print_address(net_netmask()); print_line("");
     print("Gateway         : "); print_address(net_gateway()); print_line("");
     print("Name server     : "); print_address(net_dns()); print_line("");
-    if (usb_net_dropped()) {
-        print("Frames dropped  : ");
-        print_dec(usb_net_dropped());
-        print_line(" (arrived with nowhere to put them)");
-    }
     print_traffic();
+    if (e1000_ready()) {
+        print("Card registers  : ");
+        e1000_diagnose(print, print_card_number);
+        print_line("");
+    }
 }
 
 /* What has actually moved. Printed whenever the network is discussed, because
@@ -671,13 +754,13 @@ static void print_traffic(void) {
     boot_uint32_t received = 0;
     boot_uint32_t failed = 0;
 
-    usb_net_counters(&sent, &received, &failed);
+    net_traffic(&sent, &received, &failed);
     print("Frames sent     : ");
     print_dec(sent);
     if (failed) {
         print(" (");
         print_dec(failed);
-        print(" refused by the device)");
+        print(" lost)");
     }
     print_line("");
     print("Frames received : ");
@@ -686,7 +769,7 @@ static void print_traffic(void) {
 }
 
 static void command_net_start(void) {
-    if (!usb_net_ready()) { print_line("No network device."); return; }
+    if (!net_link_ready()) { print_line("No network device."); return; }
     print_line("Asking for an address...");
     if (!net_start()) {
         print_line("Nobody answered.");
@@ -698,6 +781,12 @@ static void command_net_start(void) {
         print_line("Sent, none back : the phone is not bridging - turn tethering");
         print_line("                  off and on again, and check it stayed on.");
         print_line("Frames received : something answered, but not a DHCP server.");
+        /* And what the hardware says, which is not the same as what the
+           driver believes. Written to the log rather than the screen: it is
+           for reading afterwards, next to everything else. */
+        usb_net_diagnose();
+        print_line("");
+        print_line("The controller's own view of the endpoints is in the log.");
         return;
     }
     print("Address ");
@@ -705,6 +794,46 @@ static void command_net_start(void) {
     print(", gateway ");
     print_address(net_gateway());
     print_line("");
+}
+
+/* An address chosen by hand: `net set <address> <netmask> [gateway] [dns]`.
+ *
+ * For a network with nobody to ask - two machines and one cable between them,
+ * which is the arrangement you reach for precisely when the ordinary one has
+ * stopped working. */
+static void command_net_set(const ARGUMENTS* arguments) {
+    boot_uint32_t address = 0;
+    boot_uint32_t netmask = 0;
+    boot_uint32_t gateway = 0;
+    boot_uint32_t dns = 0;
+
+    if (!net_link_ready()) { print_line("No network device."); return; }
+    if (!arguments->operand[1][0] || !arguments->operand[2][0]) {
+        print_line("Usage: net set <address> <netmask> [gateway] [dns]");
+        print_line("");
+        print_line("For a cable straight between two machines:");
+        print_line("  here      net set 192.168.50.2 255.255.255.0");
+        print_line("  the other ip addr add 192.168.50.1/24 dev <interface>");
+        return;
+    }
+    if (!net_parse_address(arguments->operand[1], &address) ||
+        !net_parse_address(arguments->operand[2], &netmask)) {
+        print_line("Not an address.");
+        return;
+    }
+    if (arguments->operand[3][0] &&
+        !net_parse_address(arguments->operand[3], &gateway)) {
+        print_line("Not a gateway address.");
+        return;
+    }
+
+    if (!net_configure(address, netmask, gateway, dns)) {
+        print_line("The address could not be set.");
+        return;
+    }
+    print("Address ");
+    print_address(net_address());
+    print_line(", set by hand");
 }
 
 /* Four echo requests, the way every ping since 1983 has done it. */
@@ -2619,6 +2748,7 @@ static void execute(const char* input) {
     if (word_is(input, "SOUND")) { command_sound(); return; }
     if (word_is(input, "NET")) {
         if (word_is(arguments.operand[0], "START")) command_net_start();
+        else if (word_is(arguments.operand[0], "SET")) command_net_set(&arguments);
         else command_net();
         return;
     }

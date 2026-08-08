@@ -126,6 +126,19 @@ else
     NETWORK_ARGS="-netdev user,id=koinet -device usb-net,bus=xhci1.0,netdev=koinet,id=usbnet"
 fi
 
+# And a real network card, which is what the laptop this is aimed at actually
+# has: an Intel 82579LM. QEMU's e1000e is an 82574L - the same family, the same
+# registers, and near enough that the driver written here is the driver that
+# runs there.
+#
+# KOI_E1000=0 leaves it out, which is how the USB path above stays testable:
+# with a card present the stack prefers it.
+if [ "${KOI_E1000:-1}" = "0" ]; then
+    ETHERNET_ARGS=""
+else
+    ETHERNET_ARGS="-netdev user,id=koieth -device e1000e,netdev=koieth,id=eth0"
+fi
+
 if [ -n "${KOI_AUDIO_WAV:-}" ]; then
     AUDIO_BACKEND="wav,id=koisnd,path=$KOI_AUDIO_WAV"
 else
@@ -301,4 +314,5 @@ exec qemu-system-x86_64 \
   -device "$HDA_CODEC",bus=hda.0,audiodev=koisnd \
   -serial stdio \
   $NETWORK_ARGS \
+  $ETHERNET_ARGS \
   "$@"

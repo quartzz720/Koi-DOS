@@ -160,6 +160,7 @@ the whole span is what initialises `.bss`, which has no presence in the file at 
 | [kernel/hpet.c](kernel/hpet.c) | The HPET, as a monotonic clock rather than a source of events |
 | [kernel/apic.c](kernel/apic.c) | Local APIC timer and I/O APIC interrupt routing |
 | [kernel/xhci.c](kernel/xhci.c) | USB 3 host controller: the HID boot keyboard, mass storage and RNDIS networking |
+| [kernel/e1000.c](kernel/e1000.c) | Intel gigabit Ethernet: descriptor rings, polled, no interrupts |
 | [kernel/ehci.c](kernel/ehci.c) | USB 2.0 host controller: firmware handoff, ports, control transfers |
 | [kernel/net.c](kernel/net.c) | ARP, IPv4, UDP, DHCP, DNS and ICMP echo — enough for `ping` |
 | [kernel/block.c](kernel/block.c) | Sector-device abstraction over any controller |
@@ -786,6 +787,77 @@ graphics program starting, drawing and exiting has not one silent 20 ms block in
 shots in DOOM land at the six moments the keys were sent, each the length `DSPISTOL` is at
 11025 Hz, since a wrong sample rate would show as a wrong duration; and a voice panned across
 while playing is silent in the far channel at each end and full in both at the centre.
+
+### Ethernet, and three registers written wrong
+
+A phone is a bad thing to debug against. It decides on its own whether tethering is on, changes
+its USB identity while you are talking to it, and gives no reason for anything. A network card
+sits still. So when RNDIS stalled on one particular laptop, the card in that laptop —
+an Intel 82579LM — became the more useful target.
+
+[kernel/e1000.c](kernel/e1000.c) is the 8254x/8257x family: a ring of receive descriptors, a ring
+of transmit descriptors, and no interrupts, because everything else here is polled and the
+completion of a transfer is a bit in a descriptor either way.
+
+The hardware address is taken from the receive address register rather than the EEPROM. Reading
+it properly means sharing a semaphore with the management engine — a second processor on the same
+chip with its own opinions about who owns the link — and it is entirely avoidable: the firmware
+has already read the address out and left it in the register the card filters on.
+
+Receive worked on the first attempt, on a chip that had never been tested against. Transmit took
+the rest of the day, and the reason is worth writing down, because it was the same mistake three
+times.
+
+**Registers are fields, not constants.** Each of these was written by assembling a value out of
+the flags this driver cares about and storing the result whole:
+
+| | |
+|---|---|
+| `CTRL.SLU` | read-only on this part, always reads back set |
+| `CTRL.ASDE` | reserved on this part; automatic speed detection does not exist here |
+| `TCTL` | assembled from scratch, which zeroed `RRTHRESH` and a reserved bit whose default is one |
+
+On the older parts all three are harmless. Here the last one was fatal: `RRTHRESH` is the
+threshold at which the transmitter asks the packet buffer for data, its default is `01b`, and
+writing the register whole set it to `00b`. The transmitter then never started. It did not error,
+did not halt, and did not complain — the head pointer simply stayed at zero while descriptors
+piled up behind the tail, sampled eight times in the first milliseconds after the doorbell and
+zero every time.
+
+The diagnosis came from reading the datasheet's register tables rather than from guessing, after
+two wrong guesses that were also worth making. One of them turned up a genuine second bug: the
+MAC samples speed and duplex from the physical layer *on the asserting edge of the link signal* —
+once, when the link comes up — and this driver was resetting the MAC while the firmware had the
+link up already, so that edge was in the past and the MAC kept a stale half-duplex setting on a
+full-duplex link. Both are fixed: speed and duplex are forced from what the physical layer
+actually negotiated, and a card that is already up is configured in place rather than reset.
+
+### The log, over the wire
+
+Every hardware failure in this project was diagnosed by carrying a USB stick between two rooms,
+one boot at a time. The cost of that is not the walking — it is that a wrong guess costs a whole
+round trip, so guesses get hoarded and batched instead of tested.
+
+`log net <address>` sends the kernel log as UDP datagrams. No sequence numbers and no
+acknowledgements: this is a local wire, where a lost datagram is rare, and the alternative is TCP,
+which this system does not have and does not need in order to hand over a text file. What it has
+instead is a receiver that is already installed on the other machine:
+
+```
+nc -lu -p 5555 > koi.log
+```
+
+`net set <address> <netmask>` exists for the same reason. Two machines and one cable is a network
+with no DHCP server on it, and it is exactly the network you reach for when the one you have has
+stopped working.
+
+The first thing the finished channel carried was the register dump that proved the transmitter
+had started:
+
+```
+TCTL=300400FA   TDH=00000004  TDT=00000004
+Frames sent : 4   Frames received : 4
+```
 
 ### Networking
 

@@ -1,5 +1,6 @@
 #include "net.h"
 #include "xhci.h"
+#include "e1000.h"
 #include "string.h"
 #include "serial.h"
 #include "timer.h"
@@ -72,6 +73,40 @@ static boot_uint32_t dhcp_transaction;
 static boot_uint32_t dhcp_offered;
 static boot_uint32_t dhcp_server;
 
+/* ---- Which wire ----------------------------------------------------------
+ *
+ * Two of them now: a network card, and a phone pretending to be one over USB.
+ * Everything above this line is the same protocol either way, so the choice
+ * lives here and in four functions.
+ *
+ * The card wins when there is one. It is not a preference so much as an
+ * observation: a card with no cable says so, and a phone says nothing at all
+ * about whether it means to carry anything. */
+static int using_card(void) { return e1000_ready(); }
+
+static int link_ready(void) { return e1000_ready() || usb_net_ready(); }
+
+static const boot_uint8_t* link_address(void) {
+    return using_card() ? e1000_address() : usb_net_address();
+}
+
+static int link_send(const void* frame, boot_uint32_t length) {
+    return using_card() ? e1000_send(frame, length)
+                        : usb_net_send(frame, length);
+}
+
+static boot_uint32_t link_receive(void* frame, boot_uint32_t size) {
+    return using_card() ? e1000_receive(frame, size)
+                        : usb_net_receive(frame, size);
+}
+
+/* Collect whatever the hardware has been holding. The card keeps its frames in
+   its own ring and needs no prompting; USB needs its event rings drained by
+   somebody, and that somebody is here. */
+static void link_collect(void) {
+    if (!using_card()) xhci_poll();
+}
+
 static void log(const char* text) { serial_write(text); }
 static void log_dec(boot_uint64_t value) { serial_write_dec(value); }
 
@@ -110,7 +145,7 @@ static boot_uint8_t in_frame[FRAME_MAX];
 
 static void begin_frame(const boot_uint8_t* destination, boot_uint16_t type) {
     memcpy(out_frame, destination, 6);
-    memcpy(out_frame + 6, usb_net_address(), 6);
+    memcpy(out_frame + 6, link_address(), 6);
     put_be16(out_frame + 12, type);
 }
 
@@ -172,7 +207,7 @@ static int send_udp(const boot_uint8_t* destination_mac, boot_uint32_t destinati
        comes out zero is sent as all ones. The two are equal in one's
        complement; only the meaning differs. */
     put_be16(udp + 6, sum ? sum : 0xFFFF);
-    return usb_net_send(out_frame, ETHERNET_HEADER + 20 + 8 + length);
+    return link_send(out_frame, ETHERNET_HEADER + 20 + 8 + length);
 }
 
 /* ---- ARP ----------------------------------------------------------------- */
@@ -187,11 +222,11 @@ static int send_arp(boot_uint16_t operation, const boot_uint8_t* target_mac,
     arp[4] = 6;
     arp[5] = 4;
     put_be16(arp + 6, operation);
-    memcpy(arp + 8, usb_net_address(), 6);
+    memcpy(arp + 8, link_address(), 6);
     put_be32(arp + 14, our_address);
     memcpy(arp + 18, operation == 1 ? broadcast_mac : target_mac, 6);
     put_be32(arp + 24, target_address);
-    return usb_net_send(out_frame, ETHERNET_HEADER + 28);
+    return link_send(out_frame, ETHERNET_HEADER + 28);
 }
 
 static void handle_arp(const boot_uint8_t* arp, boot_uint32_t length) {
@@ -259,7 +294,7 @@ static void handle_icmp(const boot_uint8_t* ip, const boot_uint8_t* icmp,
         reply[0] = 0;                   /* echo reply */
         put_be16(reply + 2, 0);
         put_be16(reply + 2, checksum(reply, length));
-        usb_net_send(out_frame, ETHERNET_HEADER + 20 + length);
+        link_send(out_frame, ETHERNET_HEADER + 20 + length);
         return;
     }
 
@@ -299,7 +334,7 @@ int net_ping(boot_uint32_t address, boot_uint32_t timeout_ms) {
     put_be16(icmp + 2, checksum(icmp, 8 + 32));
 
     start = timer_ticks();
-    if (!usb_net_send(out_frame, ETHERNET_HEADER + 20 + 8 + 32)) return -1;
+    if (!link_send(out_frame, ETHERNET_HEADER + 20 + 8 + 32)) return -1;
 
     while (!timer_expired(start, timeout_ms)) {
         net_poll();
@@ -350,7 +385,7 @@ static boot_uint32_t begin_dhcp(boot_uint8_t type) {
     put_be32(dhcp_buffer + 4, dhcp_transaction);
     put_be16(dhcp_buffer + 10, 0x8000); /* answer by broadcast: we have no
                                            address yet to be answered at */
-    memcpy(dhcp_buffer + 28, usb_net_address(), 6);
+    memcpy(dhcp_buffer + 28, link_address(), 6);
     put_be32(dhcp_buffer + 236, DHCP_MAGIC);
 
     at = 240;
@@ -428,7 +463,7 @@ int net_start(void) {
     boot_uint32_t at;
     boot_uint8_t mac[6];
 
-    if (!usb_net_ready()) return 0;
+    if (!link_ready()) return 0;
     configured = 0;
     our_address = 0;
     neighbour_known = 0;
@@ -499,6 +534,58 @@ int net_start(void) {
     /* Learn the gateway now rather than on the first packet: it is the one
        thing that tells a working configuration from an address on a wire with
        nothing else on it. */
+    if (our_gateway) (void)resolve_neighbour(our_gateway, mac);
+    return 1;
+}
+
+/* Send an arbitrary datagram to an arbitrary place.
+ *
+ * This exists for one reason and it is worth naming: shipping the kernel log
+ * off the machine. Every failure this system has had on real hardware was
+ * diagnosed by carrying a USB stick between two rooms, one boot at a time, and
+ * the cost of that is not the walking - it is that a wrong guess costs a whole
+ * round trip. A machine that can hand over its own log turns an afternoon into
+ * a minute. */
+int net_send_to(boot_uint32_t address, boot_uint16_t port,
+                const void* data, boot_uint32_t length) {
+    boot_uint8_t mac[6];
+    boot_uint32_t target;
+
+    if (!configured || length > 1472) return 0;
+    target = ((address ^ our_address) & our_netmask) ? our_gateway : address;
+    if (!resolve_neighbour(target, mac)) return 0;
+    return send_udp(mac, address, 40001, port, (const boot_uint8_t*)data,
+                    length);
+}
+
+/* Set an address by hand instead of asking for one.
+ *
+ * There is not always somebody to ask. Two machines joined by one cable is a
+ * network with no DHCP server on it, and it is the network you end up with
+ * when the one you have is unreachable - which is how this came to be needed:
+ * a laptop that had to hand its log to a desktop, and a desktop that was
+ * itself behind a phone on a different subnet.
+ *
+ * A gateway of zero means there is nowhere else to go, which is exactly true
+ * of a cable between two machines, and the routing comparison already handles
+ * it: everything on this wire goes direct, and there is nothing off it. */
+int net_configure(boot_uint32_t address, boot_uint32_t netmask,
+                  boot_uint32_t gateway, boot_uint32_t dns) {
+    boot_uint8_t mac[6];
+
+    if (!link_ready() || !address) return 0;
+
+    our_address = address;
+    our_netmask = netmask ? netmask : 0xFFFFFF00U;
+    our_gateway = gateway;
+    our_dns = dns;
+    neighbour_known = 0;
+    configured = 1;
+
+    /* Learn the gateway now if there is one, for the same reason DHCP does:
+       it is what tells a working configuration from an address on a wire with
+       nothing else on it. Failing is not fatal - the neighbour may simply not
+       be up yet. */
     if (our_gateway) (void)resolve_neighbour(our_gateway, mac);
     return 1;
 }
@@ -667,16 +754,16 @@ void net_poll(void) {
     /* The controller collects frames into its own queue as its events arrive,
        and that only happens when somebody drains the event ring - so this has
        to do both halves. */
-    xhci_poll();
+    link_collect();
 
-    while ((length = usb_net_receive(in_frame, sizeof(in_frame))) != 0) {
+    while ((length = link_receive(in_frame, sizeof(in_frame))) != 0) {
         boot_uint16_t type;
 
         if (length < ETHERNET_HEADER) continue;
         /* Addressed to us or to everyone. The device filters too, but it was
            asked to pass multicast and this is cheaper than parsing what it
            passed. */
-        if (in_frame[0] != 0xFF && memcmp(in_frame, usb_net_address(), 6) != 0)
+        if (in_frame[0] != 0xFF && memcmp(in_frame, link_address(), 6) != 0)
             continue;
 
         type = get_be16(in_frame + 12);
@@ -695,7 +782,26 @@ boot_uint32_t net_netmask(void) { return our_netmask; }
 boot_uint32_t net_gateway(void) { return our_gateway; }
 boot_uint32_t net_dns(void) { return our_dns; }
 
-const boot_uint8_t* net_hardware_address(void) { return usb_net_address(); }
+const boot_uint8_t* net_hardware_address(void) { return link_address(); }
+
+int net_link_ready(void) { return link_ready(); }
+
+const char* net_link_name(void) {
+    if (e1000_ready()) return e1000_link_down() ? "Ethernet (no cable)"
+                                                : "Ethernet";
+    if (usb_net_ready()) return "USB (RNDIS)";
+    return "none";
+}
+
+void net_traffic(boot_uint32_t* sent, boot_uint32_t* received,
+                 boot_uint32_t* lost) {
+    if (using_card()) {
+        e1000_counters(sent, received, lost);
+        return;
+    }
+    usb_net_counters(sent, received, lost);
+    *lost += usb_net_dropped();
+}
 
 int net_parse_address(const char* text, boot_uint32_t* out) {
     boot_uint32_t value = 0;

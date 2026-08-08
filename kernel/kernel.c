@@ -22,6 +22,7 @@
 #include "build.h"
 #include "xhci.h"
 #include "ehci.h"
+#include "e1000.h"
 #include "graphics.h"
 #include "audio.h"
 #include "timer.h"
@@ -269,6 +270,21 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
             report("AUDIO: ");
             report(audio_failure());
             report("\n");
+        }
+
+        /* The network card, if there is one. Before USB, because a card is
+           the thing that sits still: it says whether a cable is in it, which
+           is more than a phone will tell anybody. */
+        for (boot_uint32_t index = 0; index < pci_device_count(); index++) {
+            const PCI_DEVICE* entry = pci_device(index);
+            if (!entry || entry->class_code != 0x02 || entry->subclass != 0x00)
+                continue;
+            if (entry->vendor_id != 0x8086) continue;
+            if (e1000_init(entry)) {
+                report("ETHERNET: ");
+                report(e1000_link_down() ? "NO CABLE\n" : "LINK UP\n");
+            }
+            break;
         }
 
         /* USB 2.0 controllers, before the USB 3 ones so that the log reads

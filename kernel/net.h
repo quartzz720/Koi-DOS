@@ -22,6 +22,14 @@
    question nobody answers. */
 int net_start(void);
 
+/* Is there anything to send frames over - a card or a phone - and which. */
+int net_link_ready(void);
+const char* net_link_name(void);
+
+/* Frames out, frames in, and frames lost, whichever wire is carrying them. */
+void net_traffic(boot_uint32_t* sent, boot_uint32_t* received,
+                 boot_uint32_t* lost);
+
 /* Has that happened, and what did it get us? Addresses in host order. */
 int net_configured(void);
 boot_uint32_t net_address(void);
@@ -35,6 +43,18 @@ const boot_uint8_t* net_hardware_address(void);
    that waits for a keystroke, so a machine sitting at the prompt is still a
    machine that replies. */
 void net_poll(void);
+
+/* Take the interface up with an address chosen by hand. Netmask zero means a
+   /24; gateway and name server may be zero, which is what a cable between two
+   machines looks like. */
+int net_configure(boot_uint32_t address, boot_uint32_t netmask,
+                  boot_uint32_t gateway, boot_uint32_t dns);
+
+/* One datagram to one place. At most 1472 bytes - what fits in an Ethernet
+   frame once the IP and UDP headers are in it - because nothing here
+   fragments. Returns 1 when it went. */
+int net_send_to(boot_uint32_t address, boot_uint16_t port,
+                const void* data, boot_uint32_t length);
 
 /* Look up a name. Returns 1 and fills `out` in host order, or 0. */
 int net_resolve(const char* name, boot_uint32_t* out);

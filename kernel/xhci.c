@@ -2994,6 +2994,62 @@ boot_uint32_t usb_net_dropped(void) {
     return network_dropped;
 }
 
+/* What the controller thinks of the endpoints, in its own words.
+ *
+ * "Four frames sent and none received" is the end of what the driver can say
+ * about itself. Everything it believes about those transfers comes from
+ * completion codes, and a completion code says the controller finished with a
+ * descriptor - not that anything left the machine.
+ *
+ * The output device context is the other side of that: the controller writes
+ * its own state there and it is never read here at all. An endpoint in Error
+ * or Halted while every transfer reports success is a thing that can happen
+ * and would look exactly like this. */
+void usb_net_diagnose(void) {
+    XHCI_CONTROLLER* self;
+    static const char* states[] = {
+        "disabled", "running", "halted", "stopped", "error",
+        "state 5", "state 6", "state 7"
+    };
+
+    if (!network_device || !network_device->context) {
+        log("XHCI: there is no network device to ask about\n");
+        return;
+    }
+    self = network_device->controller;
+
+    {
+        const boot_uint32_t* slot =
+            (const boot_uint32_t*)network_device->context;
+        log_controller(self);
+        log("slot state ");
+        log_dec((slot[3] >> 27) & 0x1F);
+        log(", address ");
+        log_dec(slot[3] & 0xFF);
+        log(", route ");
+        log_hex(slot[0] & 0xFFFFF);
+        log("\n");
+    }
+
+    for (int which = 0; which < 2; which++) {
+        boot_uint32_t dci = which ? network_out_dci : network_in_dci;
+        const boot_uint32_t* endpoint = (const boot_uint32_t*)
+            (network_device->context + self->context_size * dci);
+
+        log_controller(self);
+        log(which ? "out endpoint " : "in endpoint ");
+        log_dec(dci);
+        log(": ");
+        log(states[endpoint[0] & 0x07]);
+        log(", packet ");
+        log_dec((endpoint[1] >> 16) & 0xFFFF);
+        log(", dequeue ");
+        log_hex(((boot_uint64_t)endpoint[3] |
+                 ((boot_uint64_t)endpoint[2] << 32)) & ~0xFULL);
+        log("\n");
+    }
+}
+
 void usb_net_counters(boot_uint32_t* sent, boot_uint32_t* received,
                       boot_uint32_t* failed) {
     *sent = network_sent;

@@ -91,4 +91,9 @@ boot_uint32_t usb_net_dropped(void);
 void usb_net_counters(boot_uint32_t* sent, boot_uint32_t* received,
                       boot_uint32_t* failed);
 
+/* Ask the controller what state it has the network endpoints in, and log it.
+   Everything else this driver reports is what it believes; this is what the
+   hardware says. */
+void usb_net_diagnose(void);
+
 #endif
