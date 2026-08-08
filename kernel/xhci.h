@@ -96,4 +96,9 @@ void usb_net_counters(boot_uint32_t* sent, boot_uint32_t* received,
    hardware says. */
 void usb_net_diagnose(void);
 
+/* Send one harmless frame over the USB network device and report what the
+   hardware did, whatever else is carrying the protocol stack. For testing a
+   phone from a machine whose log leaves over a different wire. */
+void usb_net_probe(void);
+
 #endif

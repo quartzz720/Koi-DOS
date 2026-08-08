@@ -136,7 +136,11 @@ fi
 if [ "${KOI_E1000:-1}" = "0" ]; then
     ETHERNET_ARGS=""
 else
-    ETHERNET_ARGS="-netdev user,id=koieth -device e1000e,netdev=koieth,id=eth0"
+    # tftp= makes slirp serve the package tree itself, on the port it already
+    # intercepts. Better than pointing the guest at a server on this machine:
+    # the client is then tested against somebody else's implementation of the
+    # protocol rather than against its own author's.
+    ETHERNET_ARGS="-netdev user,id=koieth,tftp=$HOME/TestOS/DOSGET -device e1000e,netdev=koieth,id=eth0"
 fi
 
 if [ -n "${KOI_AUDIO_WAV:-}" ]; then

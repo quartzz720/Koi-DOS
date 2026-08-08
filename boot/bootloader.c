@@ -6,6 +6,14 @@ _Static_assert(sizeof(BOOT_MEMORY_DESCRIPTOR) == sizeof(EFI_MEMORY_DESCRIPTOR),
                "Boot memory descriptor must match the UEFI descriptor layout");
 
 #define KERNEL_PATH L"\\BOOT\\KERNEL.ELF"
+/* The kernel that was running before the last update.
+ *
+ * `dosget update` writes a new kernel and keeps the old one here. That is the
+ * whole safety of updating a system over the network: the new one either
+ * starts, or it does not and the previous one does. Without this, a bad
+ * kernel is a machine that needs a USB stick - which is the thing the network
+ * was meant to retire. */
+#define KERNEL_FALLBACK_PATH L"\\BOOT\\KERNEL.BAK"
 #define KERNEL_MAX_IMAGE (16ULL * 1024ULL * 1024ULL)
 #define KERNEL_STACK_PAGES 16ULL
 #define MEMORY_MAP_SLACK 8ULL
@@ -72,7 +80,7 @@ static EFI_STATUS boot_fail(CHAR16* stage, EFI_STATUS status) {
 
 /* Read the whole kernel file into pool memory. The caller frees it. */
 static EFI_STATUS read_kernel_file(EFI_HANDLE image_handle, UINT8** contents,
-                                   UINTN* length) {
+                                   UINTN* length, CHAR16* path) {
     EFI_GUID loaded_image_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
     EFI_GUID filesystem_guid = EFI_SIMPLE_FILE_SYSTEM_PROTOCOL_GUID;
     EFI_GUID file_info_guid = EFI_FILE_INFO_GUID;
@@ -94,7 +102,7 @@ static EFI_STATUS read_kernel_file(EFI_HANDLE image_handle, UINT8** contents,
     if (status != EFI_SUCCESS) return status;
     status = filesystem->OpenVolume(filesystem, &root);
     if (status != EFI_SUCCESS) return status;
-    status = root->Open(root, &kernel, KERNEL_PATH, EFI_FILE_MODE_READ, 0);
+    status = root->Open(root, &kernel, path, EFI_FILE_MODE_READ, 0);
     root->Close(root);
     if (status != EFI_SUCCESS) return status;
 
@@ -182,7 +190,7 @@ static EFI_STATUS validate_elf(const ELF64_HEADER* header, UINTN length) {
  * AllocateAddress call and zeroed first: that covers .bss (which occupies no
  * space in the file) and any padding between segments, so nothing is left
  * holding firmware garbage. */
-static EFI_STATUS load_kernel(EFI_HANDLE image_handle) {
+static EFI_STATUS load_kernel(EFI_HANDLE image_handle, CHAR16* which) {
     UINT8* contents = NULL;
     UINTN length = 0;
     const ELF64_HEADER* header;
@@ -193,7 +201,7 @@ static EFI_STATUS load_kernel(EFI_HANDLE image_handle) {
     UINTN pages;
     EFI_STATUS status;
 
-    status = read_kernel_file(image_handle, &contents, &length);
+    status = read_kernel_file(image_handle, &contents, &length, which);
     if (status != EFI_SUCCESS) return status;
 
     header = (const ELF64_HEADER*)contents;
@@ -354,8 +362,17 @@ EFI_STATUS efi_main(EFI_HANDLE image_handle, EFI_SYSTEM_TABLE* st) {
     status = get_framebuffer();
     if (status != EFI_SUCCESS) return boot_fail(L"framebuffer", status);
     get_boot_volume_serial(image_handle);
-    status = load_kernel(image_handle);
-    if (status != EFI_SUCCESS) return boot_fail(L"kernel load", status);
+    status = load_kernel(image_handle, KERNEL_PATH);
+    if (status != EFI_SUCCESS) {
+        /* The one that was here before the last update, if there is one.
+           Said out loud: a machine that quietly runs a different kernel from
+           the one that was installed is worse than one that will not start,
+           because the second is obvious and the first is not. */
+        system_table->ConOut->OutputString(system_table->ConOut,
+            L"The kernel would not load; falling back to the previous one.\r\n");
+        status = load_kernel(image_handle, KERNEL_FALLBACK_PATH);
+        if (status != EFI_SUCCESS) return boot_fail(L"kernel load", status);
+    }
     trace("KOI BOOT: kernel loaded\r\n");
     status = st->BootServices->AllocatePages(AllocateAnyPages, EfiLoaderData,
         KERNEL_STACK_PAGES, &stack);

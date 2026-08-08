@@ -29,8 +29,13 @@
 #define SYSCALL_VECTOR 0x40
 
 /* Major in the high byte, minor in the low one. Reported by SYS_VERSION and
-   printed by `ver`. */
-#define KOI_DOS_VERSION 0x0005
+   printed by `ver`.
+ *
+ * 0.51 rather than 0.6: the jump from 0.5 is not a jump in what the system is,
+ * it is the point at which it stopped needing a USB stick to be changed. A
+ * machine that updates itself over the network is a different thing to live
+ * with than one that does not, and that is what beta means here. */
+#define KOI_DOS_VERSION 0x0033
 
 /* The interface's own version, which moves independently of the system's.
  *

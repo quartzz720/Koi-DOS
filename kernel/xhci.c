@@ -2325,6 +2325,9 @@ static boot_uint32_t network_frame_limit;
 static boot_uint8_t network_in_address;
 static boot_uint8_t network_out_address;
 static boot_uint16_t network_out_packet;
+/* Which interface the class requests are addressed to, kept because the
+   conversation continues long after the descriptor that named it is gone. */
+static boot_uint8_t network_control_interface;
 static boot_uint8_t network_mac[6];
 static int network_ready;
 
@@ -2554,6 +2557,63 @@ static int rndis_set(USB_DEVICE* device, boot_uint8_t interface,
     return get32(buffer + 12) == RNDIS_STATUS_SUCCESS;
 }
 
+/* Collect anything the device has queued for us without being asked.
+ *
+ * RNDIS has a channel the other way: the device raises its interrupt endpoint
+ * to say a response is waiting, and the host fetches it. After the packet
+ * filter is set, a phone puts a media-connect indication there - and that is
+ * the moment it considers the link usable.
+ *
+ * Timing is the whole of it. Asked once, immediately after setup, the device
+ * answers with a stall, which means "nothing yet" and reads exactly like
+ * "nothing ever". The indication arrives a moment later, to an endpoint
+ * nobody is watching, and is never collected.
+ *
+ * A controller with nothing queued may hand back the last reply it gave
+ * rather than nothing at all, so only the two message types a device sends
+ * unasked are read as news. */
+static void drain_responses(USB_DEVICE* device, boot_uint8_t interface,
+                            boot_uint8_t* buffer) {
+    XHCI_CONTROLLER* self = device->controller;
+
+    for (int drain = 0; drain < 4; drain++) {
+        boot_uint32_t type;
+        int got = control_in(device, 0xA1, RNDIS_GET_RESPONSE, 0, interface,
+                             buffer, PAGE_SIZE);
+
+        if (got < 0) {
+            /* A device with nothing queued refuses the request, and a refusal
+               halts endpoint zero - which is the one endpoint everything else
+               about this device goes through.
+             *
+             * Left halted, as it was, the control channel is dead from the
+             * moment setup finishes: every later request fails, and the
+             * symptom is not a stall but silence, because a halted endpoint
+             * does not answer at all. So the poll that was meant to find out
+             * whether the link was up was itself breaking the connection it
+             * was asking about. */
+            clear_control_halt(device);
+            break;
+        }
+        if (got < 12) break;
+        type = get32(buffer + 0);
+        if (type != RNDIS_INDICATE_STATUS && type != RNDIS_KEEPALIVE) break;
+
+        log_controller(self);
+        if (type == RNDIS_KEEPALIVE) {
+            log("the device asked whether we are still here\n");
+        } else {
+            boot_uint32_t status = get32(buffer + 8);
+            log("the device says the link is ");
+            if (status == RNDIS_STATUS_MEDIA_CONNECT) log("up\n");
+            else if (status == RNDIS_STATUS_MEDIA_DISCONNECT)
+                log("down - tethering is on but not carrying anything\n");
+            else { log("in state "); log_hex(status); log("\n"); }
+        }
+        timer_wait(20);
+    }
+}
+
 /* Introduce ourselves, and report what the device says it can do. */
 static int rndis_initialize(USB_DEVICE* device, boot_uint8_t interface,
                             boot_uint8_t* buffer, boot_uint32_t size,
@@ -2710,46 +2770,9 @@ static int configure_network(USB_DEVICE* device,
             log("the packet filter was refused - it will hand over nothing\n");
         }
 
-        /* And whatever the device has been holding for us.
-         *
-         * RNDIS has a second channel the other way: the device raises its
-         * interrupt endpoint to say "there is a response waiting" and the host
-         * fetches it. After initialize, Android puts a media-connect
-         * indication there and waits. Nothing here ever collected it, and a
-         * device whose response queue is never drained is a device that has
-         * said the link is up and had nobody listen - which is exactly what
-         * four frames sent and none received looks like.
-         *
-         * Drained by asking rather than by watching the interrupt endpoint.
-         * That endpoint is the proper way and is worth having; this is the
-         * cheap half of it, and it either changes the symptom or rules the
-         * whole idea out. */
-        for (int drain = 0; drain < 4; drain++) {
-            int got = control_in(device, 0xA1, RNDIS_GET_RESPONSE, 0,
-                                 network.control, buffer, PAGE_SIZE);
-            boot_uint32_t type;
-
-            if (got < 12) break;
-            type = get32(buffer + 0);
-            /* Only the two kinds a device sends unasked. A controller with
-               nothing queued may hand back the last reply it gave rather than
-               nothing at all - QEMU's does - and treating that as news would
-               be reading an echo as a message. */
-            if (type != RNDIS_INDICATE_STATUS && type != RNDIS_KEEPALIVE) break;
-
-            log_controller(self);
-            if (type == RNDIS_KEEPALIVE) {
-                log("the device asked whether we are still here\n");
-            } else {
-                boot_uint32_t status = get32(buffer + 8);
-                log("the device says the link is ");
-                if (status == RNDIS_STATUS_MEDIA_CONNECT) log("up\n");
-                else if (status == RNDIS_STATUS_MEDIA_DISCONNECT)
-                    log("down - tethering is on but not carrying anything\n");
-                else { log("in state "); log_hex(status); log("\n"); }
-            }
-            timer_wait(20);
-        }
+        /* And whatever the device has been holding for us, if anything
+           yet - see drain_responses below for why "yet" matters. */
+        drain_responses(device, network.control, buffer);
 
         max_frame = max_transfer;
         free_page(buffer);
@@ -2813,6 +2836,7 @@ static int configure_network(USB_DEVICE* device,
         network_in_address = network.in_address;
         network_out_address = network.out_address;
         network_out_packet = network.out_packet;
+        network_control_interface = network.control;
         network_frame_limit = max_frame;
         log_controller(self);
         log("frame channels open, up to ");
@@ -3044,10 +3068,82 @@ void usb_net_diagnose(void) {
         log(", packet ");
         log_dec((endpoint[1] >> 16) & 0xFFFF);
         log(", dequeue ");
-        log_hex(((boot_uint64_t)endpoint[3] |
-                 ((boot_uint64_t)endpoint[2] << 32)) & ~0xFULL);
+        /* Low half first. The two were the wrong way round here, which turns
+           a perfectly good address into a number that looks like corruption -
+           a diagnostic that lies is worse than none. */
+        log_hex(((boot_uint64_t)endpoint[2] |
+                 ((boot_uint64_t)endpoint[3] << 32)) & ~0xFULL);
         log("\n");
     }
+}
+
+/* Exercise the USB network device on its own, whatever else is carrying the
+ * protocol stack.
+ *
+ * With a cable plugged in the stack prefers the card and never touches the
+ * phone, which is correct and made the phone untestable: the one machine that
+ * could report on it was the one whose report had to travel over the thing
+ * being tested. So this pokes the device directly and writes what happens to
+ * the log, which then leaves over the wire that is working.
+ *
+ * The frame is a broadcast ARP request for an address nobody has. It is the
+ * smallest thing that is unambiguously a real frame - a device that forwards
+ * it is bridging, and one that does not is not - and it disturbs nothing. */
+void usb_net_probe(void) {
+    boot_uint8_t frame[60];
+    boot_uint32_t before_sent = network_sent;
+    boot_uint32_t before_received = network_received;
+
+    if (!network_ready) {
+        log("XHCI: there is no USB network device\n");
+        return;
+    }
+
+    log("XHCI: probing the USB network device\n");
+    usb_net_diagnose();
+
+    memset(frame, 0, sizeof(frame));
+    memset(frame, 0xFF, 6);                       /* to everybody */
+    memcpy(frame + 6, network_mac, 6);
+    frame[12] = 0x08; frame[13] = 0x06;           /* ARP */
+    frame[14] = 0x00; frame[15] = 0x01;           /* over Ethernet */
+    frame[16] = 0x08; frame[17] = 0x00;           /* for IPv4 */
+    frame[18] = 6; frame[19] = 4;
+    frame[21] = 1;                                /* a request */
+    memcpy(frame + 22, network_mac, 6);
+    /* From 0.0.0.0, asking about 0.0.0.0: a probe that claims nothing and
+       cannot be mistaken for a machine appearing on the network. */
+
+    log("XHCI: sending one frame\n");
+    if (!usb_net_send(frame, sizeof(frame)))
+        log("XHCI: the device would not take it\n");
+
+    /* Whatever comes back, given a moment to arrive. */
+    for (int wait = 0; wait < 20; wait++) {
+        xhci_poll();
+        timer_wait(50);
+    }
+
+    /* And whatever the device has queued since it was set up, which is the
+       interesting question: at setup it had nothing, and the moment it decides
+       the link is usable comes afterwards. */
+    {
+        boot_uint8_t* buffer = (boot_uint8_t*)alloc_page();
+        if (buffer) {
+            log("XHCI: asking again for anything the device has to say\n");
+            drain_responses(network_device, network_control_interface, buffer);
+            free_page(buffer);
+        }
+    }
+
+    log("XHCI: after the probe, sent ");
+    log_dec(network_sent - before_sent);
+    log(", received ");
+    log_dec(network_received - before_received);
+    log(", receive errors ");
+    log_dec(network_receive_errors);
+    log("\n");
+    usb_net_diagnose();
 }
 
 void usb_net_counters(boot_uint32_t* sent, boot_uint32_t* received,

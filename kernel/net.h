@@ -56,6 +56,23 @@ int net_configure(boot_uint32_t address, boot_uint32_t netmask,
 int net_send_to(boot_uint32_t address, boot_uint16_t port,
                 const void* data, boot_uint32_t length);
 
+/* The same, from a chosen source port - which for some protocols is not a
+   detail: it is the address the other end replies to and identifies the
+   conversation. */
+int net_send_from(boot_uint16_t source_port, boot_uint32_t address,
+                  boot_uint16_t port, const void* data, boot_uint32_t length);
+
+/* Collect datagrams addressed to one port. `net_listen(0)` stops.
+ *
+ * One datagram is held at a time. Everything that uses this sends a request
+ * and waits for its reply before sending the next, so a queue would be storage
+ * for a situation that does not arise. */
+void net_listen(boot_uint16_t port);
+
+/* Wait for one, and say where it came from. Returns its length, or -1. */
+int net_receive_from(void* data, boot_uint32_t size, boot_uint32_t timeout_ms,
+                     boot_uint32_t* address, boot_uint16_t* port);
+
 /* Look up a name. Returns 1 and fills `out` in host order, or 0. */
 int net_resolve(const char* name, boot_uint32_t* out);
 

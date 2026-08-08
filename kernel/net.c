@@ -67,6 +67,19 @@ static boot_uint32_t dns_pending_id;
 static boot_uint32_t dns_result;
 static int dns_answered;
 
+/* One datagram, kept for whoever asked to listen on the port it arrived at.
+ *
+ * A single slot rather than a queue, because the things that use it - a file
+ * transfer, a name lookup - send one request and wait for one reply before
+ * sending the next. A second datagram arriving before the first is collected
+ * would mean two conversations at once, which nothing here does. */
+static boot_uint16_t listen_port;
+static boot_uint8_t inbox[1472];
+static boot_uint32_t inbox_length;
+static boot_uint32_t inbox_address;
+static boot_uint16_t inbox_port;
+static int inbox_full;
+
 static int dhcp_offer_seen;
 static int dhcp_ack_seen;
 static boot_uint32_t dhcp_transaction;
@@ -548,14 +561,47 @@ int net_start(void) {
  * a minute. */
 int net_send_to(boot_uint32_t address, boot_uint16_t port,
                 const void* data, boot_uint32_t length) {
+    return net_send_from(40001, address, port, data, length);
+}
+
+int net_send_from(boot_uint16_t source_port, boot_uint32_t address,
+                  boot_uint16_t port, const void* data, boot_uint32_t length) {
     boot_uint8_t mac[6];
     boot_uint32_t target;
 
     if (!configured || length > 1472) return 0;
     target = ((address ^ our_address) & our_netmask) ? our_gateway : address;
     if (!resolve_neighbour(target, mac)) return 0;
-    return send_udp(mac, address, 40001, port, (const boot_uint8_t*)data,
-                    length);
+    return send_udp(mac, address, source_port, port,
+                    (const boot_uint8_t*)data, length);
+}
+
+/* Listen on a port, or stop. Opening one throws away anything already in the
+   slot: a reply to a conversation that is over is not wanted by the next. */
+void net_listen(boot_uint16_t port) {
+    listen_port = port;
+    inbox_full = 0;
+    inbox_length = 0;
+}
+
+int net_receive_from(void* data, boot_uint32_t size, boot_uint32_t timeout_ms,
+                     boot_uint32_t* address, boot_uint16_t* port) {
+    boot_uint64_t start = timer_ticks();
+
+    while (!timer_expired(start, timeout_ms)) {
+        net_poll();
+        if (inbox_full) {
+            boot_uint32_t length = inbox_length;
+
+            if (length > size) length = size;
+            memcpy(data, inbox, length);
+            if (address) *address = inbox_address;
+            if (port) *port = inbox_port;
+            inbox_full = 0;
+            return (int)length;
+        }
+    }
+    return -1;
 }
 
 /* Set an address by hand instead of asking for one.
@@ -712,13 +758,25 @@ int net_resolve(const char* name, boot_uint32_t* out) {
 
 /* ---- Receiving ----------------------------------------------------------- */
 
-static void handle_udp(const boot_uint8_t* udp, boot_uint32_t length) {
+static void handle_udp(const boot_uint8_t* udp, boot_uint32_t length,
+                       boot_uint32_t source_address) {
     boot_uint16_t destination;
 
     if (length < 8) return;
     destination = get_be16(udp + 2);
-    if (destination == DHCP_CLIENT_PORT) handle_dhcp(udp + 8, length - 8);
-    else if (get_be16(udp + 0) == 53) handle_dns(udp + 8, length - 8);
+    if (destination == DHCP_CLIENT_PORT) { handle_dhcp(udp + 8, length - 8); return; }
+    if (get_be16(udp + 0) == 53) { handle_dns(udp + 8, length - 8); return; }
+
+    if (listen_port && destination == listen_port && !inbox_full) {
+        boot_uint32_t payload = length - 8;
+
+        if (payload > sizeof(inbox)) payload = sizeof(inbox);
+        memcpy(inbox, udp + 8, payload);
+        inbox_length = payload;
+        inbox_port = get_be16(udp + 0);
+        inbox_address = source_address;
+        inbox_full = 1;
+    }
 }
 
 static void handle_ip(const boot_uint8_t* ip, boot_uint32_t length) {
@@ -743,7 +801,9 @@ static void handle_ip(const boot_uint8_t* ip, boot_uint32_t length) {
 
     switch (ip[9]) {
     case IP_PROTOCOL_ICMP: handle_icmp(ip, ip + header, total - header); break;
-    case IP_PROTOCOL_UDP: handle_udp(ip + header, total - header); break;
+    case IP_PROTOCOL_UDP:
+        handle_udp(ip + header, total - header, get_be32(ip + 12));
+        break;
     default: break;
     }
 }

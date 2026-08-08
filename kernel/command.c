@@ -14,6 +14,7 @@
 #include "graphics.h"
 #include "net.h"
 #include "e1000.h"
+#include "tftp.h"
 #include "timer.h"
 #include "fat32.h"
 #include "partition.h"
@@ -319,7 +320,7 @@ static void print_prompt(void) {
 }
 
 /* The build stamp is worth more than the version during development: two
-   kernels claiming 0.5 differ by whatever happened between them, and the
+   kernels claiming 0.51 differ by whatever happened between them, and the
    number is the only way to tell from the screen which one is running. It is
    the commit count, so it only moves when history does; a trailing `+` on the
    hash means the tree had uncommitted changes when this was built. */
@@ -328,7 +329,7 @@ static void command_ver(void) {
     print_dec(KOI_DOS_VERSION >> 8);
     put('.');
     print_dec(KOI_DOS_VERSION & 0xFF);
-    print_line(" Alpha");
+    print_line(" Beta");
 
     print("Kernel ");
     print_dec(KOI_DOS_VERSION >> 8);
@@ -371,7 +372,9 @@ static void command_help(void) {
     print_line("sound          the sound device, and which output it picked");
     print_line("net [start]    the network: what it is, or ask for an address");
     print_line("net set <..>   set an address by hand, for a wire with no server");
+    print_line("net usb        test the USB network device on its own");
     print_line("ping <host>    is it there, and how far away");
+    print_line("dosget <..>    packages: list, install, update");
     print_line("log [file]     the kernel log: on screen, or written to a file");
     print_line("log net <addr> send the kernel log to another machine over UDP");
     print_line("ver            show the version");
@@ -1132,6 +1135,523 @@ static void remount_everything(void) {
     current_volume = volume_boot();
     current_path[0] = '\\';
     current_path[1] = 0;
+}
+
+
+/* ---- dosget --------------------------------------------------------------
+ *
+ * A package manager, named the way winget is named and behaving the way dnf
+ * behaves: install fetches and unpacks, update brings everything already here
+ * up to date, list says what there is.
+ *
+ * The transport is deliberately the weakest part. It is TFTP today because
+ * this system has UDP and not TCP, and the whole arrangement is built so that
+ * changing it costs one line in a file: the source is read from
+ * \BOOT\dosget.cfg on every invocation, never cached, never read at boot. An
+ * installed system can be pointed somewhere else and use it immediately -
+ * which is the difference between a package manager and a hardcoded address.
+ *
+ * A package goes into a directory of its own at the root, beside DOOM: a
+ * program with data files should not scatter them into a shared BIN.
+ */
+
+/* Does a line begin with this key? Case-insensitive, because a configuration
+   file is written by a person and people do not agree about capitals. */
+/* Append a separator and a word to a path, and never past the end. Paths here
+   are built out of three or four pieces and a separate length check at each
+   join is how one of them eventually gets forgotten. */
+static void string_join(char* into, boot_uint32_t size, const char* separator,
+                        const char* word) {
+    boot_uint32_t at = 0;
+
+    while (into[at]) at++;
+    while (*separator && at + 1 < size) into[at++] = *separator++;
+    while (*word && at + 1 < size) into[at++] = *word++;
+    into[at] = 0;
+}
+
+static int prefix_matches(const char* text, const char* key) {
+    while (*key) {
+        if (upper(*text) != upper(*key)) return 0;
+        text++;
+        key++;
+    }
+    return 1;
+}
+
+#define DOSGET_CONFIG "\\BOOT\\dosget.cfg"
+#define DOSGET_DEFAULT_SOURCE "192.168.50.1"
+#define DOSGET_BUFFER (1024 * 1024)
+/* What is installed and at which version. One `NAME VERSION` per line, on the
+   boot volume beside the loader, because a record of what the system is made
+   of belongs with the system rather than inside one of its packages. */
+#define DOSGET_DATABASE "\\BOOT\\DOSGET.DB"
+
+/* Where packages come from, asked afresh every time.
+ *
+ * Read rather than remembered on purpose. A setting that is loaded at boot is
+ * a setting that needs a reboot to change, and the machine this runs on is one
+ * whose network arrangements change several times an afternoon. */
+static int dosget_source(boot_uint32_t* address) {
+    char text[64];
+    FAT_ENTRY entry;
+    boot_uint32_t got = 0;
+    boot_uint32_t at = 0;
+
+    if (current_volume && fat32_stat(current_volume, DOSGET_CONFIG, &entry)) {
+        boot_uint8_t page[512];
+        got = fat32_read(current_volume, &entry, 0, page, sizeof(page) - 1);
+        if (got) {
+            page[got] = 0;
+            /* One `key = value` per line, the same dull format the rest of the
+               system uses, and only one key understood so far. */
+            for (boot_uint32_t index = 0; index + 6 < got; index++) {
+                if (page[index] != 's' && page[index] != 'S') continue;
+                if (!prefix_matches((const char*)(page + index), "source")) continue;
+                index += 6;
+                while (index < got && (page[index] == ' ' || page[index] == '=' ||
+                                       page[index] == '\t')) index++;
+                while (index < got && at + 1 < sizeof(text) &&
+                       page[index] != '\r' && page[index] != '\n' &&
+                       page[index] != ' ')
+                    text[at++] = (char)page[index++];
+                text[at] = 0;
+                break;
+            }
+        }
+    }
+
+    if (!at) {
+        /* No file, or nothing usable in it. The default is the cable, which is
+           where this is developed and the one address that is always true of a
+           machine being worked on. */
+        const char* fallback = DOSGET_DEFAULT_SOURCE;
+        while (*fallback) text[at++] = *fallback++;
+        text[at] = 0;
+    }
+    return net_parse_address(text, address);
+}
+
+/* Fetch one file from the source into `buffer`. */
+static int dosget_fetch(boot_uint32_t source, const char* name, void* buffer,
+                        boot_uint32_t size) {
+    const char* why = (const char*)0;
+    int got = tftp_fetch(source, name, buffer, size, &why);
+
+    if (got < 0) {
+        print("  ");
+        print(name);
+        print(": ");
+        print_line(why ? why : "could not be fetched");
+        return -1;
+    }
+    return got;
+}
+
+/* Read one `key = value` line out of a manifest already in memory. Returns
+   where the value starts, or NULL. */
+static const char* manifest_value(const char* text, boot_uint32_t length,
+                                  const char* key, boot_uint32_t* from) {
+    boot_uint32_t at = from ? *from : 0;
+
+    while (at < length) {
+        boot_uint32_t start = at;
+
+        while (at < length && text[at] != '\n') at++;
+        if (prefix_matches(text + start, key)) {
+            boot_uint32_t value = start + (boot_uint32_t)strlen(key);
+            while (value < at && (text[value] == ' ' || text[value] == '=' ||
+                                  text[value] == '\t')) value++;
+            if (from) *from = at + 1;
+            return text + value;
+        }
+        at++;
+    }
+    if (from) *from = length;
+    return (const char*)0;
+}
+
+/* Copy a line's worth of text out, stopping at the end of the line. */
+static void take_line(const char* from, char* into, boot_uint32_t size) {
+    boot_uint32_t at = 0;
+
+    while (from && from[at] && from[at] != '\r' && from[at] != '\n' &&
+           at + 1 < size) {
+        into[at] = from[at];
+        at++;
+    }
+    into[at] = 0;
+}
+
+
+
+/* The version recorded for a package, or an empty string. */
+static void dosget_installed(const char* package, char* into,
+                             boot_uint32_t size) {
+    FAT_ENTRY entry;
+    char text[1024];
+    boot_uint32_t got;
+    boot_uint32_t at = 0;
+
+    into[0] = 0;
+    if (!current_volume) return;
+    if (!fat32_stat(current_volume, DOSGET_DATABASE, &entry)) return;
+    got = fat32_read(current_volume, &entry, 0, text, sizeof(text) - 1);
+    text[got] = 0;
+
+    while (at < got) {
+        boot_uint32_t start = at;
+
+        while (at < got && text[at] != '\n') at++;
+        if (prefix_matches(text + start, package)) {
+            boot_uint32_t value = start + (boot_uint32_t)strlen(package);
+
+            if (text[value] == ' ' || text[value] == '\t') {
+                while (text[value] == ' ' || text[value] == '\t') value++;
+                take_line(text + value, into, size);
+                return;
+            }
+        }
+        at++;
+    }
+}
+
+/* Write one down, replacing whatever was there for that name. */
+static void dosget_record(const char* package, const char* version) {
+    FAT_ENTRY entry;
+    char text[1024];
+    char rebuilt[1024];
+    boot_uint32_t got = 0;
+    boot_uint32_t at = 0;
+    boot_uint32_t out = 0;
+
+    if (!current_volume) return;
+    if (fat32_stat(current_volume, DOSGET_DATABASE, &entry)) {
+        got = fat32_read(current_volume, &entry, 0, text, sizeof(text) - 1);
+        fat32_remove(current_volume, DOSGET_DATABASE);
+    }
+    text[got] = 0;
+
+    /* Every line but this package's, then this package's, fresh. Rewritten
+       whole rather than edited in place: the file is a kilobyte and the
+       alternative is offsets. */
+    while (at < got) {
+        boot_uint32_t start = at;
+
+        while (at < got && text[at] != '\n') at++;
+        if (!prefix_matches(text + start, package)) {
+            for (boot_uint32_t index = start; index < at && out + 2 < sizeof(rebuilt); index++)
+                if (text[index] != '\r') rebuilt[out++] = text[index];
+            if (out + 2 < sizeof(rebuilt)) rebuilt[out++] = '\r', rebuilt[out++] = '\n';
+        }
+        at++;
+    }
+
+    /* Terminated before each join, because that is where the join starts
+       looking. Without it the first one scans uninitialised memory for a zero
+       byte and appends past whatever it finds - which put three bytes of
+       rubbish in front of every name in this file, and made a package that was
+       plainly installed look like one that was not. */
+    rebuilt[out] = 0;
+    string_join(rebuilt + out, sizeof(rebuilt) - out, "", package);
+    while (rebuilt[out]) out++;
+    rebuilt[out] = 0;
+    string_join(rebuilt + out, sizeof(rebuilt) - out, " ", version);
+    while (rebuilt[out]) out++;
+    if (out + 2 < sizeof(rebuilt)) rebuilt[out++] = '\r', rebuilt[out++] = '\n';
+
+    if (fat32_create(current_volume, DOSGET_DATABASE, 0, &entry))
+        (void)fat32_write(current_volume, &entry, 0, rebuilt, out);
+}
+
+/* `dosget list` - what the source has. */
+static void dosget_list(boot_uint32_t source, boot_uint8_t* buffer) {
+    int got = dosget_fetch(source, "INDEX", buffer, DOSGET_BUFFER - 1);
+    boot_uint32_t at = 0;
+
+    if (got < 0) return;
+    buffer[got] = 0;
+
+    print_line("PACKAGE      VERSION  SUMMARY");
+    while (at < (boot_uint32_t)got) {
+        char line[128];
+        boot_uint32_t start = at;
+
+        while (at < (boot_uint32_t)got && buffer[at] != '\n') at++;
+        take_line((const char*)(buffer + start), line, sizeof(line));
+        at++;
+        if (!line[0] || line[0] == '#') continue;
+        print_line(line);
+    }
+}
+
+/* Fetch one package's files and write them into a directory of its own. */
+static int dosget_install(boot_uint32_t source, const char* package,
+                          boot_uint8_t* buffer) {
+    char path[PATH_MAX];
+    char directory[PATH_MAX];
+    char manifest[1024];
+    char name[64];
+    char version[32];
+    boot_uint32_t manifest_length;
+    boot_uint32_t at = 0;
+    int files = 0;
+    FAT_ENTRY entry;
+
+    if (!current_volume) { print_line("No volume."); return 0; }
+
+    /* The manifest first: it names the files, and a package whose manifest is
+       missing is not a package this knows how to unpack. */
+    at = 0;
+    path[0] = 0;
+    string_join(path, sizeof(path), "packages/", package);
+    string_join(path, sizeof(path), "", "/MANIFEST");
+    {
+        int got = dosget_fetch(source, path, manifest, sizeof(manifest) - 1);
+        if (got < 0) return 0;
+        manifest[got] = 0;
+        manifest_length = (boot_uint32_t)got;
+    }
+
+    /* Where it goes. A package normally gets a directory of its own at the
+       root, beside DOOM - a program with data files should not scatter them
+       into a shared BIN. A package that replaces part of the system says so,
+       and SYSTEM is the one that does. */
+    {
+        const char* target = manifest_value(manifest, manifest_length,
+                                            "target", (boot_uint32_t*)0);
+        if (target) {
+            take_line(target, path, sizeof(path));
+        } else {
+            path[0] = '\\';
+            path[1] = 0;
+            string_join(path, sizeof(path), "", package);
+        }
+    }
+    /* Already there is not an error: installing over an older copy is the
+       ordinary case, and is most of what a package manager does. */
+    if (!fat32_stat(current_volume, path, &entry) &&
+        !fat32_create(current_volume, path, 1, &entry)) {
+        print("Could not make ");
+        print_line(path);
+        return 0;
+    }
+    {
+        char here[PATH_MAX];
+        boot_uint32_t at2 = 0;
+        while (path[at2]) { directory[at2] = path[at2]; at2++; }
+        directory[at2] = 0;
+        (void)here;
+    }
+
+    at = 0;
+    for (;;) {
+        const char* value = manifest_value(manifest, manifest_length, "file",
+                                           &at);
+        char remote[PATH_MAX];
+        char local[PATH_MAX];
+        int got;
+
+        if (!value) break;
+        take_line(value, name, sizeof(name));
+        if (!name[0]) continue;
+
+        remote[0] = 0;
+        string_join(remote, sizeof(remote), "packages/", package);
+        string_join(remote, sizeof(remote), "/", name);
+
+        got = dosget_fetch(source, remote, buffer, DOSGET_BUFFER);
+        if (got < 0) return 0;
+
+        local[0] = 0;
+        string_join(local, sizeof(local), "", directory);
+        string_join(local, sizeof(local), "\\", name);
+
+        /* The old copy is kept, not deleted, when it is part of the system.
+           A kernel that does not start is otherwise a machine that needs the
+           USB stick this whole arrangement exists to retire. */
+        if (fat32_stat(current_volume, local, &entry) &&
+            word_is(package, "SYSTEM")) {
+            char keep[PATH_MAX];
+            FAT_ENTRY previous;
+
+            keep[0] = 0;
+            string_join(keep, sizeof(keep), "", directory);
+            string_join(keep, sizeof(keep), "\\", "KERNEL.BAK");
+            if (fat32_stat(current_volume, keep, &previous))
+                fat32_remove(current_volume, keep);
+            if (fat32_create(current_volume, keep, 0, &previous)) {
+                boot_uint8_t* old = buffer + DOSGET_BUFFER / 2;
+                boot_uint32_t was = fat32_read(current_volume, &entry, 0, old,
+                                               DOSGET_BUFFER / 2);
+                if (was) (void)fat32_write(current_volume, &previous, 0, old, was);
+                print("  kept the old one as ");
+                print_line(keep);
+            }
+        }
+
+        if (fat32_stat(current_volume, local, &entry))
+            fat32_remove(current_volume, local);
+        if (!fat32_create(current_volume, local, 0, &entry)) {
+            print("Could not write ");
+            print_line(local);
+            return 0;
+        }
+        if (fat32_write(current_volume, &entry, 0, buffer,
+                        (boot_uint32_t)got) != (boot_uint32_t)got) {
+            print("Could not write all of ");
+            print_line(local);
+            return 0;
+        }
+
+        print("  ");
+        print(local);
+        print("  ");
+        print_dec((boot_uint64_t)got);
+        print_line(" bytes");
+        files++;
+    }
+
+    if (!files) {
+        print_line("The manifest names no files.");
+        return 0;
+    }
+
+    {
+        const char* value = manifest_value(manifest, manifest_length,
+                                           "version", (boot_uint32_t*)0);
+        take_line(value, version, sizeof(version));
+        dosget_record(package, version[0] ? version : "0");
+    }
+    return 1;
+}
+
+
+/* `dosget update` - everything already here, brought up to date.
+ *
+ * dnf's meaning of the word rather than apt's: it refreshes and upgrades in
+ * one go. A package is "already here" when the database says so, which is why
+ * installing writes to it. Packages nobody asked for are not installed by
+ * this, and packages that have not moved are not fetched twice. */
+static void dosget_update(boot_uint32_t source, boot_uint8_t* buffer) {
+    char index[2048];
+    boot_uint32_t at = 0;
+    boot_uint32_t got;
+    int changed = 0;
+
+    {
+        int fetched = dosget_fetch(source, "INDEX", index, sizeof(index) - 1);
+        if (fetched < 0) return;
+        index[fetched] = 0;
+        got = (boot_uint32_t)fetched;
+    }
+
+    while (at < got) {
+        char line[128];
+        char name[64];
+        char offered[32];
+        char here[32];
+        boot_uint32_t start = at;
+        boot_uint32_t split = 0;
+
+        while (at < got && index[at] != '\n') at++;
+        take_line(index + start, line, sizeof(line));
+        at++;
+        if (!line[0] || line[0] == '#') continue;
+
+        /* NAME VERSION SUMMARY, split at the first two spaces. */
+        while (line[split] && line[split] != ' ') split++;
+        if (!line[split]) continue;
+        line[split] = 0;
+        take_line(line, name, sizeof(name));
+        split++;
+        {
+            boot_uint32_t end = split;
+            while (line[end] && line[end] != ' ') end++;
+            line[end] = 0;
+            take_line(line + split, offered, sizeof(offered));
+        }
+
+        dosget_installed(name, here, sizeof(here));
+        if (!here[0]) continue;              /* not ours to update */
+        if (!strcmp(here, offered)) continue; /* already at that version */
+
+        print(name);
+        print(": ");
+        print(here);
+        print(" -> ");
+        print_line(offered);
+        if (dosget_install(source, name, buffer)) changed++;
+    }
+
+    if (!changed) {
+        print_line("Everything is already up to date.");
+        return;
+    }
+    print_dec((boot_uint64_t)changed);
+    print_line(" package(s) updated.");
+    print_line("");
+    print_line("A new kernel takes effect at the next boot. The old one is");
+    print_line("kept as \\BOOT\\KERNEL.BAK, and the loader falls back to it");
+    print_line("if the new one will not start.");
+}
+
+static void command_dosget(const ARGUMENTS* arguments) {
+    boot_uint32_t source = 0;
+    boot_uint8_t* buffer;
+    char shown[16];
+
+    if (!net_configured()) {
+        print_line("No address yet. Run `net start`, or `net set` on a cable.");
+        return;
+    }
+    if (!dosget_source(&source)) {
+        print("The source in " DOSGET_CONFIG " is not an address.");
+        print_line("");
+        return;
+    }
+
+    net_format_address(source, shown);
+
+    if (!arguments->operand[0][0]) {
+        print("Source          : ");
+        print_line(shown);
+        print_line("");
+        print_line("dosget list              what the source has");
+        print_line("dosget install <name>    fetch it and unpack it");
+        print_line("dosget update            bring everything here up to date");
+        print_line("");
+        print("The source is read from " DOSGET_CONFIG);
+        print_line(" every time,");
+        print_line("so it can be changed on a running system.");
+        return;
+    }
+
+    /* One buffer for the largest thing a package might carry, taken and given
+       back around the command rather than held: this is the only place in the
+       system that needs a quarter of a megabyte at once. */
+    buffer = (boot_uint8_t*)alloc_pages(DOSGET_BUFFER / PAGE_SIZE);
+    if (!buffer) { print_line("Out of memory."); return; }
+
+    print("Source: ");
+    print_line(shown);
+
+    if (word_is(arguments->operand[0], "LIST")) {
+        dosget_list(source, buffer);
+    } else if (word_is(arguments->operand[0], "INSTALL")) {
+        if (!arguments->operand[1][0]) {
+            print_line("Usage: dosget install <name>");
+        } else if (dosget_install(source, arguments->operand[1], buffer)) {
+            print(arguments->operand[1]);
+            print_line(" installed.");
+        }
+    } else if (word_is(arguments->operand[0], "UPDATE")) {
+        dosget_update(source, buffer);
+    } else {
+        print_line("dosget: list, install or update.");
+    }
+
+    free_pages(buffer, DOSGET_BUFFER / PAGE_SIZE);
 }
 
 /* ---- The installer ------------------------------------------------------- */
@@ -2749,10 +3269,21 @@ static void execute(const char* input) {
     if (word_is(input, "NET")) {
         if (word_is(arguments.operand[0], "START")) command_net_start();
         else if (word_is(arguments.operand[0], "SET")) command_net_set(&arguments);
+        else if (word_is(arguments.operand[0], "USB")) {
+            if (!usb_net_ready()) {
+                print_line("No USB network device.");
+            } else {
+                print_line("Probing the USB network device; the result is in");
+                print_line("the log, which can leave over the other wire.");
+                usb_net_probe();
+                print_line("Done.");
+            }
+        }
         else command_net();
         return;
     }
     if (word_is(input, "PING")) { command_ping(&arguments); return; }
+    if (word_is(input, "DOSGET")) { command_dosget(&arguments); return; }
     if (word_is(input, "LOG")) { command_log(&arguments); return; }
     if (word_is(input, "HELP")) { command_help(); return; }
     /* `echo.` prints a blank line - the DOS idiom for one, since a bare

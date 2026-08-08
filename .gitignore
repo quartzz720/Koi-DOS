@@ -45,3 +45,7 @@ Thumbs.db
 # Logs pulled off a machine with `log <file>`. Useful to look at, never worth
 # committing - they are one boot of one machine.
 *.log
+
+# Host-side bench helper, not part of the system
+lan.sh
+koi.log
