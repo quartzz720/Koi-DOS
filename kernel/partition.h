@@ -116,4 +116,10 @@ void partition_set_system_volume(VOLUME* system);
    pointing the shell at somebody else's system disk. */
 VOLUME* volume_boot(void);
 
+/* The partition the loader was started from, which is where the kernel lives.
+   The same volume as the system one on a single-volume disk, and a different
+   one - with no drive letter at all - on an installed machine. Anything
+   replacing the kernel writes here. */
+VOLUME* volume_loader(void);
+
 #endif

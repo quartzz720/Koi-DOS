@@ -31,14 +31,14 @@ KERNEL_SOURCES = kernel/kernel.c kernel/console.c kernel/font.c kernel/serial.c 
                  kernel/partition.c kernel/fat32.c kernel/command.c \
                  kernel/syscall.c kernel/program.c kernel/config.c kernel/xhci.c \
                  kernel/timer.c kernel/pci.c kernel/ahci.c kernel/nvme.c kernel/hpet.c \
-                 kernel/apic.c kernel/graphics.c kernel/hda.c kernel/audio.c kernel/net.c kernel/ehci.c kernel/e1000.c kernel/tftp.c
+                 kernel/apic.c kernel/graphics.c kernel/hda.c kernel/audio.c kernel/net.c kernel/ehci.c kernel/e1000.c kernel/tftp.c kernel/mouse.c
 KERNEL_HEADERS = kernel/kernel.h kernel/console.h kernel/font.h kernel/serial.h \
                  kernel/string.h kernel/io.h kernel/memory.h kernel/cpu.h \
                  kernel/idt.h kernel/pic.h kernel/acpi.h kernel/keyboard.h \
                  kernel/heap.h kernel/paging.h kernel/rtc.h kernel/block.h \
                  kernel/partition.h kernel/fat32.h kernel/command.h \
                  kernel/syscall.h kernel/program.h kernel/config.h kernel/xhci.h \
-                 kernel/graphics.h kernel/hda.h kernel/audio.h kernel/net.h kernel/ehci.h kernel/e1000.h kernel/tftp.h \
+                 kernel/graphics.h kernel/hda.h kernel/audio.h kernel/net.h kernel/ehci.h kernel/e1000.h kernel/tftp.h kernel/mouse.h \
                  include/syscall.h $(BUILD_HEADER) \
                  kernel/timer.h kernel/pci.h kernel/ahci.h kernel/nvme.h kernel/hpet.h kernel/apic.h \
                  include/bootinfo.h

@@ -23,6 +23,7 @@
 #include "xhci.h"
 #include "ehci.h"
 #include "e1000.h"
+#include "mouse.h"
 #include "graphics.h"
 #include "audio.h"
 #include "timer.h"
@@ -122,6 +123,11 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
         break;
     }
 
+    /* After the keyboard, because both live on the 8042 and the second port
+       is enabled by rewriting a configuration byte the first one just set. */
+    if (mouse_init(info->framebuffer_width, info->framebuffer_height))
+        report("MOUSE: PS/2 POINTER READY\n");
+
     timer_init();
     report("TIMER: PIT POLLING 1000 HZ\n");
 
@@ -193,6 +199,11 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
             /* Everything else has to move across in the same breath. An IRQ
                still expecting the 8259 would simply stop arriving, because the
                dispatcher now acknowledges the APIC instead. */
+            /* And the pointer's, which arrives on the same controller by a
+               different line and would otherwise stop the moment the 8259 is
+               left behind. */
+            if (mouse_present() && apic_route_irq(12, IRQ_BASE + 12))
+                report("MOUSE: MOVED TO THE IO APIC\n");
             if (keyboard_present_ps2() && apic_route_irq(1, IRQ_BASE + 1)) {
                 report("KEYBOARD: MOVED TO THE IO APIC\n");
             } else if (keyboard_present_ps2()) {

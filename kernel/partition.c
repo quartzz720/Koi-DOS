@@ -352,6 +352,15 @@ VOLUME* volume_by_letter(char letter) {
     return (VOLUME*)0;
 }
 
+/* The partition the firmware started the loader from. Not the same as the
+   system volume once an installation has marked one, and it is where the
+   loader looks for a kernel. */
+static VOLUME* loader_volume;
+
+VOLUME* volume_loader(void) {
+    return loader_volume ? loader_volume : volume_boot();
+}
+
 VOLUME* volume_boot(void) {
     for (boot_uint32_t index = 0; index < volumes_found; index++)
         if (volumes[index].is_boot_volume) return &volumes[index];
@@ -363,6 +372,13 @@ void partition_set_system_volume(VOLUME* system) {
     char letter = 'Z';
 
     if (!system || system == loader) return;
+    /* Remembered before the flag moves, because after this the loader's
+       volume has no letter and no mark, and nothing can find it again.
+     *
+     * Which matters more than it looks: the kernel lives on that partition,
+     * because that is the one the firmware hands to the loader. Anything that
+     * replaces the kernel has to write there and nowhere else. */
+    loader_volume = loader;
 
     for (boot_uint32_t index = 0; index < volumes_found; index++)
         volumes[index].is_boot_volume = 0;

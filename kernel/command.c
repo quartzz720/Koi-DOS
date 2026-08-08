@@ -15,6 +15,7 @@
 #include "net.h"
 #include "e1000.h"
 #include "tftp.h"
+#include "mouse.h"
 #include "timer.h"
 #include "fat32.h"
 #include "partition.h"
@@ -375,6 +376,7 @@ static void command_help(void) {
     print_line("net usb        test the USB network device on its own");
     print_line("ping <host>    is it there, and how far away");
     print_line("dosget <..>    packages: list, install, update");
+    print_line("pointer        move the pointer about; hold the button to draw");
     print_line("log [file]     the kernel log: on screen, or written to a file");
     print_line("log net <addr> send the kernel log to another machine over UDP");
     print_line("ver            show the version");
@@ -1138,6 +1140,84 @@ static void remount_everything(void) {
 }
 
 
+
+/* `pointer` - a screen, a cursor, and somewhere to move it.
+ *
+ * The smallest thing that proves a pointer works, and the first program in
+ * this system that is driven by something other than a keyboard. It draws
+ * where the pointer is, leaves a trail where the button was held, and says how
+ * many packets have arrived - because a device that was found and reports
+ * nothing looks exactly like a working one that nobody is touching. */
+static void command_pointer(void) {
+    GRAPHICS_SCREEN screen;
+    boot_uint32_t background;
+    boot_uint32_t ink;
+    boot_uint32_t trail;
+    int last_x;
+    int last_y;
+
+    if (!mouse_present()) {
+        print_line("No pointer. This machine has no PS/2 mouse or touchpad,");
+        print_line("or the firmware left its port switched off.");
+        return;
+    }
+    if (!graphics_enter(&screen)) {
+        print_line("The screen could not be taken.");
+        return;
+    }
+
+    background = graphics_color(16, 24, 40);
+    ink = graphics_color(230, 240, 255);
+    trail = graphics_color(80, 160, 220);
+    graphics_clear(background);
+    /* And shown. Clearing draws into the back buffer, and everything after
+       this presents only the small rectangle around the pointer - so without
+       this line the screen keeps the text that was there and the pointer
+       arrives as grey squares appearing over it, which reads as a machine
+       that has hung rather than one that is working. */
+    graphics_present();
+    mouse_place((int)screen.width / 2, (int)screen.height / 2);
+    last_x = mouse_x();
+    last_y = mouse_y();
+
+    for (;;) {
+        int x = mouse_x();
+        int y = mouse_y();
+
+        if (keyboard_pending() && keyboard_getchar() == 27) break;
+
+        if (mouse_buttons() & 1) {
+            /* Held down: draw. A line rather than a dot, because the pointer
+               moves further between two looks than one pixel. */
+            graphics_line(last_x, last_y, x, y, trail);
+            graphics_present();
+        } else if (x != last_x || y != last_y) {
+            /* Erase the old cursor by redrawing the background under it, which
+               is cheap and does not disturb anything drawn. */
+            graphics_fill(last_x - 6, last_y - 6, 13, 13, background);
+            graphics_present_rect(last_x - 7, last_y - 7, 15, 15);
+        }
+
+        if (x != last_x || y != last_y || (mouse_buttons() & 1)) {
+            graphics_line(x - 6, y, x + 6, y, ink);
+            graphics_line(x, y - 6, x, y + 6, ink);
+            graphics_present_rect(x - 7, y - 7, 15, 15);
+            last_x = x;
+            last_y = y;
+        }
+    }
+
+    graphics_leave();
+    console_use_theme();
+    print("Pointer at ");
+    print_dec((boot_uint64_t)mouse_x());
+    print(",");
+    print_dec((boot_uint64_t)mouse_y());
+    print(" after ");
+    print_dec(mouse_movements());
+    print_line(" packet(s).");
+}
+
 /* ---- dosget --------------------------------------------------------------
  *
  * A package manager, named the way winget is named and behaving the way dnf
@@ -1393,12 +1473,14 @@ static int dosget_install(boot_uint32_t source, const char* package,
     char manifest[1024];
     char name[64];
     char version[32];
+    VOLUME* volume;
     boot_uint32_t manifest_length;
     boot_uint32_t at = 0;
     int files = 0;
     FAT_ENTRY entry;
 
     if (!current_volume) { print_line("No volume."); return 0; }
+    volume = current_volume;
 
     /* The manifest first: it names the files, and a package whose manifest is
        missing is not a package this knows how to unpack. */
@@ -1420,6 +1502,29 @@ static int dosget_install(boot_uint32_t source, const char* package,
     {
         const char* target = manifest_value(manifest, manifest_length,
                                             "target", (boot_uint32_t*)0);
+        const char* where = manifest_value(manifest, manifest_length,
+                                           "volume", (boot_uint32_t*)0);
+
+        /* Which partition, which on an installed machine is not the one the
+         * shell is standing on.
+         *
+         * The kernel lives on the partition the firmware hands to the loader,
+         * because that is the only one the loader can read before there is a
+         * system. On a machine installed to a disk that is a second partition
+         * with no drive letter - deliberately, so nothing deletes it by
+         * accident - and writing to `Z:\BOOT` there produces a perfectly good
+         * kernel on a volume nothing will ever boot from.
+         *
+         * Which is exactly what happened: every byte written, every message
+         * correct, and the old kernel still running after the reboot. */
+        if (where && prefix_matches(where, "loader")) {
+            volume = volume_loader();
+            if (!volume) {
+                print_line("There is no loader partition to write to.");
+                return 0;
+            }
+        }
+
         if (target) {
             take_line(target, path, sizeof(path));
         } else {
@@ -1430,8 +1535,8 @@ static int dosget_install(boot_uint32_t source, const char* package,
     }
     /* Already there is not an error: installing over an older copy is the
        ordinary case, and is most of what a package manager does. */
-    if (!fat32_stat(current_volume, path, &entry) &&
-        !fat32_create(current_volume, path, 1, &entry)) {
+    if (!fat32_stat(volume, path, &entry) &&
+        !fat32_create(volume, path, 1, &entry)) {
         print("Could not make ");
         print_line(path);
         return 0;
@@ -1470,7 +1575,7 @@ static int dosget_install(boot_uint32_t source, const char* package,
         /* The old copy is kept, not deleted, when it is part of the system.
            A kernel that does not start is otherwise a machine that needs the
            USB stick this whole arrangement exists to retire. */
-        if (fat32_stat(current_volume, local, &entry) &&
+        if (fat32_stat(volume, local, &entry) &&
             word_is(package, "SYSTEM")) {
             char keep[PATH_MAX];
             FAT_ENTRY previous;
@@ -1478,26 +1583,26 @@ static int dosget_install(boot_uint32_t source, const char* package,
             keep[0] = 0;
             string_join(keep, sizeof(keep), "", directory);
             string_join(keep, sizeof(keep), "\\", "KERNEL.BAK");
-            if (fat32_stat(current_volume, keep, &previous))
-                fat32_remove(current_volume, keep);
-            if (fat32_create(current_volume, keep, 0, &previous)) {
+            if (fat32_stat(volume, keep, &previous))
+                fat32_remove(volume, keep);
+            if (fat32_create(volume, keep, 0, &previous)) {
                 boot_uint8_t* old = buffer + DOSGET_BUFFER / 2;
-                boot_uint32_t was = fat32_read(current_volume, &entry, 0, old,
+                boot_uint32_t was = fat32_read(volume, &entry, 0, old,
                                                DOSGET_BUFFER / 2);
-                if (was) (void)fat32_write(current_volume, &previous, 0, old, was);
+                if (was) (void)fat32_write(volume, &previous, 0, old, was);
                 print("  kept the old one as ");
                 print_line(keep);
             }
         }
 
-        if (fat32_stat(current_volume, local, &entry))
-            fat32_remove(current_volume, local);
-        if (!fat32_create(current_volume, local, 0, &entry)) {
+        if (fat32_stat(volume, local, &entry))
+            fat32_remove(volume, local);
+        if (!fat32_create(volume, local, 0, &entry)) {
             print("Could not write ");
             print_line(local);
             return 0;
         }
-        if (fat32_write(current_volume, &entry, 0, buffer,
+        if (fat32_write(volume, &entry, 0, buffer,
                         (boot_uint32_t)got) != (boot_uint32_t)got) {
             print("Could not write all of ");
             print_line(local);
@@ -1505,6 +1610,7 @@ static int dosget_install(boot_uint32_t source, const char* package,
         }
 
         print("  ");
+        if (volume != current_volume) print("(loader) ");
         print(local);
         print("  ");
         print_dec((boot_uint64_t)got);
@@ -1526,6 +1632,24 @@ static int dosget_install(boot_uint32_t source, const char* package,
     return 1;
 }
 
+
+/* Is this package on the disk, whatever the database believes?
+ *
+ * SYSTEM is a special case and an obvious one: a machine that is running is
+ * running a kernel, so the system is installed by definition. Everything else
+ * has a directory of its own, and the directory being there is the evidence. */
+static int dosget_present(const char* package) {
+    char path[PATH_MAX];
+    FAT_ENTRY entry;
+
+    if (!current_volume) return 0;
+    if (word_is(package, "SYSTEM")) return 1;
+
+    path[0] = '\\';
+    path[1] = 0;
+    string_join(path, sizeof(path), "", package);
+    return fat32_stat(current_volume, path, &entry);
+}
 
 /* `dosget update` - everything already here, brought up to date.
  *
@@ -1573,15 +1697,30 @@ static void dosget_update(boot_uint32_t source, boot_uint8_t* buffer) {
         }
 
         dosget_installed(name, here, sizeof(here));
-        if (!here[0]) continue;              /* not ours to update */
-        if (!strcmp(here, offered)) continue; /* already at that version */
-
-        print(name);
-        print(": ");
-        print(here);
-        print(" -> ");
-        print_line(offered);
+        if (!here[0]) {
+            /* No record. That is not the same as not installed, and treating
+               it as such is how a machine with a damaged database reports
+               that everything is up to date while running something older.
+             *
+             * The database is a record; the filesystem is the truth. A package
+             * whose files are here is installed, whatever the record says, and
+             * a version nobody wrote down is one that cannot match - so it is
+             * fetched and written down properly this time. */
+            if (!dosget_present(name)) continue;
+            print(name);
+            print_line(": installed, but no version recorded - fetching it");
+        } else if (!strcmp(here, offered)) {
+            continue;                        /* already at that version */
+        } else {
+            print(name);
+            print(": ");
+            print(here);
+            print(" -> ");
+            print_line(offered);
+        }
         if (dosget_install(source, name, buffer)) changed++;
+        continue;
+
     }
 
     if (!changed) {
@@ -1614,8 +1753,16 @@ static void command_dosget(const ARGUMENTS* arguments) {
     net_format_address(source, shown);
 
     if (!arguments->operand[0][0]) {
+        char version[32];
+
         print("Source          : ");
         print_line(shown);
+        dosget_installed("SYSTEM", version, sizeof(version));
+        print("System version  : ");
+        /* Said out loud because its absence was confusing on its own: a
+           machine that has never been updated over the network and one whose
+           record was lost look identical without this line. */
+        print_line(version[0] ? version : "not recorded - never updated here");
         print_line("");
         print_line("dosget list              what the source has");
         print_line("dosget install <name>    fetch it and unpack it");
@@ -1639,6 +1786,9 @@ static void command_dosget(const ARGUMENTS* arguments) {
     if (word_is(arguments->operand[0], "LIST")) {
         dosget_list(source, buffer);
     } else if (word_is(arguments->operand[0], "INSTALL")) {
+        /* Install pays no attention to versions on purpose: it is the way to
+           put a package on regardless of what the records claim, which is what
+           somebody wants when the records are what is wrong. */
         if (!arguments->operand[1][0]) {
             print_line("Usage: dosget install <name>");
         } else if (dosget_install(source, arguments->operand[1], buffer)) {
@@ -1996,6 +2146,16 @@ static void command_reboot(void) {
  * mistaken `del` in the system volume cannot take away the machine's ability
  * to start - not protection against anything deliberate, but the accident
  * worth preventing. */
+/* The volume to install from: the one the shell is standing on when it
+   carries the file in question, and otherwise whichever one does. */
+static VOLUME* setup_source_of(const char* path) {
+    FAT_ENTRY entry;
+
+    if (current_volume && fat32_stat(current_volume, path, &entry))
+        return current_volume;
+    return volume_holding(path);
+}
+
 static void command_setup(void) {
     BLOCK_DEVICE* targets[BLOCK_MAX_DEVICES];
     boot_uint32_t target_count = 0;
@@ -2011,6 +2171,14 @@ static void command_setup(void) {
 
     setup_banner("Welcome");
     print_line("  This installs Koi-DOS onto a disk in this machine.");
+    {
+        VOLUME* from = setup_source_of("\\BIN");
+        print("  Installing from ");
+        if (from && from->letter) { put(from->letter); print(":"); }
+        else print("this drive");
+        if (from && from->label[0]) { print(" ("); print(from->label); print(")"); }
+        print_line("");
+    }
     print_line("");
     print_line("  The disk you choose will be erased completely. Everything on");
     print_line("  it - every partition, every file, any other operating system");
@@ -2035,9 +2203,17 @@ static void command_setup(void) {
     }
 
     /* Where the pieces are copied from. On single-volume media both are the
-       same volume; on a two-partition one they are not. */
-    loader_source = volume_holding("\\EFI\\BOOT\\BOOTX64.EFI");
-    system_source = volume_holding("\\BIN");
+       same volume; on a two-partition one they are not.
+     *
+     * The drive the user is standing on is asked first, and that is not a
+     * nicety. Searching every volume for the files finds the installed system
+     * before it finds the media, so a machine booted from its disk with newer
+     * install media plugged in would offer to copy the old system onto the new
+     * stick - which is backwards, and reads as correct until you look at what
+     * it says twice. Somebody who has changed to a drive and typed `setup`
+     * means that drive. */
+    loader_source = setup_source_of("\\EFI\\BOOT\\BOOTX64.EFI");
+    system_source = setup_source_of("\\BIN");
     if (!system_source) system_source = volume_boot();
     if (!loader_source || !system_source) {
         setup_banner("Stopped");
@@ -3284,6 +3460,7 @@ static void execute(const char* input) {
     }
     if (word_is(input, "PING")) { command_ping(&arguments); return; }
     if (word_is(input, "DOSGET")) { command_dosget(&arguments); return; }
+    if (word_is(input, "POINTER")) { command_pointer(); return; }
     if (word_is(input, "LOG")) { command_log(&arguments); return; }
     if (word_is(input, "HELP")) { command_help(); return; }
     /* `echo.` prints a blank line - the DOS idiom for one, since a bare
