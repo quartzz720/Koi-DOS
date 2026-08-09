@@ -1,5 +1,6 @@
 #include "command.h"
 #include "console.h"
+#include "layout.h"
 #include "keyboard.h"
 #include "serial.h"
 #include "string.h"
@@ -393,6 +394,7 @@ static void command_help(void) {
     print_line("beep [hz] [ms] a tone, if there is a sound device");
     print_line("sound [node]   the sound device; a node sends output there by hand");
     print_line("sound volume <n>  loudness, 0 to 100");
+    print_line("layout [en|ru|uk|el]  keyboard layout; Alt+Shift switches");
     print_line("net [start]    the network: what it is, or ask for an address");
     print_line("net set <..>   set an address by hand, for a wire with no server");
     print_line("net usb        test the USB network device on its own");
@@ -2940,6 +2942,39 @@ static void command_chkdsk(const ARGUMENTS* arguments) {
  * of a table that silently filled up, or simply of a kind we do not drive. On
  * real hardware, with no serial cable attached, this is the only way to tell
  * those apart. */
+/* `layout` - what the keyboard is typing, and how to change it.
+ *
+ * Alt+Shift does the same thing and is what anybody will reach for. This
+ * exists because a key combination nobody mentioned is not a feature: it is a
+ * thing that happens by accident and confuses somebody. */
+static void command_layout(const ARGUMENTS* arguments) {
+    if (arguments->operand_count) {
+        const char* name = arguments->operand[0];
+        int chosen = -1;
+
+        if (word_is(name, "EN") || word_is(name, "ENGLISH")) chosen = LAYOUT_EN;
+        else if (word_is(name, "RU") || word_is(name, "RUSSIAN")) chosen = LAYOUT_RU;
+        else if (word_is(name, "UK") || word_is(name, "UKRAINIAN")) chosen = LAYOUT_UK;
+        else if (word_is(name, "EL") || word_is(name, "GREEK")) chosen = LAYOUT_GR;
+
+        if (chosen < 0) {
+            print_line("layout [en|ru|uk|el]");
+            print_line("");
+            print_line("With no argument, which layout is typing now.");
+            return;
+        }
+        layout_select(chosen);
+        if (chosen != LAYOUT_EN) layout_set_alternate(chosen);
+    }
+
+    print("Typing in ");
+    print(layout_name(layout_current()));
+    print_line(".");
+    print("Alt+Shift switches between English and ");
+    print(layout_name(layout_alternate()));
+    print_line(".");
+}
+
 static void command_pci(void) {
     print_line("BUS:DEV.F  VENDOR:DEVICE  CLASS");
     for (boot_uint32_t index = 0; index < pci_device_count(); index++) {
@@ -3832,6 +3867,7 @@ static void execute(const char* input) {
     if (word_is(input, "VOL")) { command_vol(); return; }
     if (word_is(input, "MEM")) { command_mem(); return; }
     if (word_is(input, "PCI")) { command_pci(); return; }
+    if (word_is(input, "LAYOUT")) { command_layout(&arguments); return; }
     if (word_is(input, "DISK")) { command_disk(); return; }
     if (word_is(input, "FORMAT")) { command_format(&arguments); return; }
     if (word_is(input, "CHKDSK")) { command_chkdsk(&arguments); return; }

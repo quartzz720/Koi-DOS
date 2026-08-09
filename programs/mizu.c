@@ -45,7 +45,6 @@ static WINDOW* note_window;
  */
 typedef struct {
     const char* name;
-    const char* note;
     koi_uint32 (*tint)(void);
 } ENTRY;
 
@@ -56,15 +55,15 @@ static koi_uint32 tint_tools(void) { return koi_gfx_color(0x58, 0xB0, 0xA8); }
 static ENTRY entries[4];
 
 static void name_entries(void) {
-    entries[0] = (ENTRY){ say(SAY_COMMANDER), say(SAY_TWO_PANELS), tint_files };
-    entries[1] = (ENTRY){ say(SAY_NOTEEDIT), say(SAY_WRITE_TEXT), tint_tools };
-    entries[2] = (ENTRY){ say(SAY_CLOCK), say(SAY_AND_A_DATE), tint_setup };
-    entries[3] = (ENTRY){ say(SAY_ABOUT), say(SAY_THIS_SYSTEM), tint_tools };
+    entries[0] = (ENTRY){ say(SAY_COMMANDER), tint_files };
+    entries[1] = (ENTRY){ say(SAY_NOTEEDIT), tint_tools };
+    entries[2] = (ENTRY){ say(SAY_CLOCK), tint_setup };
+    entries[3] = (ENTRY){ say(SAY_ABOUT), tint_tools };
 }
 #define ENTRY_COUNT 4
 
 #define ICON_W 120
-#define ICON_H 76
+#define ICON_H 96
 
 /* An icon, drawn rather than loaded. A picture would be a file to ship and a
    format to decode; a rounded tile with a drop in it is three rectangles and
@@ -81,6 +80,52 @@ static void draw_icon(int x, int y, koi_uint32 tint) {
     koi_gfx_rect(x + 28, y + 16, 8, 10, tint);
 }
 
+/* A label under an icon, wrapped over as many lines as it needs and every
+ * line centred.
+ *
+ * There used to be a second line of description under the name, and in
+ * English it fitted. "Control Panel" became "Панель керування" and the
+ * description became the thing that ran into the neighbouring icon - so the
+ * description is gone and the name gets the room instead. A caption that only
+ * fits in the language it was written in is a caption that was never measured.
+ *
+ * Broken at spaces; a single word longer than the cell is left to overhang,
+ * because breaking a word mid-letter reads worse than a wide one.
+ */
+#define LABEL_LINES 3
+
+static void label_in_cell(int x, int y, const char* text) {
+    int cell = ICON_W - 8;
+    int fits = cell / WINDOW_CHAR_W;
+    char line[64];
+    int line_count = 0;
+
+    while (*text && line_count < LABEL_LINES) {
+        int bytes = 0;
+        int columns = 0;
+        int last_space = -1;
+        int width;
+
+        while (text[bytes] && columns < fits) {
+            if (text[bytes] == ' ') last_space = bytes;
+            if (((unsigned char)text[bytes] & 0xC0) != 0x80) columns++;
+            bytes++;
+        }
+        if (text[bytes] && last_space > 0) bytes = last_space;
+        if (bytes > (int)sizeof(line) - 1) bytes = (int)sizeof(line) - 1;
+        memcpy(line, text, (koi_uint64)bytes);
+        line[bytes] = 0;
+
+        width = language_columns(line) * WINDOW_CHAR_W;
+        window_label(x + (cell - width) / 2, y + line_count * WINDOW_CHAR_H,
+                     line, window_text);
+        line_count++;
+
+        text += bytes;
+        while (*text == ' ') text++;
+    }
+}
+
 static void paint_control(WINDOW* window, int x, int y, int width, int height) {
     (void)window;
     (void)height;
@@ -89,21 +134,9 @@ static void paint_control(WINDOW* window, int x, int y, int width, int height) {
         int row = index / (width / ICON_W ? width / ICON_W : 1);
         int ix = x + 8 + column * ICON_W;
         int iy = y + 8 + row * ICON_H;
-        int text_x;
 
         draw_icon(ix + (ICON_W - 8) / 2 - 32, iy, entries[index].tint());
-        /* Centred in the cell and clipped to it. A translated label is longer
-           than the English one it replaced - "Панель керування" against
-           "Control Panel" - and a label measured against the icon rather than
-           against the cell runs into its neighbour. */
-        text_x = ix + (ICON_W - 8 - language_columns(entries[index].name) *
-                       WINDOW_CHAR_W) / 2;
-        if (text_x < ix) text_x = ix;
-        window_label(text_x, iy + 40, entries[index].name, window_text);
-        text_x = ix + (ICON_W - 8 - language_columns(entries[index].note) *
-                       WINDOW_CHAR_W) / 2;
-        if (text_x < ix) text_x = ix;
-        window_label(text_x, iy + 56, entries[index].note, window_shadow);
+        label_in_cell(ix, iy + 40, entries[index].name);
     }
 }
 
@@ -158,7 +191,6 @@ static int month_length(int year, int month) {
 }
 
 static void paint_clock(WINDOW* window, int x, int y, int width, int height) {
-    static const char* days[] = { "Su","Mo","Tu","We","Th","Fr","Sa" };
     long now = koi_sysinfo(KOI_INFO_TIME, 0);
     long today = koi_sysinfo(KOI_INFO_DATE, 0);
     int year = KOI_DATE_YEAR(today);
@@ -173,20 +205,26 @@ static void paint_clock(WINDOW* window, int x, int y, int width, int height) {
     (void)window;
     (void)height;
 
-    koi_snprintf(line, sizeof(line), "%02d:%02d:%02d   %04d-%02d-%02d",
-                 KOI_TIME_HOUR(now), KOI_TIME_MINUTE(now), KOI_TIME_SECOND(now),
-                 year, month, day);
-    window_label(x + (width - (int)strlen(line) * WINDOW_CHAR_W) / 2, y + 6,
+    koi_snprintf(line, sizeof(line), "%02d:%02d:%02d",
+                 KOI_TIME_HOUR(now), KOI_TIME_MINUTE(now), KOI_TIME_SECOND(now));
+    window_label(x + (width - language_columns(line) * WINDOW_CHAR_W) / 2, y + 6,
                  line, window_text);
+    /* "9 August 2026" rather than 2026-08-09: the numbers are for sorting and
+       the words are for reading, and this window is for reading. */
+    koi_snprintf(line, sizeof(line), "%d %s %d", day, language_month(month),
+                 year);
+    window_label(x + (width - language_columns(line) * WINDOW_CHAR_W) / 2,
+                 y + 24, line, window_text);
 
     left = x + (width - 7 * cell) / 2;
     for (int index = 0; index < 7; index++)
-        window_label(left + index * cell + 4, y + 30, days[index], window_shadow);
+        window_label(left + index * cell + 4, y + 46,
+                     language_weekday(index), window_shadow);
 
     for (int number = 1; number <= length; number++) {
         int slot = start + number - 1;
         int cx = left + (slot % 7) * cell;
-        int cy = y + 50 + (slot / 7) * 20;
+        int cy = y + 66 + (slot / 7) * 20;
 
         koi_snprintf(line, sizeof(line), "%d", number);
         if (number == day) {
@@ -306,7 +344,7 @@ static void paint_about(WINDOW* window, int x, int y, int width, int height) {
 
 static void open_clock(void) {
     if (clock_window) { clock_window->minimised = 0; window_raise(clock_window); return; }
-    clock_window = window_new(say(SAY_CLOCK), 640, 300, 280, 240);
+    clock_window = window_new(say(SAY_CLOCK), 620, 300, 300, 260);
     if (!clock_window) return;
     clock_window->paint = paint_clock;
 }
@@ -465,14 +503,7 @@ int main(void) {
                     window_raise(control_window);
                 }
                 break;
-            case MENU_TILE:
-                /* Everything back where it started, for a desk that has been
-                   shuffled into a pile. */
-                if (control_window) { control_window->x = 60; control_window->y = 70; }
-                if (clock_window) { clock_window->x = 640; clock_window->y = 300; }
-                if (about_window) { about_window->x = 360; about_window->y = 380; }
-                window_repaint();
-                break;
+            case MENU_TILE: window_tile(); break;
             case MENU_EXIT:
                 /* "Close" in a window's own File menu closes that window;
                    "Exit to DOS" in the desktop's menu ends everything. */

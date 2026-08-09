@@ -1,5 +1,6 @@
 #include "config.h"
 #include "audio.h"
+#include "layout.h"
 #include "console.h"
 #include "fat32.h"
 #include "heap.h"
@@ -75,6 +76,18 @@ static void apply_console(const char* key, const char* value, void* context) {
     else if (equals_ignoring_case(key, "error")) theme->error = (boot_uint8_t)color;
     /* Anything else is ignored on purpose: a file written by a newer program
        must not stop an older kernel from booting. */
+}
+
+/* The second layout follows the language the machine was set to. Somebody who
+   chose Ukrainian at setup wants Ukrainian and English on Alt+Shift, and
+   having to say so twice is the kind of question software asks when it has not
+   been thought about. */
+static void apply_language(const char* key, const char* value, void* context) {
+    (void)context;
+    if (!equals_ignoring_case(key, "language")) return;
+    if (value[0] == 'r' && value[1] == 'u') layout_set_alternate(LAYOUT_RU);
+    else if (value[0] == 'u' && value[1] == 'k') layout_set_alternate(LAYOUT_UK);
+    else if (value[0] == 'e' && value[1] == 'l') layout_set_alternate(LAYOUT_GR);
 }
 
 static void apply_sound(const char* key, const char* value, void* context) {
@@ -170,6 +183,8 @@ void config_load(VOLUME* volume) {
     read_settings(volume, CONFIG_LEGACY_PATH, apply_console, &theme);
     read_settings(volume, CONFIG_DIRECTORY "\\CONSOLE.CFG", apply_console, &theme);
     read_settings(volume, CONFIG_DIRECTORY "\\SOUND.CFG", apply_sound, &percent);
+    read_settings(volume, CONFIG_DIRECTORY "\\SYSTEM.CFG", apply_language,
+                  (void*)0);
 
     if (percent >= 0) audio_set_volume(percent * 255 / 100);
 

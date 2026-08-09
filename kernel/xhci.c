@@ -1,4 +1,5 @@
 #include "xhci.h"
+#include "layout.h"
 #include "memory.h"
 #include "string.h"
 #include "serial.h"
@@ -1337,6 +1338,20 @@ static void handle_report(USB_KEYBOARD* keyboard, const boot_uint8_t* report) {
         if (now_down != was_down)
             keyboard_submit_event(modifier_keys[index].key, !now_down);
     }
+
+    /* Alt+Shift changes the keyboard layout, here as well as on PS/2.
+     *
+     * It was wired to the PS/2 driver alone, and on any machine with a USB
+     * keyboard - which is most of them, and every one this has been tested on -
+     * the gesture did nothing at all while the layouts themselves worked
+     * perfectly. The layout is applied where both keyboards meet; the gesture
+     * has to be recognised in both places, because a modifier is a fact about
+     * a device and there is nowhere else to see it.
+     *
+     * The latch that stops one gesture counting twice lives in layout.c,
+     * because a machine can have more than one keyboard and every one of them
+     * sees the same fingers. */
+    layout_gesture((modifiers & 0x22) != 0, (modifiers & 0x44) != 0);
 
     for (int index = 2; index < 8; index++) {
         boot_uint8_t usage = report[index];

@@ -29,10 +29,6 @@ static const char* phrases[SAY_COUNT][LANGUAGE_COUNT] = {
     /* SAY_ITALIC         */ { "Italic", "Курсив", "Курсив" },
     /* SAY_UNDERLINE      */ { "Underline", "Подчёркнутый", "Підкреслений" },
     /* SAY_PLAIN          */ { "Plain", "Обычный", "Звичайний" },
-    /* SAY_TWO_PANELS     */ { "two panels", "две панели", "дві панелі" },
-    /* SAY_WRITE_TEXT     */ { "write text", "писать текст", "писати текст" },
-    /* SAY_AND_A_DATE     */ { "and a date", "и дата", "і дата" },
-    /* SAY_THIS_SYSTEM    */ { "this system", "об этой ОС", "про цю ОС" },
     /* SAY_ONE_AT_A_TIME_1*/ { "Windows belong to one program:",
                                "Окна принадлежат одной программе:",
                                "Вікна належать одній програмі:" },
@@ -43,6 +39,34 @@ static const char* phrases[SAY_COUNT][LANGUAGE_COUNT] = {
     /* SAY_COULD_NOT_SAVE */ { "could not save", "не удалось сохранить",
                                "не вдалося зберегти" }
 };
+
+static const char* const weekdays[LANGUAGE_COUNT][7] = {
+    { "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" },
+    { "Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб" },
+    { "Нд", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб" }
+};
+
+/* Genitive in Russian and Ukrainian, because a date reads "the ninth of
+   August" and the month is the thing the ninth is of. A table of nominative
+   month names would be correct as a list and wrong in every date it appeared
+   in, which is the kind of translation that tells a reader the software was
+   not written for them. */
+static const char* const months[LANGUAGE_COUNT][12] = {
+    { "January", "February", "March", "April", "May", "June",
+      "July", "August", "September", "October", "November", "December" },
+    { "января", "февраля", "марта", "апреля", "мая", "июня",
+      "июля", "августа", "сентября", "октября", "ноября", "декабря" },
+    { "січня", "лютого", "березня", "квітня", "травня", "червня",
+      "липня", "серпня", "вересня", "жовтня", "листопада", "грудня" }
+};
+
+const char* language_weekday(int index) {
+    return (index >= 0 && index < 7) ? weekdays[current][index] : "";
+}
+
+const char* language_month(int month) {
+    return (month >= 1 && month <= 12) ? months[current][month - 1] : "";
+}
 
 static const char* names[LANGUAGE_COUNT] = {
     "English", "Русский", "Українська"

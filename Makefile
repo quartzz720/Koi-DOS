@@ -26,7 +26,7 @@ BUILD_HEADER = kernel/build.h
 
 KERNEL_SOURCES = kernel/kernel.c kernel/console.c kernel/font.c kernel/font_glyphs.c kernel/serial.c \
                  kernel/string.c kernel/memory.c kernel/cpu.c kernel/idt.c \
-                 kernel/isr.S kernel/pic.c kernel/acpi.c kernel/keyboard.c \
+                 kernel/isr.S kernel/pic.c kernel/acpi.c kernel/keyboard.c kernel/layout.c \
                  kernel/heap.c kernel/paging.c kernel/rtc.c kernel/block.c \
                  kernel/partition.c kernel/fat32.c kernel/command.c \
                  kernel/syscall.c kernel/program.c kernel/config.c kernel/xhci.c \
@@ -35,7 +35,7 @@ KERNEL_SOURCES = kernel/kernel.c kernel/console.c kernel/font.c kernel/font_glyp
 KERNEL_HEADERS = kernel/kernel.h kernel/console.h kernel/font.h kernel/serial.h \
                  kernel/string.h kernel/io.h kernel/memory.h kernel/cpu.h \
                  kernel/idt.h kernel/pic.h kernel/acpi.h kernel/keyboard.h \
-                 kernel/heap.h kernel/paging.h kernel/rtc.h kernel/block.h \
+                 kernel/layout.h kernel/heap.h kernel/paging.h kernel/rtc.h kernel/block.h \
                  kernel/partition.h kernel/fat32.h kernel/command.h \
                  kernel/syscall.h kernel/program.h kernel/config.h kernel/xhci.h \
                  kernel/graphics.h kernel/hda.h kernel/audio.h kernel/net.h kernel/ehci.h kernel/e1000.h kernel/tftp.h kernel/mouse.h \

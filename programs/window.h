@@ -62,6 +62,10 @@ struct WINDOW {
     int x, y, width, height;      /* the frame, not the client area */
     int minimised;
     int used;
+    /* Smaller than this and the frame has eaten the contents. A window that
+       can be dragged to nothing is a window somebody loses. */
+    int minimum_width;
+    int minimum_height;
 
     /* The menu strip inside this window, under its title. Zero menus means no
        strip and the client area starts higher. */
@@ -98,6 +102,12 @@ void window_desktop_menu(const WINDOW_MENU* menus, int count);
 WINDOW* window_new(const char* title, int x, int y, int width, int height);
 void window_delete(WINDOW* window);
 void window_raise(WINDOW* window);
+
+/* Lay every open window out side by side, filling the desktop. What "tile"
+   meant in the system this borrows its shape from - not "put three windows
+   back where they started", which is what it did first and is a different
+   verb. */
+void window_tile(void);
 WINDOW* window_active(void);
 
 /* Where a window's contents live, in screen coordinates. */

@@ -331,6 +331,18 @@ static void paint_window(WINDOW* window, int active) {
     window_client(window, &client_x, &client_y, &client_w, &client_h);
     window_sunken(client_x - 1, client_y - 1, client_w + 2, client_h + 2);
     if (window->paint) window->paint(window, client_x, client_y, client_w, client_h);
+
+    /* The grip. Three diagonal strokes in the corner, which is the shape every
+       system has used for "drag me" since windows could be resized at all -
+       and which is the only part of a frame that has to be learnt once rather
+       than explained. */
+    for (int line = 0; line < 3; line++) {
+        int offset = 3 + line * 4;
+        koi_gfx_line(window->x + window->width - offset - 1,
+                     window->y + window->height - 4,
+                     window->x + window->width - 4,
+                     window->y + window->height - offset - 1, window_shadow);
+    }
 }
 
 static void paint_taskbar(void) {
@@ -353,6 +365,41 @@ static void paint_taskbar(void) {
         window_label(place + WINDOW_CHAR_W, y + 6, window->title, window_text);
         place += width + 4;
     }
+}
+
+void window_tile(void) {
+    int visible = 0;
+    int columns = 1;
+    int rows;
+    int top = WINDOW_TOPBAR_H;
+    int height = (int)screen.height - WINDOW_TASKBAR_H - top;
+    int slot = 0;
+
+    for (int index = 0; index < order_count; index++)
+        if (!order[index]->minimised) visible++;
+    if (!visible) return;
+
+    /* As square a grid as the count allows: two windows side by side, three or
+       four in two columns. Anything cleverer needs to know what is in them. */
+    while (columns * columns < visible) columns++;
+    if (columns > 1 && columns * (columns - 1) >= visible) rows = columns - 1;
+    else rows = columns;
+    if (rows < 1) rows = 1;
+
+    for (int index = 0; index < order_count; index++) {
+        WINDOW* window = order[index];
+        int column, row;
+
+        if (window->minimised) continue;
+        column = slot % columns;
+        row = slot / columns;
+        window->x = column * ((int)screen.width / columns);
+        window->y = top + row * (height / rows);
+        window->width = (int)screen.width / columns - 4;
+        window->height = height / rows - 4;
+        slot++;
+    }
+    dirty = 1;
 }
 
 void window_repaint(void) { dirty = 1; }
@@ -514,7 +561,10 @@ void window_close_desktop(void) {
 /* ---- The loop ------------------------------------------------------------ */
 
 static int dragging;
+static int sizing;
 static int drag_x, drag_y;
+
+#define GRIP 14
 
 /* A click that landed on a menu bar, wherever that bar was. Returns 1 when it
    was taken, so the caller stops looking. */
@@ -618,18 +668,28 @@ int window_next(WINDOW_EVENT* event) {
 
         koi_mouse(&pointer);
 
-        if (dragging) {
+        if (dragging || sizing) {
             if (pointer.buttons & KOI_BUTTON_LEFT) {
                 WINDOW* top = window_active();
                 if (top && (pointer.x != previous_x || pointer.y != previous_y)) {
-                    top->x = pointer.x - drag_x;
-                    top->y = pointer.y - drag_y;
-                    if (top->y < WINDOW_TOPBAR_H) top->y = WINDOW_TOPBAR_H;
+                    if (sizing) {
+                        int least_w = top->minimum_width ? top->minimum_width : 160;
+                        int least_h = top->minimum_height ? top->minimum_height : 100;
+                        top->width = pointer.x - top->x + drag_x;
+                        top->height = pointer.y - top->y + drag_y;
+                        if (top->width < least_w) top->width = least_w;
+                        if (top->height < least_h) top->height = least_h;
+                    } else {
+                        top->x = pointer.x - drag_x;
+                        top->y = pointer.y - drag_y;
+                        if (top->y < WINDOW_TOPBAR_H) top->y = WINDOW_TOPBAR_H;
+                    }
                     dirty = 1;
                 }
                 continue;
             }
             dragging = 0;
+            sizing = 0;
         }
 
         if (pointer.presses[0] != last_press) {
@@ -697,6 +757,16 @@ int window_next(WINDOW_EVENT* event) {
                 dragging = 1;
                 drag_x = x - hit->x;
                 drag_y = y - hit->y;
+                continue;
+            }
+
+            /* The corner, before the contents: a click there is a grab and
+               not a click on whatever the window happens to draw underneath. */
+            if (x >= hit->x + hit->width - GRIP &&
+                y >= hit->y + hit->height - GRIP) {
+                sizing = 1;
+                drag_x = hit->x + hit->width - x;
+                drag_y = hit->y + hit->height - y;
                 continue;
             }
 

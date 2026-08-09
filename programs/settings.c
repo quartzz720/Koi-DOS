@@ -5,6 +5,7 @@
 static char text[SETTINGS_MAX];
 static char rebuilt[SETTINGS_MAX];
 static char path[80];
+static char spare[80];
 
 /* \BOOT\CONFIG\<SECTION>.CFG, upper case because every other name on this
    filesystem is. */
@@ -122,14 +123,40 @@ int settings_set(const char* section, const char* key, const char* value) {
     rebuilt[out++] = '\n';
     rebuilt[out] = 0;
 
-    /* Removed and remade rather than written over: a shorter file written into
-       a longer one leaves the tail of the old one behind. */
-    /* The directory may not exist yet; already there is not an error. */
+    /* Written beside the real one and moved on top of it when it is whole.
+     *
+     * The old way removed the file and made it again, which leaves a window -
+     * short, but real - where the settings do not exist at all, and a longer
+     * one where they exist half-written. Losing power in either is losing the
+     * settings. A rename cannot be half-done: the directory entry either names
+     * the new file or the old one, and there is no third answer.
+     *
+     * This is not a journalled filesystem and nothing here pretends otherwise.
+     * What it buys is that the failure is "the change did not happen" rather
+     * than "the file is now rubbish", and those are very different mornings. */
     koi_mkdir(SETTINGS_DIRECTORY);
-    koi_remove(path_of(section));
-    handle = koi_open(path_of(section), OPEN_WRITE);
+
+    {
+        long at = 0;
+        const char* live = path_of(section);
+        while (live[at] && at < (long)sizeof(spare) - 1) { spare[at] = live[at]; at++; }
+        spare[at] = 0;
+        /* Same name, different extension: it lands in the same directory, so
+           the rename never crosses a device. */
+        if (at > 4) { spare[at-3] = 'T'; spare[at-2] = 'M'; spare[at-1] = 'P'; }
+    }
+
+    koi_remove(spare);
+    handle = koi_open(spare, OPEN_WRITE);
     if (handle < 0) return 0;
     if (koi_write(handle, rebuilt, out) != out) { koi_close(handle); return 0; }
     koi_close(handle);
+
+    koi_remove(path_of(section));
+    if (koi_rename(spare, path_of(section)) < 0) {
+        /* The new file is written and could not be put in place. Say so rather
+           than leaving the caller believing a setting stuck. */
+        return 0;
+    }
     return 1;
 }

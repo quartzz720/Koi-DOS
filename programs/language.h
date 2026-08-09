@@ -42,13 +42,19 @@ enum {
     SAY_ABOUT, SAY_EXIT, SAY_CONTROL_PANEL, SAY_CLOCK, SAY_COMMANDER,
     SAY_TILE, SAY_NOTEEDIT, SAY_SAVE, SAY_CLOSE,
     SAY_BOLD, SAY_ITALIC, SAY_UNDERLINE, SAY_PLAIN,
-    SAY_TWO_PANELS, SAY_WRITE_TEXT, SAY_AND_A_DATE, SAY_THIS_SYSTEM,
     SAY_ONE_AT_A_TIME_1, SAY_ONE_AT_A_TIME_2, SAY_FREE,
     SAY_COULD_NOT_SAVE,
     SAY_COUNT
 };
 
 const char* say(int phrase);
+
+/* The calendar's own words. Two-letter weekday headings, because that is what
+   fits a column, and month names in whatever case the language puts a date in -
+   "9 августа", not "9 август". A month name is not a word looked up in a
+   dictionary; it is a word in a sentence. */
+const char* language_weekday(int index);      /* 0 = Sunday */
+const char* language_month(int month);        /* 1 = January */
 
 /* How many columns a UTF-8 string occupies. Not its length in bytes, which is
    what every one of these strings was measured by until there was a second

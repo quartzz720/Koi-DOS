@@ -1,4 +1,6 @@
 #include "keyboard.h"
+#include "layout.h"
+#include "serial.h"
 #include "acpi.h"
 #include "console.h"
 #include "idt.h"
@@ -224,9 +226,19 @@ static void handle_scancode(boot_uint8_t code) {
     keyboard_submit_event(scancode_identity(code, 0), released);
 
     switch (code) {
-    case 0x2A: case 0x36: shift_held = !released; return;
+    /* Alt+Shift changes layout, whichever of the two is pressed second. The
+       gesture is the one every other system uses, and a gesture somebody
+       already has in their fingers is worth more than a better one they would
+       have to learn. */
+    case 0x2A: case 0x36:
+        shift_held = !released;
+        layout_gesture(shift_held, alt_held);
+        return;
     case 0x1D: control_held = !released; return;
-    case 0x38: alt_held = !released; return;
+    case 0x38:
+        alt_held = !released;
+        layout_gesture(shift_held, alt_held);
+        return;
     case 0x3A: if (!released) caps_lock = !caps_lock; return;
     default: break;
     }
@@ -254,7 +266,7 @@ static void handle_scancode(boot_uint8_t code) {
         if (character >= 'a' && character <= 'z') character = (char)(character - 'a' + 1);
         else if (character >= 'A' && character <= 'Z') character = (char)(character - 'A' + 1);
     }
-    buffer_push((boot_uint16_t)(unsigned char)character);
+    keyboard_submit((int)(unsigned char)character);
 }
 
 static void keyboard_interrupt(INTERRUPT_FRAME* frame) {
@@ -356,8 +368,34 @@ int keyboard_init(void) {
     return KEYBOARD_READY;
 }
 
+/* One place where a key becomes what the buffer carries, so both keyboards get
+ * layouts and neither driver has to know about alphabets.
+ *
+ * A letter outside ASCII is pushed as its UTF-8 bytes rather than as a code
+ * point, because everything downstream already reads UTF-8: the console holds
+ * a start byte until its continuations arrive, and the editors step through
+ * text by character. Nothing had to change to receive Cyrillic - it only had
+ * to be sent. */
 void keyboard_submit(int key) {
-    if (key) buffer_push((boot_uint16_t)key);
+    boot_uint32_t code;
+
+    if (!key) return;
+    if (key < 0x20 || key > 0x7E) {   /* control codes, arrows, F-keys */
+        buffer_push((boot_uint16_t)key);
+        return;
+    }
+
+    code = layout_map(key);
+    if (code < 0x80) {
+        buffer_push((boot_uint16_t)code);
+    } else if (code < 0x800) {
+        buffer_push((boot_uint16_t)(0xC0 | (code >> 6)));
+        buffer_push((boot_uint16_t)(0x80 | (code & 0x3F)));
+    } else {
+        buffer_push((boot_uint16_t)(0xE0 | (code >> 12)));
+        buffer_push((boot_uint16_t)(0x80 | ((code >> 6) & 0x3F)));
+        buffer_push((boot_uint16_t)(0x80 | (code & 0x3F)));
+    }
 }
 
 int keyboard_available(void) {
