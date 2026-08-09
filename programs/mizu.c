@@ -1,6 +1,7 @@
 #include "koi.h"
 #include "window.h"
 #include "editcore.h"
+#include "wav.h"
 #include "settings.h"
 #include "language.h"
 
@@ -30,11 +31,14 @@
 #define MENU_UNDERLINE 10
 #define MENU_PLAIN 11
 #define MENU_SAVE 12
+#define MENU_PLAYER 13
+#define MENU_STOP 14
 
 static WINDOW* control_window;
 static WINDOW* clock_window;
 static WINDOW* about_window;
 static WINDOW* note_window;
+static WINDOW* player_window;
 
 
 /* ---- The control panel ---------------------------------------------------
@@ -52,15 +56,16 @@ static koi_uint32 tint_setup(void) { return koi_gfx_color(0x4A, 0x8F, 0xB8); }
 static koi_uint32 tint_files(void) { return koi_gfx_color(0x35, 0xA6, 0xC4); }
 static koi_uint32 tint_tools(void) { return koi_gfx_color(0x58, 0xB0, 0xA8); }
 
-static ENTRY entries[4];
+static ENTRY entries[5];
 
 static void name_entries(void) {
     entries[0] = (ENTRY){ say(SAY_COMMANDER), tint_files };
     entries[1] = (ENTRY){ say(SAY_NOTEEDIT), tint_tools };
     entries[2] = (ENTRY){ say(SAY_CLOCK), tint_setup };
-    entries[3] = (ENTRY){ say(SAY_ABOUT), tint_tools };
+    entries[3] = (ENTRY){ "Player", tint_setup };
+    entries[4] = (ENTRY){ say(SAY_ABOUT), tint_tools };
 }
-#define ENTRY_COUNT 4
+#define ENTRY_COUNT 5
 
 #define ICON_W 120
 #define ICON_H 96
@@ -143,6 +148,7 @@ static void paint_control(WINDOW* window, int x, int y, int width, int height) {
 static void open_about(void);
 static void open_clock(void);
 static void open_note(void);
+static void open_player(void);
 static void start_commander(void);
 
 static void click_control(WINDOW* window, int x, int y, int clicks) {
@@ -163,6 +169,7 @@ static void click_control(WINDOW* window, int x, int y, int clicks) {
     if (index == 0) start_commander();
     else if (index == 1) open_note();
     else if (index == 2) open_clock();
+    else if (index == 3) open_player();
     else open_about();
 }
 
@@ -321,6 +328,173 @@ static void key_note(WINDOW* window, int key) {
     window_repaint();
 }
 
+/* ---- The player ----------------------------------------------------------
+ *
+ * A list of the WAV files it can find, a bar, and the bar can be clicked.
+ *
+ * The bar is the whole point and it was impossible yesterday. The mixer walks
+ * a sound in 32.32 fixed point so that a recording made at one rate can play
+ * at another, and the whole part of that number is how far in it has got - it
+ * always knew, and nothing had ever asked. Three calls later there is a
+ * position, a length and a seek, and a progress bar is arithmetic.
+ *
+ * The samples stay in memory for as long as the sound plays, because the mixer
+ * reads them where they are rather than copying them. Freeing the buffer while
+ * a voice still points into it is the one way to make this crash, so the
+ * buffer is freed when the voice is stopped and never before.
+ */
+#define PLAYER_FILES 32
+#define PLAYER_NAME 32
+#define PLAYER_BYTES (4L * 1024L * 1024L)
+
+static char tracks[PLAYER_FILES][PLAYER_NAME];
+static int track_count;
+static int track_playing = -1;
+static void* track_data;
+static int voice = -1;
+static WAV_FORMAT voice_format;
+static unsigned int voice_frames;
+
+static void player_stop(void) {
+    if (voice >= 0) koi_sound_stop(voice);
+    voice = -1;
+    if (track_data) { koi_free(track_data); track_data = 0; }
+    track_playing = -1;
+}
+
+static void player_scan(void) {
+    KOI_FIND_DATA found;
+    long search;
+
+    track_count = 0;
+    search = koi_findfirst("\\*.WAV", &found);
+    if (search < 0) return;
+    do {
+        long at = 0;
+        if (track_count >= PLAYER_FILES) break;
+        while (found.name[at] && at < PLAYER_NAME - 1) {
+            tracks[track_count][at] = found.name[at];
+            at++;
+        }
+        tracks[track_count][at] = 0;
+        track_count++;
+    } while (koi_findnext(search, &found) == 0);
+    koi_findclose(search);
+}
+
+static void player_play(int index) {
+    char path[128];
+    long handle;
+    long got;
+    unsigned int data_at = 0;
+    unsigned int data_size;
+    const char* why;
+
+    if (index < 0 || index >= track_count) return;
+    player_stop();
+
+    koi_snprintf(path, sizeof(path), "\\%s", tracks[index]);
+    handle = koi_open(path, OPEN_READ);
+    if (handle < 0) return;
+    track_data = koi_alloc(PLAYER_BYTES);
+    if (!track_data) { koi_close(handle); return; }
+    got = koi_read(handle, track_data, PLAYER_BYTES);
+    koi_close(handle);
+    if (got <= 0) { player_stop(); return; }
+
+    data_size = wav_parse((const unsigned char*)track_data, (unsigned int)got,
+                          &voice_format, &data_at, &why);
+    if (!data_size) { player_stop(); return; }
+
+    voice_frames = data_size /
+        (unsigned int)(voice_format.channels * (voice_format.bits / 8));
+    if (!voice_frames) { player_stop(); return; }
+
+    voice = koi_sound_play_simple((const char*)track_data + data_at,
+                                  voice_frames, voice_format.rate,
+                                  voice_format.bits == 16 ? KOI_SOUND_S16
+                                                          : KOI_SOUND_U8,
+                                  voice_format.channels, 255);
+    if (voice < 0) { player_stop(); return; }
+    track_playing = index;
+}
+
+#define BAR_TOP 8
+#define BAR_HEIGHT 18
+#define LIST_TOP 56
+
+static void clock_text(char* out, koi_uint64 size, unsigned int frames,
+                       unsigned int rate) {
+    unsigned int seconds = rate ? frames / rate : 0;
+    koi_snprintf(out, size, "%u:%02u", seconds / 60, seconds % 60);
+}
+
+static void paint_player(WINDOW* window, int x, int y, int width, int height) {
+    char line[64];
+    char left[16];
+    char right[16];
+    unsigned int at = voice >= 0 ? koi_sound_where(voice) : 0;
+    int rows = (height - LIST_TOP) / WINDOW_CHAR_H;
+
+    (void)window;
+
+    /* The bar. Drawn even when nothing is playing, because a control that
+       appears only once it is useful is a control nobody finds. */
+    window_sunken(x + 8, y + BAR_TOP, width - 16, BAR_HEIGHT);
+    if (voice >= 0 && voice_frames) {
+        int span = (int)((koi_uint64)(width - 18) * at / voice_frames);
+        koi_gfx_fill(x + 9, y + BAR_TOP + 1, span, BAR_HEIGHT - 2, window_accent);
+    }
+
+    clock_text(left, sizeof(left), at, voice_format.rate);
+    clock_text(right, sizeof(right), voice_frames, voice_format.rate);
+    koi_snprintf(line, sizeof(line), "%s / %s   %s", left, right,
+                 track_playing >= 0 ? tracks[track_playing] : "");
+    window_label(x + 8, y + BAR_TOP + BAR_HEIGHT + 4, line, window_text);
+
+    for (int index = 0; index < track_count && index < rows; index++) {
+        int row = y + LIST_TOP + index * WINDOW_CHAR_H;
+        if (index == track_playing) {
+            koi_gfx_fill(x + 4, row, width - 8, WINDOW_CHAR_H, window_accent);
+            window_label(x + 8, row, tracks[index], window_client_paper);
+        } else {
+            window_label(x + 8, row, tracks[index], window_text);
+        }
+    }
+    if (!track_count)
+        window_label(x + 8, y + LIST_TOP, "No .WAV files in the root.",
+                     window_shadow);
+}
+
+static void click_player(WINDOW* window, int x, int y, int clicks) {
+    int client_x, client_y, client_w, client_h;
+
+    (void)window;
+    (void)clicks;
+    window_client(player_window, &client_x, &client_y, &client_w, &client_h);
+    /* On the bar: seek. One click, not two - a bar is a place, and asking for
+       a place twice is not a different request. */
+    if (y >= BAR_TOP && y < BAR_TOP + BAR_HEIGHT) {
+        if (voice >= 0 && voice_frames && client_w > 18) {
+            koi_uint64 frame = (koi_uint64)(x - 9) * voice_frames /
+                               (koi_uint64)(client_w - 18);
+            if (x < 9) frame = 0;
+            if (frame >= voice_frames) frame = voice_frames - 1;
+            koi_sound_seek(voice, (unsigned int)frame);
+            window_repaint();
+        }
+        return;
+    }
+
+    if (y >= LIST_TOP) {
+        int index = (y - LIST_TOP) / WINDOW_CHAR_H;
+        if (index >= 0 && index < track_count) {
+            player_play(index);
+            window_repaint();
+        }
+    }
+}
+
 /* ---- About --------------------------------------------------------------- */
 
 static void paint_about(WINDOW* window, int x, int y, int width, int height) {
@@ -347,6 +521,7 @@ static void open_clock(void) {
     clock_window = window_new(say(SAY_CLOCK), 620, 300, 300, 260);
     if (!clock_window) return;
     clock_window->paint = paint_clock;
+    clock_window->repaint_ms = 1000;   /* a clock that does not tick is a date */
 }
 
 static void name_note_menus(WINDOW_MENU* menus) {
@@ -379,6 +554,25 @@ static void open_note(void) {
     note_window->menus[1] = menus[1];
 }
 
+static void open_player(void) {
+    static const WINDOW_MENU menus[] = {
+        { "File", { { "Stop", MENU_STOP }, { 0, 0 }, { "Close", MENU_EXIT } }, 3 }
+    };
+
+    if (player_window) { player_window->minimised = 0; window_raise(player_window); return; }
+    player_scan();
+    player_window = window_new("Player", 340, 200, 400, 300);
+    if (!player_window) return;
+    player_window->paint = paint_player;
+    /* Four times a second: fast enough that the bar moves smoothly and slow
+       enough that a desktop with a track playing is not repainting itself
+       thirty times a second to move two pixels. */
+    player_window->repaint_ms = 250;
+    player_window->click = click_player;
+    player_window->menu_count = 1;
+    player_window->menus[0] = menus[0];
+}
+
 static void open_about(void) {
     if (about_window) { about_window->minimised = 0; window_raise(about_window); return; }
     about_window = window_new(say(SAY_ABOUT), 360, 380, 360, 180);
@@ -390,15 +584,21 @@ static void open_about(void) {
    started here: ask for it, ask for this desktop after it, and leave. The
    screen goes away and comes back, which is honest about what the machine can
    do rather than a window pretending otherwise. */
+/* Run it and come back, rather than asking the shell to restart this
+ * afterwards.
+ *
+ * Mizu used to give up its memory, chain the program, chain itself, and exit -
+ * so everything on screen went away, the desktop was rebuilt from a command
+ * line carrying its own state, and it was visibly a restart. It stays resident
+ * now and gets control back where it left off.
+ *
+ * The screen is handed back first because the thing being started expects a
+ * console, and taken again afterwards. That much is still visible and is
+ * honest: two full-screen programs cannot both have the screen. */
 static void start_commander(void) {
-    char self[128];
-
-    if (koi_systext(KOI_TEXT_PROGRAM_PATH, 0, self, sizeof(self)) <= 0)
-        strcpy(self, "\\MIZU\\MIZU.EXE");
-    koi_chain(self);
-    koi_chain("\\COMMANDER\\COMMANDER");
-    window_close_desktop();
-    koi_exit(0);
+    koi_gfx_leave();
+    koi_run("\\COMMANDER\\COMMANDER");
+    if (window_reopen_desktop()) window_repaint();
 }
 
 int main(void) {
@@ -443,8 +643,8 @@ int main(void) {
     desktop[0] = (WINDOW_MENU){ say(SAY_MENU_SYSTEM),
         { { say(SAY_ABOUT), MENU_ABOUT }, { 0, 0 }, { say(SAY_EXIT), MENU_EXIT } }, 3 };
     desktop[1] = (WINDOW_MENU){ say(SAY_MENU_RUN),
-        { { say(SAY_NOTEEDIT), MENU_NOTE },
-          { say(SAY_COMMANDER), MENU_COMMANDER } }, 2 };
+        { { say(SAY_NOTEEDIT), MENU_NOTE }, { "Player", MENU_PLAYER },
+          { say(SAY_COMMANDER), MENU_COMMANDER } }, 3 };
     desktop[2] = (WINDOW_MENU){ say(SAY_MENU_VIEW),
         { { say(SAY_CONTROL_PANEL), MENU_CONTROL },
           { say(SAY_CLOCK), MENU_CLOCK }, { 0, 0 },
@@ -474,6 +674,10 @@ int main(void) {
             if (event.window == clock_window) clock_window = (WINDOW*)0;
             if (event.window == about_window) about_window = (WINDOW*)0;
             if (event.window == note_window) note_window = (WINDOW*)0;
+            if (event.window == player_window) {
+                player_stop();
+                player_window = (WINDOW*)0;
+            }
             window_delete(event.window);
             continue;
         }
@@ -481,6 +685,8 @@ int main(void) {
             switch (event.id) {
             case MENU_ABOUT: open_about(); break;
             case MENU_NOTE: open_note(); break;
+            case MENU_PLAYER: open_player(); break;
+            case MENU_STOP: player_stop(); window_repaint(); break;
             case MENU_SAVE:
                 if (note_ready) {
                     strcpy(note_window->title, edit_save(&note, note.path)
@@ -507,7 +713,11 @@ int main(void) {
             case MENU_EXIT:
                 /* "Close" in a window's own File menu closes that window;
                    "Exit to DOS" in the desktop's menu ends everything. */
-                if (note_window && event.window == note_window) {
+                if (player_window && event.window == player_window) {
+                    player_stop();
+                    window_delete(player_window);
+                    player_window = (WINDOW*)0;
+                } else if (note_window && event.window == note_window) {
                     window_delete(note_window);
                     note_window = (WINDOW*)0;
                 } else {

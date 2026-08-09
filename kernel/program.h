@@ -31,11 +31,33 @@
 #define PROGRAM_LIMIT 0x2000000ULL             /* 32 MiB */
 #define PROGRAM_STACK_SIZE 0x40000ULL          /* 256 KiB, at the top */
 
+/* The window is divided into slots so that more than one program can be
+ * resident at once.
+ *
+ * DOS did this with EXEC: a program could run another, and got control back
+ * when it ended, with everything it had in memory still there. That is what
+ * this is for. It is not multitasking - only one of them is running at any
+ * moment, and the caller is stopped inside the call - but it is the whole of
+ * what "run this and come back" needs, and it is what SYS_CHAIN was standing
+ * in for while the machine could hold one image.
+ *
+ * Programs are position-independent now, so a slot is only an address: the
+ * loader adds the slot's base to everything the linker left relative. Four of
+ * them, four megabytes each, the top 256 KiB of every one being its stack. */
+#define PROGRAM_SLOTS 4
+#define PROGRAM_SLOT_SIZE ((PROGRAM_LIMIT - PROGRAM_BASE) / PROGRAM_SLOTS)
+#define PROGRAM_SLOT_BASE(n) (PROGRAM_BASE + (boot_uint64_t)(n) * PROGRAM_SLOT_SIZE)
+#define PROGRAM_SLOT_TOP(n) (PROGRAM_SLOT_BASE(n) + PROGRAM_SLOT_SIZE)
+
 /* Load and run `path`, passing `arguments` as its command line.
  *
  * Returns PROGRAM_OK, PROGRAM_NOT_LOADABLE or PROGRAM_REFUSED. The program's
  * own exit code goes into `exit_code`, which may be null when nobody cares,
  * and is untouched unless the program actually ran. */
+/* How many programs are resident. Zero at the prompt, one inside a program,
+   two inside a program a program started. */
+int program_depth(void);
+
 int program_run(VOLUME* volume, const char* path, const char* arguments,
                 int* exit_code);
 

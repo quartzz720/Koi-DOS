@@ -1,4 +1,5 @@
 #include "koi.h"
+#include "wav.h"
 
 /* play - a WAV file, through the mixer that was already there.
  *
@@ -20,69 +21,6 @@
  * than like an arithmetic mistake.
  */
 
-#define FORMAT_PCM 1
-
-typedef struct {
-    unsigned short format;
-    unsigned short channels;
-    unsigned int rate;
-    unsigned int bytes_per_second;
-    unsigned short block_align;
-    unsigned short bits;
-} WAVE_FORMAT;
-
-static unsigned int read32(const unsigned char* at) {
-    return (unsigned int)at[0] | ((unsigned int)at[1] << 8) |
-           ((unsigned int)at[2] << 16) | ((unsigned int)at[3] << 24);
-}
-
-static unsigned short read16(const unsigned char* at) {
-    return (unsigned short)((unsigned int)at[0] | ((unsigned int)at[1] << 8));
-}
-
-static int tag_is(const unsigned char* at, const char* name) {
-    return at[0] == (unsigned char)name[0] && at[1] == (unsigned char)name[1] &&
-           at[2] == (unsigned char)name[2] && at[3] == (unsigned char)name[3];
-}
-
-/* Walk the chunks, filling in the format and finding the samples. Returns the
-   number of bytes of sample data, or 0. */
-static unsigned int parse(const unsigned char* file, unsigned int size,
-                          WAVE_FORMAT* format, unsigned int* data_at) {
-    unsigned int at = 12;          /* past "RIFF", the size, and "WAVE" */
-    int have_format = 0;
-    unsigned int data_size = 0;
-
-    if (size < 12 || !tag_is(file, "RIFF") || !tag_is(file + 8, "WAVE"))
-        return 0;
-
-    while (at + 8 <= size) {
-        unsigned int length = read32(file + at + 4);
-        const unsigned char* body = file + at + 8;
-
-        if (length > size - at - 8) length = size - at - 8;
-
-        if (tag_is(file + at, "fmt ") && length >= 16) {
-            format->format = read16(body);
-            format->channels = read16(body + 2);
-            format->rate = read32(body + 4);
-            format->bytes_per_second = read32(body + 8);
-            format->block_align = read16(body + 12);
-            format->bits = read16(body + 14);
-            have_format = 1;
-        } else if (tag_is(file + at, "data")) {
-            *data_at = at + 8;
-            data_size = length;
-            /* Not stopping here: a file may carry chunks after the samples,
-               and one of them may be the `fmt ` we still need. */
-        }
-
-        at += 8 + length;
-        if (length & 1) at++;      /* the pad byte, which is not in the length */
-    }
-
-    return have_format ? data_size : 0;
-}
 
 static void say(const char* text) { koi_print(text); koi_print("\n"); }
 
@@ -91,7 +29,7 @@ int main(void) {
     long handle;
     long size;
     unsigned char* file;
-    WAVE_FORMAT format;
+    WAV_FORMAT format;
     unsigned int data_at = 0;
     unsigned int data_size;
     unsigned int frames;
@@ -134,28 +72,14 @@ int main(void) {
         if (got < size) size = got;
     }
 
-    data_size = parse(file, (unsigned int)size, &format, &data_at);
-    if (!data_size) { say("Not a WAV file this can read."); return 1; }
-
-    if (format.format != FORMAT_PCM) {
-        /* Said as a number, because "unsupported format" tells the person
-           holding the file nothing they can act on. 0x11 is IMA ADPCM, 0xFFFE
-           is the extensible header - both are things this could learn. */
-        koi_printf("This WAV is format %u, and only uncompressed PCM (1) is\n",
-                   format.format);
-        say("understood so far.");
-        return 1;
+    {
+        const char* why;
+        data_size = wav_parse(file, (unsigned int)size, &format, &data_at, &why);
+        if (!data_size) { say(why); return 1; }
     }
-    if (format.bits != 8 && format.bits != 16) {
-        koi_printf("%u bits per sample; 8 and 16 are understood.\n", format.bits);
-        return 1;
-    }
-    if (format.channels != 1 && format.channels != 2) {
-        koi_printf("%u channels; mono and stereo are understood.\n",
-                   format.channels);
-        return 1;
-    }
-
+    /* The reasons a file is refused are the shared reader's to give, because
+       it is the one that looked. Repeating the checks here was repeating the
+       chance of the two disagreeing. */
     frames = data_size / (unsigned int)(format.channels * (format.bits / 8));
     if (!frames) { say("The file has no samples in it."); return 1; }
 

@@ -1,5 +1,6 @@
 #include "../include/syscall.h"
 #include "syscall.h"
+#include "command.h"
 #include "console.h"
 #include "serial.h"
 #include "keyboard.h"
@@ -647,6 +648,12 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
     case SYS_SOUND_PARAMS:
         return audio_set_params((int)a, (int)b, (int)c);
 
+    case SYS_SOUND_WHERE:
+        return (long)audio_position((int)a);
+    case SYS_SOUND_LENGTH:
+        return (long)audio_length((int)a);
+    case SYS_SOUND_SEEK:
+        return audio_seek((int)a, (boot_uint32_t)b);
     case SYS_SOUND_ACTIVE:
         return audio_active((int)a) ? 1 : 0;
 
@@ -751,6 +758,16 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
         return (long)device->sector_size;
     }
 
+    case SYS_RUN: {
+        /* The exit code of what was run is not carried back yet: the shell
+           prints it and does not return it. Zero means "it ran"; -1 means the
+           command line was not usable. Saying so is better than inventing a
+           number that looks like a result. */
+        const char* line = (const char*)a;
+        if (!line) return -1;
+        command_execute_line(line);
+        return 0;
+    }
     case SYS_SECTOR_SIZE: {
         BLOCK_DEVICE* device = block_device((boot_uint32_t)a);
         return device ? (long)device->sector_size : SYSCALL_ERROR;

@@ -363,6 +363,22 @@ static inline void koi_gfx_text_styled(int x, int y, const char* text,
                     ((long)(style & 0xFF) << 32));
 }
 
+/* Run a command and come back when it has finished.
+ *
+ * This program stays in memory with everything it has; the one it starts gets
+ * a slot of its own, and this returns when that program exits. `koi_chain` is
+ * the other half of the pair and means the opposite: give up this program's
+ * memory first. Use chain when the thing being started needs the room; use
+ * this when you want to come back where you were.
+ *
+ * The screen belongs to whoever took it. A program drawing on the framebuffer
+ * should koi_gfx_leave() before this and koi_gfx_enter() afterwards - nothing
+ * here does it, because a program that only wants to run `dir` should not have
+ * its window torn down to do it. */
+static inline int koi_run(const char* command) {
+    return (int)koi_call(SYS_RUN, (long)command, 0, 0);
+}
+
 /* ---- Running something else ----------------------------------------------
  *
  * A program cannot call another program: one runs at a time, at a fixed
@@ -515,6 +531,21 @@ static inline int koi_sound_active(int voice) {
 }
 
 /* 0 to 255, applied to everything. Pass -1 to ask without changing it. */
+/* Where a sound has got to, how long it is, and how to move the first - all in
+   source frames, so frames / rate is seconds. A progress bar needs exactly
+   these three. */
+static inline unsigned int koi_sound_where(int voice) {
+    return (unsigned int)koi_call(SYS_SOUND_WHERE, voice, 0, 0);
+}
+
+static inline unsigned int koi_sound_length(int voice) {
+    return (unsigned int)koi_call(SYS_SOUND_LENGTH, voice, 0, 0);
+}
+
+static inline int koi_sound_seek(int voice, unsigned int frame) {
+    return (int)koi_call(SYS_SOUND_SEEK, voice, (long)frame, 0);
+}
+
 static inline int koi_sound_volume(int volume) {
     return (int)koi_call(SYS_SOUND_VOLUME, (long)volume, 0, 0);
 }

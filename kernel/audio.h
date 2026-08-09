@@ -63,6 +63,13 @@ int audio_set_params(int voice, int volume, int pan);
 void audio_stop(int voice);
 void audio_stop_all(void);
 int audio_active(int voice);
+/* Where a voice has got to and how long it is, both in source frames, and a
+   way to move the first. A player with a bar needs all three and the mixer
+   already knew all three. */
+boot_uint32_t audio_position(int voice);
+boot_uint32_t audio_length(int voice);
+int audio_seek(int voice, boot_uint32_t frame);
+
 boot_uint32_t audio_voices_playing(void);
 
 /* 0 to 255, applied to everything. */

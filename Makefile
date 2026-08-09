@@ -47,7 +47,7 @@ KERNEL_HEADERS = kernel/kernel.h kernel/console.h kernel/font.h kernel/serial.h 
 # script, and end up as .EXE files on the disk image. The format underneath is
 # ELF64; the extension is the DOS-familiar one.
 PROGRAM_CFLAGS = -ffreestanding -fno-stack-protector -fno-stack-check \
-                 -fno-builtin -fno-pie -mno-red-zone -mgeneral-regs-only \
+                 -fno-builtin -fpie -mno-red-zone -mgeneral-regs-only \
                  -fno-asynchronous-unwind-tables \
                  -ffunction-sections -fdata-sections \
                  -Wall -Wextra -Werror -std=c11 -I . -I include
@@ -55,7 +55,8 @@ PROGRAM_CFLAGS = -ffreestanding -fno-stack-protector -fno-stack-check \
 # that wants strlen does not also carry a formatter and a heap. Safe with our
 # linker script because it KEEPs .koi_abi, which nothing references and which
 # would otherwise be the first thing collected.
-PROGRAM_LDFLAGS = -nostdlib -no-pie -Wl,-T,programs/program.ld \
+PROGRAM_LDFLAGS = -nostdlib -pie -Wl,--no-dynamic-linker \
+                  -Wl,-T,programs/program.ld \
                   -Wl,--build-id=none -Wl,-z,max-page-size=0x1000 \
                   -Wl,-z,noexecstack -Wl,--gc-sections
 
@@ -64,7 +65,7 @@ PROGRAM_SOURCES = $(wildcard programs/*.c)
 # SDK's koicc has always accepted several sources as one program - "there is no
 # linker to run afterwards and no object files to keep" - and this Makefile
 # could not, which made the tree less capable than the SDK it ships.
-PROGRAM_SHARED = programs/editcore.c programs/dialog.c programs/settings.c programs/window.c programs/language.c
+PROGRAM_SHARED = programs/editcore.c programs/dialog.c programs/settings.c programs/window.c programs/language.c programs/wav.c
 
 PROGRAMS = $(patsubst programs/%.c,build/%.EXE,\
              $(filter-out programs/start.c programs/koilib.c $(PROGRAM_SHARED),\
@@ -73,7 +74,8 @@ PROGRAMS = $(patsubst programs/%.c,build/%.EXE,\
 # Which programs are built from more than their own file.
 build/edit.EXE: EXTRA_SOURCES = programs/editcore.c
 build/color.EXE: EXTRA_SOURCES = programs/settings.c
-build/mizu.EXE: EXTRA_SOURCES = programs/window.c programs/editcore.c programs/language.c programs/settings.c
+build/play.EXE: EXTRA_SOURCES = programs/wav.c
+build/mizu.EXE: EXTRA_SOURCES = programs/window.c programs/editcore.c programs/language.c programs/settings.c programs/wav.c
 build/commander.EXE: EXTRA_SOURCES = programs/editcore.c programs/settings.c
 build/cmdrcfg.EXE: EXTRA_SOURCES = programs/dialog.c programs/settings.c
 build/mizucfg.EXE: EXTRA_SOURCES = programs/dialog.c programs/settings.c programs/language.c
@@ -103,7 +105,7 @@ $(BUILD_HEADER): FORCE
 
 FORCE:
 
-build/%.EXE: programs/%.c programs/start.c programs/koilib.c programs/koi.h programs/program.ld include/syscall.h $(PROGRAM_SHARED) programs/editcore.h programs/dialog.h programs/settings.h programs/window.h programs/language.h
+build/%.EXE: programs/%.c programs/start.c programs/koilib.c programs/koi.h programs/program.ld include/syscall.h $(PROGRAM_SHARED) programs/editcore.h programs/dialog.h programs/settings.h programs/window.h programs/language.h programs/wav.h
 	mkdir -p build
 	$(KERNEL_CC) $(PROGRAM_CFLAGS) $(PROGRAM_LDFLAGS) -o $@ $< $(EXTRA_SOURCES) programs/start.c programs/koilib.c
 

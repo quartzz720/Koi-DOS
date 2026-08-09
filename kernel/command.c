@@ -3850,6 +3850,10 @@ static void run_batch(VOLUME* volume, const char* path) {
     kfree(contents);
 }
 
+void command_execute_line(const char* line) {
+    if (line) execute(line);
+}
+
 static void execute(const char* input) {
     ARGUMENTS arguments;
 

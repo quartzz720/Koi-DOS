@@ -5,4 +5,10 @@
    programs can be loaded from disk and this stops living inside the kernel. */
 __attribute__((noreturn)) void command_run(void);
 
+/* Run one command line, as though it had been typed, and return when it has
+   finished. This is what SYS_RUN calls: a program asking the shell to do
+   something is asking for exactly what a person typing would get, including
+   the built-in commands and the search path. */
+void command_execute_line(const char* line);
+
 #endif

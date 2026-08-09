@@ -77,6 +77,14 @@ struct WINDOW {
     void (*paint)(WINDOW* window, int x, int y, int width, int height);
     void (*click)(WINDOW* window, int x, int y, int clicks);
     void (*key)(WINDOW* window, int key);
+    /* Milliseconds between repaints, or 0 for a window that only changes when
+     * something happens to it.
+     *
+     * Most windows are the second kind and redrawing them on a timer would be
+     * a screenful of work for nothing. A clock and a progress bar are the
+     * first kind: nothing happens to them at all, and they were both correct
+     * and both frozen until this existed. */
+    int repaint_ms;
     void* data;
 };
 
@@ -95,6 +103,10 @@ typedef struct {
 /* Take the screen. Returns 0 when it could not be had. */
 int window_open_desktop(const char* title);
 void window_close_desktop(void);
+
+/* Take the screen again after something else has had it, keeping every window
+   where it was. Returns 0 if it could not be had back. */
+int window_reopen_desktop(void);
 
 /* The desktop's own menu bar, across the top. */
 void window_desktop_menu(const WINDOW_MENU* menus, int count);

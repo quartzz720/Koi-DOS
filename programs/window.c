@@ -552,6 +552,14 @@ int window_open_desktop(const char* title) {
     return 1;
 }
 
+int window_reopen_desktop(void) {
+    if (koi_gfx_enter(&screen) != 0) return 0;
+    koi_mouse_place((int)screen.width / 2, (int)screen.height / 2);
+    cursor_saved = 0;
+    dirty = 1;
+    return 1;
+}
+
 void window_close_desktop(void) {
     cursor_hide();
     koi_gfx_leave();
@@ -630,6 +638,10 @@ int window_next(WINDOW_EVENT* event) {
     static KOI_POINTER pointer;
     static unsigned int last_press;
     static int started;
+    static koi_uint64 last_tick;
+    static koi_uint64 last_click_at;
+    static int last_click_x = -100;
+    static int last_click_y = -100;
 
     event->type = WINDOW_EVENT_NONE;
     event->window = (WINDOW*)0;
@@ -648,6 +660,25 @@ int window_next(WINDOW_EVENT* event) {
         if (dirty) { draw_everything(); cursor_show(pointer.x, pointer.y); }
 
         koi_sleep(10);
+
+        /* Anything that changes on its own gets its repaint here. The shortest
+           interval any open window asked for wins, and a desktop where nothing
+           asked for one never wakes up at all. */
+        {
+            koi_uint64 now = koi_uptime();
+            int soonest = 0;
+
+            for (int index = 0; index < order_count; index++) {
+                int wanted = order[index]->repaint_ms;
+                if (order[index]->minimised || wanted <= 0) continue;
+                if (!soonest || wanted < soonest) soonest = wanted;
+            }
+            if (soonest && now - last_tick >= (koi_uint64)soonest) {
+                last_tick = now;
+                dirty = 1;
+                continue;
+            }
+        }
 
         if (koi_keypressed()) {
             int key = koi_getchar();
@@ -693,7 +724,26 @@ int window_next(WINDOW_EVENT* event) {
         }
 
         if (pointer.presses[0] != last_press) {
+            /* A double click is two clicks close together in time and place,
+             * not two that happened to land in one poll.
+             *
+             * The count from the driver is how many presses arrived since the
+             * last look, which is one almost always - so anything asking for
+             * two got them only when the machine was busy enough to miss a
+             * poll between them. The icons in the control panel needed a
+             * double click and were, in practice, decorations.
+             *
+             * Half a second and four pixels, which is what everything else
+             * uses and what a hand actually does. */
             unsigned int clicks = pointer.presses[0] - last_press;
+            koi_uint64 now = koi_uptime();
+            int near = (pointer.x - last_click_x) * (pointer.x - last_click_x) +
+                       (pointer.y - last_click_y) * (pointer.y - last_click_y) <= 16;
+
+            if (clicks < 2 && near && now - last_click_at <= 500) clicks = 2;
+            last_click_at = now;
+            last_click_x = pointer.x;
+            last_click_y = pointer.y;
             int x = pointer.x;
             int y = pointer.y;
             WINDOW* hit;

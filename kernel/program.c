@@ -15,13 +15,23 @@
  * the structures cannot drift.
  */
 
-static const char* current_arguments = "";
-static int program_running;
+/* One entry per resident program, innermost last.
+ *
+ * A program can now run another and get control back when it ends, with
+ * everything it had in memory still there - which is what DOS's EXEC did and
+ * what SYS_CHAIN was standing in for while this machine could hold one image
+ * at a time. Only one of them is running at any moment: the caller is stopped
+ * inside the call, not scheduled alongside it. That is a smaller claim than
+ * multitasking and it is the whole of what "run this and come back" needs. */
+typedef struct {
+    boot_uint64_t base;
+    const char* arguments;
+    char path[PROGRAM_CHAIN_MAX];
+    int exit_code;
+} PROGRAM_SLOT;
 
-/* Where the running program was loaded from. Copied rather than pointed at: the
-   caller's buffer is a local in the shell's command parser and is reused for
-   the next line the moment this one finishes. */
-static char current_path[PROGRAM_CHAIN_MAX] = "";
+static PROGRAM_SLOT slots[PROGRAM_SLOTS];
+static int depth;                       /* how many are resident */
 
 /* Where to resume when the program exits.
  *
@@ -34,8 +44,11 @@ typedef struct {
     boot_uint64_t rsp, rbp, rbx, r12, r13, r14, r15, rip;
 } RESUME_POINT;
 
-static RESUME_POINT resume;
-static int exit_code;
+/* One resume point per depth, for the same reason there is one slot: the
+   innermost program exits back into the call that started it, not into the
+   outermost one. A single point here meant the second exit returned to a
+   stack frame that had already been left. */
+static RESUME_POINT resume[PROGRAM_SLOTS];
 
 /* Returns 0 when saving, and 1 when arrived at through program_resume().
    Not static: the definitions below are global assembly labels, and the
@@ -74,13 +87,16 @@ __asm__(
 "    jmp *56(%rdi)\n"
 );
 
+/* Whichever program is running now, which is the innermost one. */
 const char* program_arguments(void) {
-    return current_arguments;
+    return depth ? slots[depth - 1].arguments : "";
 }
 
 const char* program_path(void) {
-    return current_path;
+    return depth ? slots[depth - 1].path : "";
 }
+
+int program_depth(void) { return depth; }
 
 /* The chain: what to run once the running program has gone.
  *
@@ -123,12 +139,15 @@ int program_chain_take(char* command, boot_uint64_t size) {
 void program_chain_clear(void) { chain_count = 0; }
 
 __attribute__((noreturn)) void program_exit(int code) {
-    exit_code = code;
-    program_running = 0;
+    int leaving = depth - 1;
+
+    if (leaving < 0) leaving = 0;
+    slots[leaving].exit_code = code;
+    if (depth) depth--;
     /* Interrupts were left enabled by the trap gate, so nothing has to be
        re-enabled here; the abandoned interrupt frame simply goes with the
        stack we are throwing away. */
-    program_resume(&resume);
+    program_resume(&resume[leaving]);
 }
 
 /* Read the whole file into a buffer. Programs are small; streaming the ELF
@@ -157,8 +176,67 @@ static boot_uint8_t* read_program(VOLUME* volume, const char* path,
     return contents;
 }
 
+/* Apply the relocations a position-independent program carries.
+ *
+ * There is one kind, and it says "add the load address to the value already
+ * here". A table of function pointers or an array of string literals is
+ * exactly that and nothing else, because there is nobody else to link to - no
+ * libraries, no symbols to resolve, no dynamic linker. Everything else the
+ * compiler emits is already RIP-relative and needs nothing.
+ *
+ * A program with no such table has no relocations at all, which is why the
+ * first one tried came out empty and looked as though this had not worked. */
+static int relocate(const boot_uint8_t* contents, boot_uint32_t length,
+                    boot_uint64_t base) {
+    const ELF64_HEADER* header = (const ELF64_HEADER*)contents;
+    const ELF64_PROGRAM_HEADER* segments =
+        (const ELF64_PROGRAM_HEADER*)(contents + header->e_phoff);
+    boot_uint64_t table = 0;
+    boot_uint64_t bytes = 0;
+    boot_uint64_t entry_size = sizeof(ELF64_RELA);
+
+    for (elf_uint16_t index = 0; index < header->e_phnum; index++) {
+        const ELF64_PROGRAM_HEADER* segment = &segments[index];
+        const ELF64_DYNAMIC* dynamic;
+        boot_uint64_t count;
+
+        if (segment->p_type != PT_DYNAMIC) continue;
+        if (segment->p_offset > length ||
+            segment->p_filesz > length - segment->p_offset) return 0;
+
+        dynamic = (const ELF64_DYNAMIC*)(contents + segment->p_offset);
+        count = segment->p_filesz / sizeof(ELF64_DYNAMIC);
+        for (boot_uint64_t at = 0; at < count && dynamic[at].d_tag != DT_NULL; at++) {
+            if (dynamic[at].d_tag == DT_RELA) table = dynamic[at].d_value;
+            else if (dynamic[at].d_tag == DT_RELASZ) bytes = dynamic[at].d_value;
+            else if (dynamic[at].d_tag == DT_RELAENT) entry_size = dynamic[at].d_value;
+        }
+    }
+
+    if (!table || !bytes) return 1;      /* nothing to fix up, and that is fine */
+    if (!entry_size || entry_size > 64) return 0;
+
+    for (boot_uint64_t at = 0; at + entry_size <= bytes; at += entry_size) {
+        /* Read from the image in memory, which is where the linker put the
+           table - it is inside a PT_LOAD segment and has already been copied
+           and biased into place. */
+        const ELF64_RELA* item =
+            (const ELF64_RELA*)(unsigned long long)(base + table + at);
+        boot_uint64_t where = base + item->r_offset;
+
+        if (ELF64_R_TYPE(item->r_info) != R_X86_64_RELATIVE) return 0;
+        /* The same bounds the segments were checked against. A relocation is a
+           write to an address a file chose, and there is no memory protection
+           behind this. */
+        if (where < base || where + 8 > base + PROGRAM_SLOT_SIZE) return 0;
+        *(boot_uint64_t*)(unsigned long long)where =
+            base + (boot_uint64_t)item->r_addend;
+    }
+    return 1;
+}
+
 static int load_segments(const boot_uint8_t* contents, boot_uint32_t length,
-                         boot_uint64_t* entry_point) {
+                         boot_uint64_t base, boot_uint64_t* entry_point) {
     const ELF64_HEADER* header = (const ELF64_HEADER*)contents;
     const ELF64_PROGRAM_HEADER* segments;
 
@@ -167,7 +245,11 @@ static int load_segments(const boot_uint8_t* contents, boot_uint32_t length,
         header->e_ident[2] != 'L' || header->e_ident[3] != 'F') return 0;
     if (header->e_ident[ELF_INDEX_CLASS] != ELF_CLASS_64 ||
         header->e_ident[ELF_INDEX_DATA] != ELF_DATA_LSB) return 0;
-    if (header->e_type != ELF_TYPE_EXEC ||
+    /* Position-independent, so that a second program can be resident at a
+       different address while the first one waits. A fixed-address program
+       could only ever be loaded in slot zero, and refusing it outright says so
+       once rather than crashing later in whichever slot it landed in. */
+    if (header->e_type != ET_DYN ||
         header->e_machine != ELF_MACHINE_X86_64) return 0;
     if (!header->e_phnum || header->e_phentsize != sizeof(ELF64_PROGRAM_HEADER))
         return 0;
@@ -183,23 +265,23 @@ static int load_segments(const boot_uint8_t* contents, boot_uint32_t length,
         /* Refusing anything outside the program window is what keeps a
            malformed or hostile file from writing over the kernel: there is no
            memory protection to fall back on. */
-        if (segment->p_paddr < PROGRAM_BASE ||
-            segment->p_paddr + segment->p_memsz > PROGRAM_LIMIT - PROGRAM_STACK_SIZE)
+        if (segment->p_vaddr + segment->p_memsz >
+            PROGRAM_SLOT_SIZE - PROGRAM_STACK_SIZE)
             return 0;
         if (segment->p_filesz > segment->p_memsz) return 0;
         if (segment->p_offset > length ||
             segment->p_filesz > length - segment->p_offset) return 0;
 
-        memset((void*)(unsigned long long)segment->p_paddr, 0,
+        memset((void*)(unsigned long long)(base + segment->p_vaddr), 0,
                (boot_uint64_t)segment->p_memsz);
         if (segment->p_filesz)
-            memcpy((void*)(unsigned long long)segment->p_paddr,
+            memcpy((void*)(unsigned long long)(base + segment->p_vaddr),
                    contents + segment->p_offset, (boot_uint64_t)segment->p_filesz);
     }
 
-    if (header->e_entry < PROGRAM_BASE || header->e_entry >= PROGRAM_LIMIT)
-        return 0;
-    *entry_point = header->e_entry;
+    if (header->e_entry >= PROGRAM_SLOT_SIZE) return 0;
+    if (!relocate(contents, length, base)) return 0;
+    *entry_point = base + header->e_entry;
     return 1;
 }
 
@@ -213,9 +295,9 @@ static int load_segments(const boot_uint8_t* contents, boot_uint32_t length,
  * something else, and that is far worse than refusing to start.
  *
  * Fills `reason` with something a person can act on. */
-static int abi_is_acceptable(const char** reason) {
+static int abi_is_acceptable(boot_uint64_t base, const char** reason) {
     const KOI_PROGRAM_HEADER* header =
-        (const KOI_PROGRAM_HEADER*)(unsigned long long)PROGRAM_BASE;
+        (const KOI_PROGRAM_HEADER*)(unsigned long long)base;
 
     if (header->magic != KOI_PROGRAM_MAGIC) {
         *reason = "not a Koi-DOS program, or built before programs carried a "
@@ -259,12 +341,21 @@ int program_run(VOLUME* volume, const char* path, const char* arguments,
     boot_uint8_t* contents;
     boot_uint32_t length = 0;
     boot_uint64_t entry_point = 0;
+    int slot = depth;
+    boot_uint64_t base;
 
-    if (program_running) return PROGRAM_NOT_LOADABLE;   /* one at a time, as in DOS */
+    /* Out of slots is a real answer and not a failure of the file: a program
+       that runs a program that runs a program eventually meets the end of the
+       window, and saying so beats loading over somebody. */
+    if (slot >= PROGRAM_SLOTS) {
+        console_write("Too many programs running at once.\n");
+        return PROGRAM_REFUSED;
+    }
+    base = PROGRAM_SLOT_BASE(slot);
 
     contents = read_program(volume, path, &length);
     if (!contents) return PROGRAM_NOT_LOADABLE;
-    if (!load_segments(contents, length, &entry_point)) {
+    if (!load_segments(contents, length, base, &entry_point)) {
         kfree(contents);
         return PROGRAM_NOT_LOADABLE;
     }
@@ -272,7 +363,7 @@ int program_run(VOLUME* volume, const char* path, const char* arguments,
 
     {
         const char* reason;
-        if (!abi_is_acceptable(&reason)) {
+        if (!abi_is_acceptable(base, &reason)) {
             /* Said here rather than by the caller, because only this function
                knows which of the reasons it was, and "will not run" without
                "why" is the least useful message a system can give. */
@@ -286,23 +377,27 @@ int program_run(VOLUME* volume, const char* path, const char* arguments,
         }
     }
 
-    current_arguments = arguments ? arguments : "";
+    slots[slot].base = base;
+    slots[slot].arguments = arguments ? arguments : "";
+    /* Copied rather than pointed at: the caller's buffer is a local in the
+       command parser and is reused for the next line the moment this one
+       finishes. */
     {
         boot_uint64_t index = 0;
         while (path[index] && index < PROGRAM_CHAIN_MAX - 1) {
-            current_path[index] = path[index];
+            slots[slot].path[index] = path[index];
             index++;
         }
-        current_path[index] = 0;
+        slots[slot].path[index] = 0;
     }
-    exit_code = 0;
+    slots[slot].exit_code = 0;
 
-    if (program_save(&resume)) {
-        /* Arrived here through program_exit(). */
-        current_arguments = "";
-        if (exit_code_out) *exit_code_out = exit_code;
+    if (program_save(&resume[slot])) {
+        /* Arrived here through program_exit(). Whatever this program was
+           given is gone with it; the one underneath keeps its own. */
+        if (exit_code_out) *exit_code_out = slots[slot].exit_code;
         return PROGRAM_OK;
     }
-    program_running = 1;
-    enter_program(entry_point, PROGRAM_LIMIT);
+    depth = slot + 1;
+    enter_program(entry_point, PROGRAM_SLOT_TOP(slot));
 }

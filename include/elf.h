@@ -10,6 +10,7 @@ typedef unsigned char      elf_uint8_t;
 typedef unsigned short     elf_uint16_t;
 typedef unsigned int       elf_uint32_t;
 typedef unsigned long long elf_uint64_t;
+typedef long long          elf_int64_t;
 
 #define ELF_IDENT_SIZE 16
 
@@ -26,6 +27,38 @@ typedef unsigned long long elf_uint64_t;
 #define ELF_MACHINE_X86_64 62
 
 #define PT_LOAD 1           /* p_type: segment to be mapped into memory */
+#define PT_DYNAMIC 2        /* p_type: where the relocations are described */
+
+#define ET_EXEC 2           /* e_type: fixed address, load it where it says */
+#define ET_DYN 3            /* e_type: position independent, load it anywhere */
+
+/* The dynamic table, of which this needs three entries and no more: where the
+   relocations are, how many bytes of them, and how big one is. There is no
+   dynamic linking here - no libraries, no symbols to resolve. A
+   position-independent program still has to be told where it ended up, and
+   this is how the linker says which words hold addresses. */
+#define DT_NULL 0
+#define DT_RELA 7
+#define DT_RELASZ 8
+#define DT_RELAENT 9
+
+/* The only relocation a freestanding position-independent program produces:
+   "add the load address to the value already here". Pointers in initialised
+   data - a table of function pointers, an array of string literals - are
+   exactly this and nothing else, because there is nobody else to link to. */
+#define R_X86_64_RELATIVE 8
+#define ELF64_R_TYPE(info) ((elf_uint32_t)((info) & 0xFFFFFFFFU))
+
+typedef struct {
+    elf_int64_t d_tag;
+    elf_uint64_t d_value;
+} ELF64_DYNAMIC;
+
+typedef struct {
+    elf_uint64_t r_offset;
+    elf_uint64_t r_info;
+    elf_int64_t r_addend;
+} ELF64_RELA;
 
 typedef struct {
     elf_uint8_t  e_ident[ELF_IDENT_SIZE];

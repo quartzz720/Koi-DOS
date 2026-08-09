@@ -294,6 +294,49 @@ int audio_active(int voice) {
     return voices[index].active && voices[index].generation == generation;
 }
 
+/* How far into the sound a voice has got, in source frames.
+ *
+ * The mixer already knows: it walks the source in 32.32 fixed point so that a
+ * sound recorded at one rate can play at another, and the whole part of that
+ * number is the answer. Nothing had to be counted; it only had to be asked
+ * for, which is why a progress bar was impossible yesterday and is arithmetic
+ * today.
+ *
+ * Read without stopping the mixer. A torn read gives a position off by less
+ * than one frame at 48 kHz, which is not visible on a bar and is not worth
+ * disabling interrupts for. */
+boot_uint32_t audio_position(int voice) {
+    int index = voice & 0xFF;
+    boot_uint16_t generation = (boot_uint16_t)((voice >> 8) & 0xFFFF);
+
+    if (voice < 0 || index >= AUDIO_VOICES) return 0;
+    if (!voices[index].active || voices[index].generation != generation) return 0;
+    return (boot_uint32_t)(voices[index].position >> 32);
+}
+
+boot_uint32_t audio_length(int voice) {
+    int index = voice & 0xFF;
+    boot_uint16_t generation = (boot_uint16_t)((voice >> 8) & 0xFFFF);
+
+    if (voice < 0 || index >= AUDIO_VOICES) return 0;
+    if (!voices[index].active || voices[index].generation != generation) return 0;
+    return voices[index].frames;
+}
+
+/* Move the playing point. The one write is a whole 64-bit store, so the mixer
+   either sees the old position or the new one and never half of each - which
+   is the only reason this does not have to stop it first. */
+int audio_seek(int voice, boot_uint32_t frame) {
+    int index = voice & 0xFF;
+    boot_uint16_t generation = (boot_uint16_t)((voice >> 8) & 0xFFFF);
+
+    if (voice < 0 || index >= AUDIO_VOICES) return -1;
+    if (!voices[index].active || voices[index].generation != generation) return -1;
+    if (frame >= voices[index].frames) frame = voices[index].frames - 1;
+    voices[index].position = (boot_uint64_t)frame << 32;
+    return 0;
+}
+
 boot_uint32_t audio_voices_playing(void) {
     boot_uint32_t count = 0;
     int index;

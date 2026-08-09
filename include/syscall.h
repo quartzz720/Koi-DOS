@@ -67,7 +67,7 @@
  * nothing else, so raising it would refuse every program already installed on a
  * machine until each was reinstalled. A rule worth keeping is worth keeping for
  * its reason, and the reason does not apply here. */
-#define KOI_ABI_VERSION 10
+#define KOI_ABI_VERSION 12
 #define KOI_ABI_MINIMUM 8
 #define KOI_ABI_IS_ALPHA 1
 
@@ -396,6 +396,10 @@ typedef struct {
    calls this every tic for every sound whose direction or distance from the
    player has changed, and without it a rocket that flies past stays where it
    was fired. Pass -1 for either to leave it alone. */
+#define SYS_SOUND_WHERE 0x46  /* (voice) -> frames played */
+#define SYS_SOUND_LENGTH 0x47 /* (voice) -> frames in the sound */
+#define SYS_SOUND_SEEK 0x48   /* (voice, frame) -> 0, or -1 */
+
 #define SYS_SOUND_PARAMS 0x45  /* (voice, volume, pan) -> 0, or -1 */
 
 #define KOI_SOUND_U8 8         /* unsigned bytes, 0x80 is silence */
@@ -499,6 +503,24 @@ typedef struct {
 /* How many disks, and how large a sector is on one of them - which a caller
    needs before it can offer a buffer. */
 #define SYS_SECTOR_SIZE 0x58 /* (disk) -> bytes per sector, or -1 */
+
+/* Run a command and come back when it has finished.
+ *
+ * The caller stays in memory with everything it had; the program it starts is
+ * loaded into a slot of its own and this returns when that program exits. It
+ * is what DOS's EXEC did and what SYS_CHAIN was standing in for while the
+ * machine could hold one image at a time.
+ *
+ * SYS_CHAIN is still here and still means something different: chaining gives
+ * up this program's memory before the next one starts, which is the only way
+ * to run something that needs more of the window than is left. Running keeps
+ * it. A shell that wants to come back where it was wants this one.
+ *
+ * The screen belongs to whoever took it. A program holding the framebuffer
+ * should give it back before calling this and take it again afterwards -
+ * nothing here does that for it, because a program that only wants to run
+ * `dir` should not have its window torn down. */
+#define SYS_RUN 0x59         /* (command) -> the program's exit code, or -1 */
 
 #define KOI_BUTTON_LEFT 0x01
 #define KOI_BUTTON_RIGHT 0x02
