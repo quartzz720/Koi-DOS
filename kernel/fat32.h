@@ -147,4 +147,69 @@ int fat32_rename(VOLUME* volume, const char* from, const char* to);
 int fat32_set_attributes(VOLUME* volume, const FAT_ENTRY* entry,
                          boot_uint8_t attributes);
 
+/* ---- Checking a volume ---------------------------------------------------
+ *
+ * A filesystem driver that can only ever have been right needs no checker.
+ * This one has already been wrong: a directory that grew past its first
+ * cluster kept an end-of-directory marker in the middle of its chain, and
+ * every file beyond that point was written perfectly and could not be found
+ * again by anybody. The writer no longer does that, but volumes it wrote
+ * before the fix are still out there, and nothing in the system could either
+ * see the damage or undo it.
+ *
+ * So this exists to answer two questions that a driver alone cannot: is what
+ * is on the disk self-consistent, and if not, can it be put back. It reads
+ * the whole allocation table and walks every directory, which is why it is a
+ * command a person runs and not something a mount does.
+ */
+typedef enum {
+    FAT_FAULT_TERMINATOR,        /* end-of-directory marker hiding live entries */
+    FAT_FAULT_ORPHAN_LONG_NAME,  /* long-name entries with no short entry */
+    FAT_FAULT_BAD_LINK,          /* a chain pointing outside the volume */
+    FAT_FAULT_CROSS_LINKED,      /* one cluster claimed twice, or a loop */
+    FAT_FAULT_SIZE_TOO_LARGE,    /* recorded size exceeds the clusters held */
+    FAT_FAULT_SIZE_TOO_SMALL,    /* clusters held exceed the recorded size */
+    FAT_FAULT_PARENT_WRONG,      /* ".." not pointing at the parent */
+    FAT_FAULT_LOST_CLUSTERS,     /* allocated, belonging to nothing */
+    FAT_FAULT_FAT_COPIES_DIFFER, /* the copies of the table disagree */
+    FAT_FAULT_FREE_COUNT_WRONG,  /* the FSInfo hint is not what the table says */
+    FAT_FAULT_TOO_COMPLEX        /* the check itself ran out of room */
+} FAT_FAULT;
+
+/* Called once per fault as it is found, so a long check says something while
+   it runs rather than only at the end. `where` is a path when the fault has
+   one and the volume otherwise; `number` carries the cluster, the count or
+   the size the fault is about; `repaired` says whether it was put right. */
+typedef void (*FAT_CHECK_REPORT)(FAT_FAULT fault, const char* where,
+                                 boot_uint64_t number, int repaired);
+
+typedef struct {
+    boot_uint32_t directories;
+    boot_uint32_t files;
+    boot_uint64_t bytes_in_files;
+    boot_uint32_t clusters_total;
+    boot_uint32_t clusters_used;
+    boot_uint32_t clusters_free;
+    boot_uint32_t clusters_lost;
+    /* Reported because it is the number that decides how much has to be in a
+       directory before it grows a second cluster - which is the only condition
+       under which a whole class of damage can happen at all. On a volume with
+       large clusters a directory may never grow in its life. */
+    boot_uint32_t cluster_bytes;
+    boot_uint32_t entries_per_cluster;
+    boot_uint32_t faults;
+    boot_uint32_t repaired;
+    /* Zero when a pass had to be given up - out of memory, or a read that
+       failed. A check that could not finish must not be reported as a clean
+       volume, which is the whole reason this field exists. */
+    int complete;
+} FAT_CHECK_RESULT;
+
+/* Read the volume and report what is wrong with it. With `repair` set, put
+   right what can be put right; with it clear, change nothing at all. Returns
+   0 when the volume could not be checked (not mounted, or out of memory) -
+   which is not the same as a volume with faults. */
+int fat32_check(VOLUME* volume, int repair, FAT_CHECK_REPORT report,
+                FAT_CHECK_RESULT* result);
+
 #endif

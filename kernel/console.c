@@ -167,8 +167,8 @@ void console_redraw(void) {
 }
 
 static void draw_glyph(boot_uint32_t column, boot_uint32_t row,
-                       unsigned char code) {
-    const boot_uint8_t* glyph = font_8x16[code];
+                       boot_uint32_t code) {
+    const boot_uint8_t* glyph = font_glyph(code);
     boot_uint32_t origin_x = column * FONT_WIDTH;
     boot_uint32_t origin_y = row * FONT_HEIGHT;
 
@@ -235,9 +235,52 @@ static void newline(void) {
     if (++cursor_row >= rows) scroll();
 }
 
-void console_putchar(char character) {
-    unsigned char code = (unsigned char)character;
+/* Bytes arrive one at a time and a character may be several of them.
+ *
+ * Everything upstream writes bytes - printf, a file being typed, a program's
+ * output - and none of it knows where a character ends. So the start byte of a
+ * UTF-8 sequence is held here until its continuation bytes arrive, and one
+ * cell is drawn when the whole character is in hand. A sequence that turns out
+ * to be broken is drawn as its first byte rather than dropped: a file that is
+ * not UTF-8 should still print as something. */
+static char pending[4];
+static int pending_length;
+static int pending_needed;
 
+static void put_codepoint(boot_uint32_t code);
+
+void console_putchar(char character) {
+    unsigned char raw = (unsigned char)character;
+
+    if (pending_length) {
+        if ((raw & 0xC0) != 0x80) {
+            /* Not a continuation: the sequence was a lie. Print what was held
+               and then reconsider this byte on its own. */
+            boot_uint32_t stray = (unsigned char)pending[0];
+            pending_length = 0;
+            put_codepoint(stray);
+        } else {
+            pending[pending_length++] = character;
+            if (pending_length >= pending_needed) {
+                int length = 0;
+                boot_uint32_t code = font_decode(pending, &length);
+                pending_length = 0;
+                put_codepoint(code);
+            }
+            return;
+        }
+    }
+
+    if (raw >= 0xC0 && raw < 0xF8) {
+        pending_needed = (raw & 0xE0) == 0xC0 ? 2 : (raw & 0xF0) == 0xE0 ? 3 : 4;
+        pending[0] = character;
+        pending_length = 1;
+        return;
+    }
+    put_codepoint(raw);
+}
+
+static void put_codepoint(boot_uint32_t code) {
     hide_cursor_for_edit();
 
     switch (code) {

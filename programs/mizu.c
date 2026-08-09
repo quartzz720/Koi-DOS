@@ -1,1037 +1,495 @@
 #include "koi.h"
+#include "window.h"
+#include "editcore.h"
+#include "settings.h"
+#include "language.h"
 
-/* Mizu 0.1 for Koi-DOS - a shell you point at.
+/* Mizu 0.5 - the desktop.
  *
- * Two panels, a pointer, and a wheel. The shape is Norton Commander's, and the
- * reason is not nostalgia: two directories side by side is the arrangement that
- * answers "where is it" and "where is it going" in one screen, and a machine
- * with one screen and no windows to overlap has nothing better to spend it on.
- * Windows 1.0 reached the same conclusion from the other direction - it tiled,
- * because overlapping windows on a screen this size hide more than they show.
+ * The name was the file manager's while that was the only graphical thing
+ * here. The file manager is finished and is called Koi-Commander now; this is
+ * what the name was being kept for.
  *
- * It is a program, not part of the system. It arrives with `dosget install
- * mizu` and can be removed again, and the system underneath is exactly the
- * system without it. That is deliberate: a graphical shell that cannot be taken
- * off is an operating system with a graphical shell, and this one is not.
- *
- * What 0.1 does not do yet: copy, move, delete, rename, or a second drive shown
- * beside the first. F9 changes drive by going through the shell, which restarts
- * this program - honest, and visibly a restart. Those are 0.2.
- *
- * ---- Running things ------------------------------------------------------
- *
- * One program runs at a time, at a fixed address. So this cannot call a
- * program: it asks the shell to run one after it has exited, and to start it
- * again afterwards - koi_chain, twice, most recent first. Everything on screen
- * is gone in between, which is why the state that matters travels back as a
- * command line: the two paths, which panel was active, and where the bar was.
- *
- * Small DOS shells did exactly this, for exactly this reason.
+ * Windows 3.0's shape, water's colours. What it is not yet is honest to say
+ * plainly: the windows here are parts of this program, because Koi-DOS holds
+ * one program in memory at a time. Windows 1.0 through 3.0 in real mode were
+ * exactly that too, and their bundled applications were parts of one image for
+ * the same reason. When a second program can be resident, the frames and the
+ * ordering below do not change - only who supplies the paint.
  */
 
-#define CHAR_W 8
-#define CHAR_H 16
-#define ROW_H 18
-#define BAR_H 26
-#define MARGIN 8
-#define FRAME 2
+#define MENU_ABOUT 1
+#define MENU_EXIT 2
+#define MENU_CONTROL 3
+#define MENU_CLOCK 4
+#define MENU_COMMANDER 5
+#define MENU_TILE 6
+#define MENU_NOTE 7
+#define MENU_BOLD 8
+#define MENU_ITALIC 9
+#define MENU_UNDERLINE 10
+#define MENU_PLAIN 11
+#define MENU_SAVE 12
 
-#define NAME_MAX 32
-#define PATH_MAX 128
-#define ITEMS_MAX 512
-#define LINE_MAX 256
+static WINDOW* control_window;
+static WINDOW* clock_window;
+static WINDOW* about_window;
+static WINDOW* note_window;
 
-/* Norton's colours, which are Norton's colours because they work: a dark blue
-   field, light text on it, and one bar of reversed colour that the eye finds
-   before it has finished looking. */
-static koi_uint32 c_desktop;
-static koi_uint32 c_panel;
-static koi_uint32 c_frame;
-static koi_uint32 c_frame_active;
-static koi_uint32 c_text;
-static koi_uint32 c_directory;
-static koi_uint32 c_program;
-static koi_uint32 c_select;
-static koi_uint32 c_select_text;
-static koi_uint32 c_bar;
-static koi_uint32 c_bar_text;
-static koi_uint32 c_bar_key;
-static koi_uint32 c_shadow;
 
+/* ---- The control panel ---------------------------------------------------
+ *
+ * Program Manager's grid, which is the right shape for a machine with no
+ * overlapping-window habits yet: a page of things you can start, each one a
+ * picture and a word.
+ */
 typedef struct {
-    char name[NAME_MAX];
-    unsigned int size;
-    unsigned int attributes;
+    const char* name;
+    const char* note;
+    koi_uint32 (*tint)(void);
 } ENTRY;
 
-typedef struct {
-    char path[PATH_MAX];
-    ENTRY items[ITEMS_MAX];
-    int count;
-    int top;               /* first entry drawn */
-    int selected;
-    int x, y, w, h;        /* where it sits on screen */
-    int rows;              /* how many entries fit in it */
-} PANEL;
+static koi_uint32 tint_setup(void) { return koi_gfx_color(0x4A, 0x8F, 0xB8); }
+static koi_uint32 tint_files(void) { return koi_gfx_color(0x35, 0xA6, 0xC4); }
+static koi_uint32 tint_tools(void) { return koi_gfx_color(0x58, 0xB0, 0xA8); }
 
-static KOI_SCREEN screen;
-static PANEL panels[2];
-static int active;
-static int running = 1;
+static ENTRY entries[4];
 
-/* Two drive letters, and the difference between them is the whole of a bug
- * that only appears with a USB stick plugged in.
- *
- * `home` is the drive Mizu itself was loaded from. `browse` is the drive being
- * looked at, which koi_setdrive moves without restarting anything. They are
- * usually the same and must not be assumed to be: a program started from the
- * panel is reached by a path on `browse`, and Mizu is reached by a path on
- * `home`, and running one command line on the wrong drive finds nothing. */
-static int home_letter;
-static int browse_letter;
+static void name_entries(void) {
+    entries[0] = (ENTRY){ say(SAY_COMMANDER), say(SAY_TWO_PANELS), tint_files };
+    entries[1] = (ENTRY){ say(SAY_NOTEEDIT), say(SAY_WRITE_TEXT), tint_tools };
+    entries[2] = (ENTRY){ say(SAY_CLOCK), say(SAY_AND_A_DATE), tint_setup };
+    entries[3] = (ENTRY){ say(SAY_ABOUT), say(SAY_THIS_SYSTEM), tint_tools };
+}
+#define ENTRY_COUNT 4
 
-/* Which drive this program's paths currently mean. */
-static int drive_now(void) {
-    long count = koi_sysinfo(KOI_INFO_VOLUME_COUNT, 0);
+#define ICON_W 120
+#define ICON_H 76
 
-    for (long index = 0; index < count; index++)
-        if (koi_sysinfo(KOI_INFO_VOLUME_IS_CURRENT, index) == 1)
-            return (int)koi_sysinfo(KOI_INFO_VOLUME_LETTER, index);
-    return 0;
+/* An icon, drawn rather than loaded. A picture would be a file to ship and a
+   format to decode; a rounded tile with a drop in it is three rectangles and
+   says the same thing at this size. */
+static void draw_icon(int x, int y, koi_uint32 tint) {
+    koi_gfx_fill(x + 14, y + 6, 36, 30, tint);
+    koi_gfx_fill(x + 14, y + 6, 36, 6,
+                 koi_gfx_color(0xFF, 0xFF, 0xFF));
+    koi_gfx_rect(x + 14, y + 6, 36, 30, window_shadow);
+    /* The drop: a small square with its top corners taken off, which at eight
+       pixels is as much water as anybody can see. */
+    koi_gfx_fill(x + 28, y + 16, 8, 10, window_client_paper);
+    koi_gfx_line(x + 31, y + 13, x + 31, y + 15, window_client_paper);
+    koi_gfx_rect(x + 28, y + 16, 8, 10, tint);
 }
 
-/* ---- The pointer --------------------------------------------------------
- *
- * Drawn by hand, over whatever is underneath, with the pixels it covers kept so
- * they can be put back. The alternative - redrawing the whole screen every time
- * the pointer moves a pixel - is what makes a pointer feel like it is being
- * dragged through sand.
- */
-#define CURSOR_W 12
-#define CURSOR_H 19
+static void paint_control(WINDOW* window, int x, int y, int width, int height) {
+    (void)window;
+    (void)height;
+    for (int index = 0; index < ENTRY_COUNT; index++) {
+        int column = index % (width / ICON_W ? width / ICON_W : 1);
+        int row = index / (width / ICON_W ? width / ICON_W : 1);
+        int ix = x + 8 + column * ICON_W;
+        int iy = y + 8 + row * ICON_H;
+        int text_x;
 
-static const char* cursor_shape[CURSOR_H] = {
-    "o           ",
-    "oo          ",
-    "o*o         ",
-    "o**o        ",
-    "o***o       ",
-    "o****o      ",
-    "o*****o     ",
-    "o******o    ",
-    "o*******o   ",
-    "o********o  ",
-    "o*********o ",
-    "o*****ooooo ",
-    "o**o**o     ",
-    "o*o o**o    ",
-    "oo  o**o    ",
-    "o    o**o   ",
-    "     o**o   ",
-    "      o*o   ",
-    "       o    "
-};
-
-static koi_uint32 cursor_under[CURSOR_H][CURSOR_W];
-static int cursor_x = -1;
-static int cursor_y = -1;
-static int cursor_saved;
-static koi_uint32 cursor_ink;
-static koi_uint32 cursor_edge;
-
-static koi_uint32* pixel_row(int y) {
-    return (koi_uint32*)((koi_uint8*)screen.pixels +
-                         (koi_uint64)y * screen.pitch);
-}
-
-static void cursor_hide(void) {
-    if (!cursor_saved) return;
-    for (int row = 0; row < CURSOR_H; row++) {
-        int py = cursor_y + row;
-        koi_uint32* line;
-        if (py < 0 || py >= (int)screen.height) continue;
-        line = pixel_row(py);
-        for (int col = 0; col < CURSOR_W; col++) {
-            int px = cursor_x + col;
-            if (px < 0 || px >= (int)screen.width) continue;
-            line[px] = cursor_under[row][col];
-        }
-    }
-    koi_gfx_present_rect(cursor_x, cursor_y, CURSOR_W, CURSOR_H);
-    cursor_saved = 0;
-}
-
-static void cursor_show(int x, int y) {
-    cursor_x = x;
-    cursor_y = y;
-    for (int row = 0; row < CURSOR_H; row++) {
-        int py = y + row;
-        koi_uint32* line;
-        if (py < 0 || py >= (int)screen.height) continue;
-        line = pixel_row(py);
-        for (int col = 0; col < CURSOR_W; col++) {
-            int px = x + col;
-            char shape;
-            if (px < 0 || px >= (int)screen.width) continue;
-            cursor_under[row][col] = line[px];
-            shape = cursor_shape[row][col];
-            if (shape == 'o') line[px] = cursor_edge;
-            else if (shape == '*') line[px] = cursor_ink;
-        }
-    }
-    cursor_saved = 1;
-    koi_gfx_present_rect(x, y, CURSOR_W, CURSOR_H);
-}
-
-/* ---- Small things -------------------------------------------------------- */
-
-static void text_at(int x, int y, const char* text, koi_uint32 color) {
-    koi_gfx_text(x, y, text, color, KOI_TEXT_TRANSPARENT);
-}
-
-static int is_directory(const ENTRY* entry) {
-    return (entry->attributes & KOI_ATTRIBUTE_DIRECTORY) != 0;
-}
-
-/* Does this name end in `suffix`? Case-insensitive, because FAT stores 8.3
-   names upper-cased and nobody types them that way. */
-static int ends_with(const char* name, const char* suffix) {
-    koi_uint64 length = strlen(name);
-    koi_uint64 tail = strlen(suffix);
-    if (tail > length) return 0;
-    for (koi_uint64 index = 0; index < tail; index++)
-        if (toupper(name[length - tail + index]) != toupper(suffix[index]))
-            return 0;
-    return 1;
-}
-
-static int is_runnable(const ENTRY* entry) {
-    if (is_directory(entry)) return 0;
-    return ends_with(entry->name, ".EXE") || ends_with(entry->name, ".BAT");
-}
-
-/* A size a person reads rather than counts. */
-static void size_text(unsigned int bytes, char* out, koi_uint64 size) {
-    if (bytes < 10000U) koi_snprintf(out, size, "%u", bytes);
-    else if (bytes < 10000U * 1024U)
-        koi_snprintf(out, size, "%uK", bytes / 1024U);
-    else koi_snprintf(out, size, "%uM", bytes / (1024U * 1024U));
-}
-
-/* One row: the name padded out to `width`, then the size right-aligned in the
-   six columns after it.
- *
- * Built by hand rather than with a format string. koi_snprintf takes a width,
- * but not a width passed as an argument - `%-*.*s` is not one of its
- * conversions, and what it does with one is print the stars. Which is exactly
- * what the first version of this drew: a panel of `½*.*S`, once per file,
- * perfectly aligned. */
-static void row_text(char* out, koi_uint64 size, const char* name, int width,
-                     const char* right) {
-    koi_uint64 at = 0;
-    koi_uint64 tail = strlen(right);
-
-    while (name[at] && at < (koi_uint64)width && at + 1 < size)
-        out[at] = name[at], at++;
-    while (at < (koi_uint64)width && at + 1 < size) out[at++] = ' ';
-
-    /* Six columns for the size, so that the numbers line up under each other
-       and a directory's DIR sits where a size would be. */
-    for (koi_uint64 pad = tail; pad < 7 && at + 1 < size; pad++) out[at++] = ' ';
-    for (koi_uint64 index = 0; index < tail && at + 1 < size; index++)
-        out[at++] = right[index];
-    out[at] = 0;
-}
-
-/* Join a directory and a name into a path, without the doubled backslash that
-   the root would otherwise produce. */
-static void join_path(const char* directory, const char* name, char* out,
-                      koi_uint64 size) {
-    if (directory[0] == '\\' && directory[1] == 0)
-        koi_snprintf(out, size, "\\%s", name);
-    else
-        koi_snprintf(out, size, "%s\\%s", directory, name);
-}
-
-/* ---- Reading a directory ------------------------------------------------- */
-
-/* Directories first, then files, each alphabetically - which is the order every
-   file manager has used since before this one, and the one where the eye knows
-   where to start. Insertion sort: the lists are short and it is stable, so
-   equal keys keep the order the filesystem gave them. */
-static void sort_entries(PANEL* panel) {
-    for (int index = 1; index < panel->count; index++) {
-        ENTRY held = panel->items[index];
-        int place = index - 1;
-
-        while (place >= 0) {
-            const ENTRY* other = &panel->items[place];
-            int order;
-
-            if (is_directory(other) != is_directory(&held))
-                order = is_directory(&held) ? -1 : 1;
-            else
-                order = strcmp(held.name, other->name);
-            if (order >= 0) break;
-            panel->items[place + 1] = panel->items[place];
-            place--;
-        }
-        panel->items[place + 1] = held;
+        draw_icon(ix + (ICON_W - 8) / 2 - 32, iy, entries[index].tint());
+        /* Centred in the cell and clipped to it. A translated label is longer
+           than the English one it replaced - "Панель керування" against
+           "Control Panel" - and a label measured against the icon rather than
+           against the cell runs into its neighbour. */
+        text_x = ix + (ICON_W - 8 - language_columns(entries[index].name) *
+                       WINDOW_CHAR_W) / 2;
+        if (text_x < ix) text_x = ix;
+        window_label(text_x, iy + 40, entries[index].name, window_text);
+        text_x = ix + (ICON_W - 8 - language_columns(entries[index].note) *
+                       WINDOW_CHAR_W) / 2;
+        if (text_x < ix) text_x = ix;
+        window_label(text_x, iy + 56, entries[index].note, window_shadow);
     }
 }
 
-static void read_directory(PANEL* panel) {
-    KOI_FIND_DATA found;
-    char pattern[PATH_MAX + 4];
-    long search;
+static void open_about(void);
+static void open_clock(void);
+static void open_note(void);
+static void start_commander(void);
 
-    panel->count = 0;
-    panel->top = 0;
-
-    join_path(panel->path, "*", pattern, sizeof(pattern));
-    search = koi_findfirst(pattern, &found);
-    if (search >= 0) {
-        do {
-            ENTRY* entry;
-            /* `.` and `..` come back from the filesystem; the one that goes up
-               is added below, in a known place, so that it is always the first
-               row whether or not this directory happens to carry it. */
-            if (found.name[0] == '.') continue;
-            if (panel->count >= ITEMS_MAX) break;
-            entry = &panel->items[panel->count++];
-            strncpy(entry->name, found.name, NAME_MAX - 1);
-            entry->name[NAME_MAX - 1] = 0;
-            entry->size = found.size;
-            entry->attributes = found.attributes;
-        } while (koi_findnext(search, &found) == 0);
-        koi_findclose(search);
-    }
-
-    sort_entries(panel);
-
-    /* And the way back, first, unless this is the root. */
-    if (!(panel->path[0] == '\\' && panel->path[1] == 0)) {
-        if (panel->count >= ITEMS_MAX) panel->count = ITEMS_MAX - 1;
-        for (int index = panel->count; index > 0; index--)
-            panel->items[index] = panel->items[index - 1];
-        panel->count++;
-        strcpy(panel->items[0].name, "..");
-        panel->items[0].size = 0;
-        panel->items[0].attributes = KOI_ATTRIBUTE_DIRECTORY;
-    }
-
-    if (panel->selected >= panel->count) panel->selected = panel->count - 1;
-    if (panel->selected < 0) panel->selected = 0;
-}
-
-/* Keep the selected row on screen, whichever end it walked off. */
-static void follow_selection(PANEL* panel) {
-    if (panel->selected < panel->top) panel->top = panel->selected;
-    if (panel->selected >= panel->top + panel->rows)
-        panel->top = panel->selected - panel->rows + 1;
-    if (panel->top > panel->count - panel->rows)
-        panel->top = panel->count - panel->rows;
-    if (panel->top < 0) panel->top = 0;
-}
-
-/* ---- Drawing ------------------------------------------------------------- */
-
-static void draw_panel(PANEL* panel, int is_active) {
-    koi_uint32 border = is_active ? c_frame_active : c_frame;
-    char line[LINE_MAX];
-    int columns = (panel->w - 2 * MARGIN) / CHAR_W;
-    int name_columns;
-
-    if (columns > LINE_MAX - 1) columns = LINE_MAX - 1;
-    name_columns = columns - 8;
-    if (name_columns < 8) name_columns = 8;
-
-    koi_gfx_fill(panel->x, panel->y, panel->w, panel->h, c_panel);
-    koi_gfx_rect(panel->x, panel->y, panel->w, panel->h, border);
-    koi_gfx_rect(panel->x + 1, panel->y + 1, panel->w - 2, panel->h - 2, border);
-
-    /* The path, in the frame - which is where Norton put it, and it is the
-       right place: it belongs to the panel and not to the screen. */
-    koi_gfx_fill(panel->x + FRAME, panel->y + FRAME, panel->w - 2 * FRAME,
-                 CHAR_H + 4, border);
-    /* With the drive letter, because a file manager that can change drive and
-       does not say which one it is on is showing you a directory listing with
-       the most important word missing. */
-    koi_snprintf(line, sizeof(line), " %c:%s ", (char)browse_letter,
-                 panel->path);
-    text_at(panel->x + MARGIN, panel->y + FRAME + 2, line,
-            is_active ? c_select_text : c_text);
-
-    for (int row = 0; row < panel->rows; row++) {
-        int index = panel->top + row;
-        int y = panel->y + FRAME + CHAR_H + 6 + row * ROW_H;
-        const ENTRY* entry;
-        koi_uint32 ink;
-        char size[16];
-
-        if (index >= panel->count) break;
-        entry = &panel->items[index];
-
-        if (index == panel->selected) {
-            /* The bar is drawn on the inactive panel too, dimmed. A panel whose
-               selection vanishes when it loses focus has lost the user's place
-               in it, and it is still where they left it. */
-            koi_gfx_fill(panel->x + FRAME + 2, y - 1, panel->w - 2 * FRAME - 4,
-                         ROW_H, is_active ? c_select : c_shadow);
-            ink = is_active ? c_select_text : c_text;
-        } else if (is_directory(entry)) {
-            ink = c_directory;
-        } else if (is_runnable(entry)) {
-            ink = c_program;
-        } else {
-            ink = c_text;
-        }
-
-        if (is_directory(entry)) {
-            row_text(line, sizeof(line), entry->name, name_columns,
-                     entry->name[0] == '.' ? "UP" : "DIR");
-        } else {
-            size_text(entry->size, size, sizeof(size));
-            row_text(line, sizeof(line), entry->name, name_columns, size);
-        }
-        text_at(panel->x + MARGIN, y, line, ink);
-    }
-
-    /* How much of the list is showing, when not all of it is. Two fingers on a
-       touchpad move this, and without something moving there is no way to tell
-       a scroll that arrived from one that did not. */
-    if (panel->count > panel->rows) {
-        int track_x = panel->x + panel->w - FRAME - 6;
-        int track_y = panel->y + FRAME + CHAR_H + 6;
-        int track_h = panel->rows * ROW_H;
-        int thumb_h = track_h * panel->rows / panel->count;
-        int thumb_y = track_y + track_h * panel->top / panel->count;
-
-        if (thumb_h < 8) thumb_h = 8;
-        koi_gfx_fill(track_x, track_y, 4, track_h, c_shadow);
-        koi_gfx_fill(track_x, thumb_y, 4, thumb_h, border);
-    }
-}
-
-/* The bar along the bottom. The labels are the keys, and they are also the
-   buttons - a shell for a machine that may or may not have a pointer must be
-   usable either way, and the same row of words serves both. */
-typedef struct {
-    const char* key;
-    const char* label;
-    int code;
-    int x, w;
-} BUTTON;
-
-static BUTTON buttons[] = {
-    { "Tab", "Panel", '\t', 0, 0 },
-    { "Enter", "Open", '\n', 0, 0 },
-    { "F3", "View", KOI_KEY_F1 + 2, 0, 0 },
-    { "F9", "Drive", KOI_KEY_F1 + 8, 0, 0 },
-    { "F10", "Quit", KOI_KEY_F1 + 9, 0, 0 }
-};
-
-#define BUTTON_COUNT ((int)(sizeof(buttons) / sizeof(buttons[0])))
-
-static void draw_bars(void) {
-    char line[LINE_MAX];
-    int y = (int)screen.height - BAR_H;
-    int at = MARGIN;
-    long free_kib = koi_sysinfo(KOI_INFO_MEMORY_FREE, 0);
-
-    koi_gfx_fill(0, 0, (int)screen.width, BAR_H, c_bar);
-    text_at(MARGIN, 5, "Mizu 0.1 for Koi-DOS", c_bar_text);
-    koi_snprintf(line, sizeof(line), "%ld KiB free", free_kib);
-    text_at((int)screen.width - MARGIN - (int)strlen(line) * CHAR_W, 5, line,
-            c_bar_text);
-
-    koi_gfx_fill(0, y, (int)screen.width, BAR_H, c_bar);
-    for (int index = 0; index < BUTTON_COUNT; index++) {
-        int width;
-
-        koi_snprintf(line, sizeof(line), "%s %s", buttons[index].key,
-                     buttons[index].label);
-        width = (int)strlen(line) * CHAR_W + CHAR_W;
-        buttons[index].x = at;
-        buttons[index].w = width;
-
-        text_at(at, y + 5, buttons[index].key, c_bar_key);
-        text_at(at + (int)strlen(buttons[index].key) * CHAR_W + CHAR_W, y + 5,
-                buttons[index].label, c_bar_text);
-        at += width + CHAR_W;
-    }
-}
-
-static void layout(void) {
-    int top = BAR_H + MARGIN;
-    int bottom = (int)screen.height - BAR_H - MARGIN;
-    int width = ((int)screen.width - 3 * MARGIN) / 2;
-    int height = bottom - top;
-
-    for (int index = 0; index < 2; index++) {
-        PANEL* panel = &panels[index];
-        panel->x = MARGIN + index * (width + MARGIN);
-        panel->y = top;
-        panel->w = width;
-        panel->h = height;
-        panel->rows = (height - FRAME * 2 - CHAR_H - 8) / ROW_H;
-        if (panel->rows < 1) panel->rows = 1;
-    }
-}
-
-static void draw_all(void) {
-    cursor_hide();
-    koi_gfx_clear(c_desktop);
-    draw_bars();
-    for (int index = 0; index < 2; index++)
-        draw_panel(&panels[index], index == active);
-    koi_gfx_present();
-}
-
-/* ---- Looking at a file --------------------------------------------------- */
-
-#define VIEW_BYTES (128U * 1024U)
-#define VIEW_LINES 8192
-
-/* Show a file, with the wheel to move through it.
- *
- * Reads a fixed amount and says so when there was more, rather than pretending
- * a large file is small. This is a viewer, not an editor: nothing it does can
- * change the file, which is what makes it safe to point at anything at all. */
-static void view_file(const char* path) {
-    long handle = koi_open(path, OPEN_READ);
-    char* text;
-    long got;
-    static int line_at[VIEW_LINES];
-    int lines = 0;
-    int top = 0;
-    int rows;
+static void click_control(WINDOW* window, int x, int y, int clicks) {
     int columns;
-    int last_scroll;
-    KOI_POINTER pointer;
-    int truncated = 0;
+    int index;
+    int client_x, client_y, client_w, client_h;
 
-    if (handle < 0) return;
-    text = (char*)koi_alloc(VIEW_BYTES + 1);
-    if (!text) { koi_close(handle); return; }
+    (void)window;
+    window_client(control_window, &client_x, &client_y, &client_w, &client_h);
+    columns = client_w / ICON_W;
+    if (columns < 1) columns = 1;
+    index = (y - 8) / ICON_H * columns + (x - 8) / ICON_W;
+    if (index < 0 || index >= ENTRY_COUNT) return;
+    /* Twice, as Program Manager had it: one click to point at a thing and two
+       to set it going, so a hand resting on the button does not launch it. */
+    if (clicks < 2) return;
 
-    got = koi_read(handle, text, VIEW_BYTES);
-    if (got < 0) got = 0;
-    if ((unsigned long)got == VIEW_BYTES) truncated = 1;
-    text[got] = 0;
-    koi_close(handle);
+    if (index == 0) start_commander();
+    else if (index == 1) open_note();
+    else if (index == 2) open_clock();
+    else open_about();
+}
 
-    /* An index of where each line starts, built once. Scrolling then costs
-       nothing, which is the difference between a wheel that moves the text and
-       one that thinks about it first. */
-    line_at[lines++] = 0;
-    for (long index = 0; index < got && lines < VIEW_LINES; index++) {
-        if (text[index] == '\n') line_at[lines++] = (int)index + 1;
-    }
+/* ---- The clock ----------------------------------------------------------- */
 
-    rows = ((int)screen.height - 2 * BAR_H - 2 * MARGIN) / ROW_H;
-    columns = ((int)screen.width - 2 * MARGIN) / CHAR_W;
-    if (columns > LINE_MAX - 1) columns = LINE_MAX - 1;
+/* Which weekday the first of a month falls on, 0 Sunday. Zeller's, because a
+   table of month lengths and a running count is the same arithmetic written
+   out longer and wrong in February. */
+static int first_weekday(int year, int month) {
+    int shift_month = month;
+    int shift_year = year;
+    int century;
 
-    koi_mouse(&pointer);
-    last_scroll = pointer.scroll;
+    if (shift_month < 3) { shift_month += 12; shift_year--; }
+    century = shift_year / 100;
+    shift_year %= 100;
+    return (1 + (13 * (shift_month + 1)) / 5 + shift_year + shift_year / 4 +
+            century / 4 + 5 * century) % 7;
+}
 
-    for (;;) {
-        char line[LINE_MAX];
-        int y = BAR_H + MARGIN;
+static int month_length(int year, int month) {
+    static const int lengths[] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))
+        return 29;
+    return lengths[month - 1];
+}
 
-        cursor_hide();
-        koi_gfx_clear(c_desktop);
-        koi_gfx_fill(0, 0, (int)screen.width, BAR_H, c_bar);
-        koi_snprintf(line, sizeof(line), "View  %s%s", path,
-                     truncated ? "  (first 128 KiB)" : "");
-        text_at(MARGIN, 5, line, c_bar_text);
-        koi_gfx_fill(0, (int)screen.height - BAR_H, (int)screen.width, BAR_H,
-                     c_bar);
-        text_at(MARGIN, (int)screen.height - BAR_H + 5,
-                "Wheel or arrows to move    Esc to close", c_bar_text);
+static void paint_clock(WINDOW* window, int x, int y, int width, int height) {
+    static const char* days[] = { "Su","Mo","Tu","We","Th","Fr","Sa" };
+    long now = koi_sysinfo(KOI_INFO_TIME, 0);
+    long today = koi_sysinfo(KOI_INFO_DATE, 0);
+    int year = KOI_DATE_YEAR(today);
+    int month = KOI_DATE_MONTH(today);
+    int day = KOI_DATE_DAY(today);
+    int start = first_weekday(year, month);
+    int length = month_length(year, month);
+    char line[64];
+    int cell = 24;
+    int left;
 
-        for (int row = 0; row < rows && top + row < lines; row++) {
-            int start = line_at[top + row];
-            int length = 0;
+    (void)window;
+    (void)height;
 
-            while (text[start + length] && text[start + length] != '\n' &&
-                   text[start + length] != '\r' && length < columns) {
-                char character = text[start + length];
-                /* A tab is drawn as a space rather than expanded. Expanding it
-                   properly needs a column count this loop does not keep, and a
-                   wrong tab stop is worse than none. */
-                line[length] = (character == '\t') ? ' ' :
-                               (isprint((unsigned char)character) ? character : '.');
-                length++;
-            }
-            line[length] = 0;
-            text_at(MARGIN, y + row * ROW_H, line, c_text);
-        }
-        koi_gfx_present();
-        cursor_show(pointer.x, pointer.y);
+    koi_snprintf(line, sizeof(line), "%02d:%02d:%02d   %04d-%02d-%02d",
+                 KOI_TIME_HOUR(now), KOI_TIME_MINUTE(now), KOI_TIME_SECOND(now),
+                 year, month, day);
+    window_label(x + (width - (int)strlen(line) * WINDOW_CHAR_W) / 2, y + 6,
+                 line, window_text);
 
-        for (;;) {
-            int moved = 0;
-            int key = 0;
+    left = x + (width - 7 * cell) / 2;
+    for (int index = 0; index < 7; index++)
+        window_label(left + index * cell + 4, y + 30, days[index], window_shadow);
 
-            koi_sleep(10);
-            if (koi_keypressed()) key = koi_getchar();
+    for (int number = 1; number <= length; number++) {
+        int slot = start + number - 1;
+        int cx = left + (slot % 7) * cell;
+        int cy = y + 50 + (slot / 7) * 20;
 
-            if (key == 27 || key == KOI_KEY_F1 + 9) {
-                koi_free(text);
-                return;
-            }
-            if (key == KOI_KEY_DOWN) { top++; moved = 1; }
-            if (key == KOI_KEY_UP) { top--; moved = 1; }
-            if (key == KOI_KEY_PAGE_DOWN) { top += rows; moved = 1; }
-            if (key == KOI_KEY_PAGE_UP) { top -= rows; moved = 1; }
-            if (key == KOI_KEY_HOME) { top = 0; moved = 1; }
-            if (key == KOI_KEY_END) { top = lines - rows; moved = 1; }
-
-            {
-                int previous_x = pointer.x;
-                int previous_y = pointer.y;
-
-                koi_mouse(&pointer);
-                if (pointer.scroll != last_scroll) {
-                    top -= (pointer.scroll - last_scroll) * 3;
-                    last_scroll = pointer.scroll;
-                    moved = 1;
-                }
-                if (!moved && (pointer.x != previous_x ||
-                               pointer.y != previous_y)) {
-                    cursor_hide();
-                    cursor_show(pointer.x, pointer.y);
-                }
-            }
-
-            if (moved) {
-                if (top > lines - rows) top = lines - rows;
-                if (top < 0) top = 0;
-                break;
-            }
+        koi_snprintf(line, sizeof(line), "%d", number);
+        if (number == day) {
+            koi_gfx_fill(cx, cy - 2, cell - 2, 18, window_accent);
+            window_label(cx + (number < 10 ? 8 : 4), cy, line,
+                         window_client_paper);
+        } else {
+            window_label(cx + (number < 10 ? 8 : 4), cy, line, window_text);
         }
     }
 }
 
-/* ---- Doing something with the selected entry ----------------------------- */
+/* ---- NoteEdit ------------------------------------------------------------
+ *
+ * The same editing core the console editor uses, drawn into a window instead
+ * of onto a terminal. One buffer implementation, two front ends, for the
+ * reason it was split out in the first place: a text buffer is where the
+ * off-by-ones live and two copies written a week apart do not stay the same
+ * shape.
+ *
+ * The style is the whole document's, which is not a shortcut - it is what
+ * Notepad did, and for the same reason. A style that varies inside the text
+ * needs a second buffer running alongside it saying where each run begins and
+ * ends, and a plain text file has nowhere to keep that. The moment there is a
+ * format that can, this becomes MizuWriter and the runs go in it.
+ */
+#define NOTE_CAPACITY (64L * 1024L)
+#define NOTE_PATH "\\NOTE.TXT"
 
-/* The command line that brings this program back where it was. */
-static void own_command(char* out, koi_uint64 size) {
-    char self[PATH_MAX];
+static EDITOR note;
+static int note_ready;
+static int note_style;
+static long note_top_line;
+
+static void paint_note(WINDOW* window, int x, int y, int width, int height) {
+    long total = edit_lines(&note);
+    long caret_line = edit_line_of(&note, note.cursor);
+    int rows = height / WINDOW_CHAR_H;
+    int columns = width / WINDOW_CHAR_W;
+
+    (void)window;
+    if (rows < 1) rows = 1;
+
+    /* Keep the caret in view before drawing anything, so the first frame after
+       a keystroke already shows where it went. */
+    if (caret_line < note_top_line) note_top_line = caret_line;
+    if (caret_line >= note_top_line + rows) note_top_line = caret_line - rows + 1;
+    if (note_top_line < 0) note_top_line = 0;
+
+    for (int row = 0; row < rows && note_top_line + row < total; row++) {
+        long number = note_top_line + row;
+        long start = edit_line_start(&note, number);
+        long length = edit_line_length(&note, number);
+        char line[256];
+        long copied = 0;
+
+        while (copied < length && copied < columns && copied < 255) {
+            char character = note.text[start + copied];
+            line[copied] = (character == '\t') ? ' ' : character;
+            copied++;
+        }
+        line[copied] = 0;
+        window_label_styled(x + 2, y + row * WINDOW_CHAR_H, line, window_text,
+                            note_style);
+    }
+
+    {
+        int row = (int)(caret_line - note_top_line);
+        long column = note.cursor - edit_line_start(&note, caret_line);
+        if (row >= 0 && row < rows)
+            koi_gfx_fill(x + 2 + (int)column * WINDOW_CHAR_W,
+                         y + row * WINDOW_CHAR_H, 2, WINDOW_CHAR_H,
+                         window_accent);
+    }
+}
+
+static void key_note(WINDOW* window, int key) {
+    (void)window;
+    switch (key) {
+    case KOI_KEY_LEFT:  edit_move_by(&note, -1, 0); break;
+    case KOI_KEY_RIGHT: edit_move_by(&note, 1, 0); break;
+    case KOI_KEY_UP:    edit_move_lines(&note, -1, 0); break;
+    case KOI_KEY_DOWN:  edit_move_lines(&note, 1, 0); break;
+    case KOI_KEY_HOME:  edit_move_home(&note, 0); break;
+    case KOI_KEY_END:   edit_move_end(&note, 0); break;
+    case KOI_KEY_DELETE: edit_delete(&note); break;
+    case '\b': edit_backspace(&note); break;
+    case '\n': case '\r': edit_insert_char(&note, '\n'); break;
+    case '\t': edit_insert(&note, "    ", 4); break;
+    default:
+        if (key >= ' ' && key < 0x100) edit_insert_char(&note, (char)key);
+        break;
+    }
+    window_repaint();
+}
+
+/* ---- About --------------------------------------------------------------- */
+
+static void paint_about(WINDOW* window, int x, int y, int width, int height) {
+    char line[80];
+
+    (void)window;
+    (void)width;
+    (void)height;
+    window_label(x + 12, y + 10, say(SAY_DESKTOP_TITLE), window_text);
+    koi_snprintf(line, sizeof(line), "Koi-DOS build %ld",
+                 koi_sysinfo(KOI_INFO_BUILD_NUMBER, 0));
+    window_label(x + 12, y + 34, line, window_text);
+    window_label(x + 12, y + 58, say(SAY_ONE_AT_A_TIME_1), window_shadow);
+    window_label(x + 12, y + 74, say(SAY_ONE_AT_A_TIME_2), window_shadow);
+    koi_snprintf(line, sizeof(line), "%ld %s",
+                 koi_sysinfo(KOI_INFO_MEMORY_FREE, 0), say(SAY_FREE));
+    window_label(x + 12, y + 98, line, window_text);
+}
+
+/* ---- Opening things ------------------------------------------------------ */
+
+static void open_clock(void) {
+    if (clock_window) { clock_window->minimised = 0; window_raise(clock_window); return; }
+    clock_window = window_new(say(SAY_CLOCK), 640, 300, 280, 240);
+    if (!clock_window) return;
+    clock_window->paint = paint_clock;
+}
+
+static void name_note_menus(WINDOW_MENU* menus) {
+    menus[0] = (WINDOW_MENU){ say(SAY_MENU_FILE),
+        { { say(SAY_SAVE), MENU_SAVE }, { 0, 0 },
+          { say(SAY_CLOSE), MENU_EXIT } }, 3 };
+    menus[1] = (WINDOW_MENU){ say(SAY_MENU_FORMAT),
+        { { say(SAY_BOLD), MENU_BOLD }, { say(SAY_ITALIC), MENU_ITALIC },
+          { say(SAY_UNDERLINE), MENU_UNDERLINE }, { 0, 0 },
+          { say(SAY_PLAIN), MENU_PLAIN } }, 5 };
+}
+
+static void open_note(void) {
+    WINDOW_MENU menus[2];
+
+    if (note_window) { note_window->minimised = 0; window_raise(note_window); return; }
+    if (!note_ready) {
+        if (!edit_load(&note, NOTE_PATH, NOTE_CAPACITY) &&
+            !edit_new(&note, NOTE_CAPACITY)) return;
+        if (!note.path[0]) strcpy(note.path, NOTE_PATH);
+        note_ready = 1;
+    }
+    name_note_menus(menus);
+    note_window = window_new("NoteEdit - NOTE.TXT", 300, 120, 520, 340);
+    if (!note_window) return;
+    note_window->paint = paint_note;
+    note_window->key = key_note;
+    note_window->menu_count = 2;
+    note_window->menus[0] = menus[0];
+    note_window->menus[1] = menus[1];
+}
+
+static void open_about(void) {
+    if (about_window) { about_window->minimised = 0; window_raise(about_window); return; }
+    about_window = window_new(say(SAY_ABOUT), 360, 380, 360, 180);
+    if (!about_window) return;
+    about_window->paint = paint_about;
+}
+
+/* Koi-Commander is another program, so it is started the way any program is
+   started here: ask for it, ask for this desktop after it, and leave. The
+   screen goes away and comes back, which is honest about what the machine can
+   do rather than a window pretending otherwise. */
+static void start_commander(void) {
+    char self[128];
 
     if (koi_systext(KOI_TEXT_PROGRAM_PATH, 0, self, sizeof(self)) <= 0)
         strcpy(self, "\\MIZU\\MIZU.EXE");
-    koi_snprintf(out, size, "%s %s %s %d %d %d %c", self, panels[0].path,
-                 panels[1].path, active, panels[0].selected,
-                 panels[1].selected, (char)browse_letter);
-}
-
-/* Run a program: ask for it, ask for this shell after it, and leave.
- *
- * The order looks backwards and is not. Requests are honoured most recent
- * first, so the one asked for last is the one that runs first.
- *
- * The drive changes are the part that is easy to leave out and impossible to
- * notice missing until somebody plugs in a USB stick. koi_setdrive moves where
- * THIS program's paths point; it does not move the shell, and the shell is what
- * runs both of these command lines. So the program is reached on the drive
- * being browsed, and Mizu is reached on the drive Mizu lives on, and when those
- * differ the shell has to be walked from one to the other and back.
- *
- * Reading downwards, the requests run upwards:
- *
- *     browse:      change the shell to the drive being looked at
- *     the program  which is on that drive
- *     home:        change back to where Mizu lives
- *     MIZU ...     which is on that one
- */
-static void run_entry(const char* path) {
-    char resume[PATH_MAX * 3];
-    char drive[8];
-    int elsewhere = browse_letter != home_letter;
-
-    own_command(resume, sizeof(resume));
-    koi_chain(resume);
-    if (elsewhere) {
-        koi_snprintf(drive, sizeof(drive), "%c:", (char)home_letter);
-        koi_chain(drive);
-    }
-    koi_chain(path);
-    if (elsewhere) {
-        koi_snprintf(drive, sizeof(drive), "%c:", (char)browse_letter);
-        koi_chain(drive);
-    }
-    cursor_hide();
-    koi_gfx_leave();
+    koi_chain(self);
+    koi_chain("\\COMMANDER\\COMMANDER");
+    window_close_desktop();
     koi_exit(0);
 }
 
-static void open_selected(void) {
-    PANEL* panel = &panels[active];
-    const ENTRY* entry;
-    char path[PATH_MAX];
-
-    if (!panel->count) return;
-    entry = &panel->items[panel->selected];
-
-    if (is_directory(entry)) {
-        if (strcmp(entry->name, "..") == 0) {
-            /* Up: cut the last component off, and never past the root. */
-            int end = (int)strlen(panel->path);
-            while (end > 0 && panel->path[end - 1] != '\\') end--;
-            if (end > 1) end--;
-            if (end < 1) end = 1;
-            panel->path[end] = 0;
-            if (!panel->path[0]) strcpy(panel->path, "\\");
-        } else {
-            char joined[PATH_MAX];
-            join_path(panel->path, entry->name, joined, sizeof(joined));
-            if (strlen(joined) >= PATH_MAX - 1) return;
-            strcpy(panel->path, joined);
-        }
-        panel->selected = 0;
-        panel->top = 0;
-        read_directory(panel);
-        draw_all();
-        return;
-    }
-
-    join_path(panel->path, entry->name, path, sizeof(path));
-    if (is_runnable(entry)) run_entry(path);
-    else {
-        view_file(path);
-        draw_all();
-    }
-}
-
-/* Change drive.
- *
- * This used to ask the shell to change drive and then restart Mizu - and a
- * program that does that is asking to be restarted from a drive it has just
- * left. It changed to the USB stick and could not find itself:
- *
- *     Bad command or file name: \MIZU\mizu.EXE \ \ 1 0 0
- *
- * Perfectly correct behaviour from the shell, and an impossible request. Now
- * koi_setdrive moves where this program's paths point, without restarting
- * anything and without moving the shell, so nothing has to be found twice. */
-static void change_drive(void) {
-    long count = koi_sysinfo(KOI_INFO_VOLUME_COUNT, 0);
-    long here = -1;
-    int letter;
-
-    if (count < 2) return;
-    for (long index = 0; index < count; index++)
-        if (koi_sysinfo(KOI_INFO_VOLUME_LETTER, index) == browse_letter)
-            here = index;
-    if (here < 0) return;
-
-    letter = (int)koi_sysinfo(KOI_INFO_VOLUME_LETTER, (here + 1) % count);
-    if (letter <= 0 || koi_setdrive(letter) != 1) return;
-    browse_letter = letter;
-
-    /* Both panels go back to the root: the paths that were showing belonged to
-       a drive this is no longer on, and a path that happens to exist on both is
-       worse than one that exists on neither. */
-    for (int index = 0; index < 2; index++) {
-        strcpy(panels[index].path, "\\");
-        panels[index].selected = 0;
-        panels[index].top = 0;
-        read_directory(&panels[index]);
-    }
-    draw_all();
-}
-
-/* ---- Input --------------------------------------------------------------- */
-
-static void move_selection(int by) {
-    PANEL* panel = &panels[active];
-
-    if (!panel->count) return;
-    panel->selected += by;
-    if (panel->selected < 0) panel->selected = 0;
-    if (panel->selected >= panel->count) panel->selected = panel->count - 1;
-    follow_selection(panel);
-}
-
-static void act_on(int code) {
-    switch (code) {
-    case '\t':
-        active = active ? 0 : 1;
-        draw_all();
-        break;
-    case '\n':
-        open_selected();
-        break;
-    case KOI_KEY_F1 + 2: {
-        PANEL* panel = &panels[active];
-        char path[PATH_MAX];
-        if (!panel->count || is_directory(&panel->items[panel->selected])) break;
-        join_path(panel->path, panel->items[panel->selected].name, path,
-                  sizeof(path));
-        view_file(path);
-        draw_all();
-        break;
-    }
-    case KOI_KEY_F1 + 8:
-        change_drive();
-        break;
-    case KOI_KEY_F1 + 9:
-        running = 0;
-        break;
-    default:
-        break;
-    }
-}
-
-/* Which panel is the pointer over, or -1. */
-static int panel_under(int x, int y) {
-    for (int index = 0; index < 2; index++) {
-        PANEL* panel = &panels[index];
-        if (x >= panel->x && x < panel->x + panel->w &&
-            y >= panel->y && y < panel->y + panel->h) return index;
-    }
-    return -1;
-}
-
-/* Which row of a panel a point falls on, or -1. */
-static int row_under(const PANEL* panel, int y) {
-    int first = panel->y + FRAME + CHAR_H + 6;
-    int row;
-
-    if (y < first) return -1;
-    row = (y - first) / ROW_H;
-    if (row < 0 || row >= panel->rows) return -1;
-    if (panel->top + row >= panel->count) return -1;
-    return panel->top + row;
-}
-
 int main(void) {
-    KOI_POINTER pointer;
-    int last_scroll;
-    unsigned int last_presses = 0;
-    int last_x = -1;
-    int last_y = -1;
-    koi_uint64 last_click = 0;
-    int last_clicked_row = -1;
+    WINDOW_EVENT event;
+    WINDOW_MENU desktop[3];
+    WINDOW_MENU panel[2];
 
-    /* Where it was, if it has been here before. The shell has just restarted
-       this program after running something else, and everything it knew is in
-       these arguments. */
-    strcpy(panels[0].path, "\\");
-    strcpy(panels[1].path, "\\");
-    /* The drive Mizu itself came from, before anything moves. Every later
-       command line aimed at Mizu has to be run on this one. */
-    home_letter = drive_now();
-    browse_letter = home_letter;
+    /* The first time, ask the questions before drawing anything. Done by
+       asking the shell to run the configuration and then this again, because
+       one program runs at a time and this one has not taken the screen yet. */
     {
-        const char* arguments = koi_arguments();
-        char word[PATH_MAX];
-        int field = 0;
+        char configured[16];
 
-        while (*arguments && field < 6) {
-            int length = 0;
-            while (*arguments == ' ') arguments++;
-            if (!*arguments) break;
-            while (*arguments && *arguments != ' ' && length < PATH_MAX - 1)
-                word[length++] = *arguments++;
-            word[length] = 0;
+        if (!koi_arguments()[0] &&
+            (!settings_get("MIZU", "configured", configured,
+                           sizeof(configured)) || configured[0] != '1')) {
+            char self[128];
+            char config[128];
+            int cut = 0;
 
-            if (field == 0) strcpy(panels[0].path, word);
-            else if (field == 1) strcpy(panels[1].path, word);
-            else if (field == 2) active = atoi(word) ? 1 : 0;
-            else if (field == 3) panels[0].selected = atoi(word);
-            else if (field == 4) panels[1].selected = atoi(word);
-            else if (field == 5) {
-                /* Back to the drive that was being looked at. If it has gone -
-                   the stick was pulled out while a program was running - stay
-                   on this one rather than showing an empty screen for a volume
-                   that is not there. */
-                int letter = toupper((unsigned char)word[0]);
-                if (letter && letter != browse_letter &&
-                    koi_setdrive(letter) == 1) {
-                    browse_letter = letter;
-                } else if (letter && letter != browse_letter) {
-                    strcpy(panels[0].path, "\\");
-                    strcpy(panels[1].path, "\\");
-                    panels[0].selected = panels[1].selected = 0;
-                }
-            }
-            field++;
+            if (koi_systext(KOI_TEXT_PROGRAM_PATH, 0, self, sizeof(self)) <= 0)
+                strcpy(self, "\\MIZU\\MIZU.EXE");
+            strcpy(config, self);
+            for (int index = 0; config[index]; index++)
+                if (config[index] == '\\') cut = index + 1;
+            strcpy(config + cut, "MIZUCFG.EXE");
+            koi_chain(self);
+            koi_chain(config);
+            return 0;
         }
     }
 
-    if (koi_gfx_enter(&screen) != 0) {
-        koi_print("Mizu needs a screen it can draw on, and there is none.\n");
+    language_load();
+
+    if (!window_open_desktop(say(SAY_DESKTOP_TITLE))) {
+        koi_print("Mizu needs a framebuffer and could not get one.\n");
         return 1;
     }
+    /* Built here rather than written as literals: a menu in three languages
+       is three tables that drift apart, and one table filled in at startup is
+       one. */
+    desktop[0] = (WINDOW_MENU){ say(SAY_MENU_SYSTEM),
+        { { say(SAY_ABOUT), MENU_ABOUT }, { 0, 0 }, { say(SAY_EXIT), MENU_EXIT } }, 3 };
+    desktop[1] = (WINDOW_MENU){ say(SAY_MENU_RUN),
+        { { say(SAY_NOTEEDIT), MENU_NOTE },
+          { say(SAY_COMMANDER), MENU_COMMANDER } }, 2 };
+    desktop[2] = (WINDOW_MENU){ say(SAY_MENU_VIEW),
+        { { say(SAY_CONTROL_PANEL), MENU_CONTROL },
+          { say(SAY_CLOCK), MENU_CLOCK }, { 0, 0 },
+          { say(SAY_TILE), MENU_TILE } }, 4 };
+    panel[0] = (WINDOW_MENU){ say(SAY_MENU_FILE),
+        { { say(SAY_COMMANDER), MENU_COMMANDER }, { 0, 0 },
+          { say(SAY_EXIT), MENU_EXIT } }, 3 };
+    panel[1] = (WINDOW_MENU){ say(SAY_MENU_OPTIONS),
+        { { say(SAY_ABOUT), MENU_ABOUT } }, 1 };
 
-    c_desktop = koi_gfx_color(0, 24, 64);
-    c_panel = koi_gfx_color(0, 40, 104);
-    c_frame = koi_gfx_color(90, 150, 200);
-    c_frame_active = koi_gfx_color(150, 220, 255);
-    c_text = koi_gfx_color(210, 230, 250);
-    c_directory = koi_gfx_color(255, 235, 150);
-    c_program = koi_gfx_color(150, 255, 190);
-    c_select = koi_gfx_color(150, 220, 255);
-    c_select_text = koi_gfx_color(0, 24, 64);
-    c_bar = koi_gfx_color(0, 16, 40);
-    c_bar_text = koi_gfx_color(200, 225, 245);
-    c_bar_key = koi_gfx_color(255, 220, 120);
-    c_shadow = koi_gfx_color(0, 32, 80);
-    cursor_ink = koi_gfx_color(255, 255, 255);
-    cursor_edge = koi_gfx_color(0, 0, 0);
+    window_desktop_menu(desktop, 3);
 
-    layout();
-    read_directory(&panels[0]);
-    read_directory(&panels[1]);
-    follow_selection(&panels[0]);
-    follow_selection(&panels[1]);
-    draw_all();
-
-    if (!koi_mouse(&pointer)) {
-        /* No pointer is not a reason to refuse. Everything here has a key, and
-           on a machine with no touchpad and no mouse that is the whole of the
-           interface rather than a degraded version of one. */
-        pointer.x = (int)screen.width / 2;
-        pointer.y = (int)screen.height / 2;
-        pointer.scroll = 0;
-        pointer.presses[0] = 0;
-    } else {
-        koi_mouse_place((int)screen.width / 2, (int)screen.height / 2);
-        koi_mouse(&pointer);
-        cursor_show(pointer.x, pointer.y);
+    name_entries();
+    control_window = window_new(say(SAY_CONTROL_PANEL), 60, 70, 512, 300);
+    if (control_window) {
+        control_window->paint = paint_control;
+        control_window->click = click_control;
+        control_window->menu_count = 2;
+        control_window->menus[0] = panel[0];
+        control_window->menus[1] = panel[1];
     }
-    last_scroll = pointer.scroll;
-    last_presses = pointer.presses[0];
-    last_x = pointer.x;
-    last_y = pointer.y;
+    open_clock();
 
-    while (running) {
-        int redraw = 0;
-
-        koi_sleep(8);
-
-        while (koi_keypressed()) {
-            int key = koi_getchar();
-
-            if (key == 27) { running = 0; break; }
-            if (key == KOI_KEY_UP) { move_selection(-1); redraw = 1; }
-            else if (key == KOI_KEY_DOWN) { move_selection(1); redraw = 1; }
-            else if (key == KOI_KEY_PAGE_UP) {
-                move_selection(-panels[active].rows);
-                redraw = 1;
-            } else if (key == KOI_KEY_PAGE_DOWN) {
-                move_selection(panels[active].rows);
-                redraw = 1;
-            } else if (key == KOI_KEY_HOME) {
-                panels[active].selected = 0;
-                follow_selection(&panels[active]);
-                redraw = 1;
-            } else if (key == KOI_KEY_END) {
-                panels[active].selected = panels[active].count - 1;
-                follow_selection(&panels[active]);
-                redraw = 1;
-            } else if (key == KOI_KEY_LEFT && active == 1) {
-                active = 0;
-                redraw = 1;
-            } else if (key == KOI_KEY_RIGHT && active == 0) {
-                active = 1;
-                redraw = 1;
-            } else {
-                act_on(key);
-            }
+    while (window_next(&event)) {
+        if (event.type == WINDOW_EVENT_CLOSE) {
+            if (event.window == control_window) { window_quit(); break; }
+            if (event.window == clock_window) clock_window = (WINDOW*)0;
+            if (event.window == about_window) about_window = (WINDOW*)0;
+            if (event.window == note_window) note_window = (WINDOW*)0;
+            window_delete(event.window);
+            continue;
         }
-        if (!running) break;
-
-        koi_mouse(&pointer);
-
-        /* The wheel moves whichever panel is under the pointer, not the active
-           one. Scrolling a list you are not pointing at is nobody's idea of
-           what a wheel does. */
-        if (pointer.scroll != last_scroll) {
-            int over = panel_under(pointer.x, pointer.y);
-            PANEL* panel = &panels[over < 0 ? active : over];
-            int by = (pointer.scroll - last_scroll) * 3;
-
-            last_scroll = pointer.scroll;
-            panel->top -= by;
-            if (panel->top > panel->count - panel->rows)
-                panel->top = panel->count - panel->rows;
-            if (panel->top < 0) panel->top = 0;
-            redraw = 1;
-        }
-
-        /* Presses, not the button's current state.
-         *
-         * Watching the state means holding the button does one thing per pass
-         * round this loop, and - the half that actually bites - a click shorter
-         * than the gap between two passes is never seen at all. The count is
-         * kept by the driver as the packets arrive, so a click that happened
-         * between two looks is still there to be found. */
-        if (pointer.presses[0] != last_presses) {
-            int over = panel_under(pointer.x, pointer.y);
-            /* How many, not whether. Two clicks fast enough to land between the
-               same pair of looks arrive as one jump of two, and collapsing that
-               into a single click is a double click that only works when it is
-               done slowly. */
-            unsigned int clicks = pointer.presses[0] - last_presses;
-
-            last_presses = pointer.presses[0];
-
-            if (over >= 0) {
-                int row = row_under(&panels[over], pointer.y);
-
-                if (row >= 0) {
-                    koi_uint64 now = koi_uptime();
-                    int again = clicks > 1 ||
-                                (over == active && row == last_clicked_row &&
-                                 now - last_click < 400);
-
-                    active = over;
-                    panels[over].selected = row;
-                    last_click = now;
-                    last_clicked_row = row;
-                    redraw = 1;
-                    if (again) {
-                        /* Twice, quickly, on the same row - which is how
-                           everything with a pointer has meant "open" since
-                           before this system existed. */
-                        open_selected();
-                        redraw = 0;
-                        last_clicked_row = -1;
-                    }
-                } else if (over != active) {
-                    active = over;
-                    redraw = 1;
+        if (event.type == WINDOW_EVENT_MENU) {
+            switch (event.id) {
+            case MENU_ABOUT: open_about(); break;
+            case MENU_NOTE: open_note(); break;
+            case MENU_SAVE:
+                if (note_ready) {
+                    strcpy(note_window->title, edit_save(&note, note.path)
+                           ? "NoteEdit - NOTE.TXT" : say(SAY_COULD_NOT_SAVE));
+                    window_repaint();
                 }
-            } else if (pointer.y >= (int)screen.height - BAR_H) {
-                for (int index = 0; index < BUTTON_COUNT; index++) {
-                    if (pointer.x >= buttons[index].x &&
-                        pointer.x < buttons[index].x + buttons[index].w) {
-                        act_on(buttons[index].code);
-                        redraw = 1;
-                        break;
-                    }
+                break;
+            case MENU_BOLD: note_style ^= KOI_TEXT_BOLD; window_repaint(); break;
+            case MENU_ITALIC: note_style ^= KOI_TEXT_ITALIC; window_repaint(); break;
+            case MENU_UNDERLINE:
+                note_style ^= KOI_TEXT_UNDERLINE;
+                window_repaint();
+                break;
+            case MENU_PLAIN: note_style = 0; window_repaint(); break;
+            case MENU_CLOCK: open_clock(); break;
+            case MENU_COMMANDER: start_commander(); break;
+            case MENU_CONTROL:
+                if (control_window) {
+                    control_window->minimised = 0;
+                    window_raise(control_window);
                 }
+                break;
+            case MENU_TILE:
+                /* Everything back where it started, for a desk that has been
+                   shuffled into a pile. */
+                if (control_window) { control_window->x = 60; control_window->y = 70; }
+                if (clock_window) { clock_window->x = 640; clock_window->y = 300; }
+                if (about_window) { about_window->x = 360; about_window->y = 380; }
+                window_repaint();
+                break;
+            case MENU_EXIT:
+                /* "Close" in a window's own File menu closes that window;
+                   "Exit to DOS" in the desktop's menu ends everything. */
+                if (note_window && event.window == note_window) {
+                    window_delete(note_window);
+                    note_window = (WINDOW*)0;
+                } else {
+                    window_quit();
+                }
+                break;
+            default: break;
             }
+            continue;
         }
-        if (redraw) {
-            draw_all();
-            cursor_show(pointer.x, pointer.y);
-            last_x = pointer.x;
-            last_y = pointer.y;
-        } else if (pointer.x != last_x || pointer.y != last_y) {
-            cursor_hide();
-            cursor_show(pointer.x, pointer.y);
-            last_x = pointer.x;
-            last_y = pointer.y;
-        }
+        if (event.type == WINDOW_EVENT_KEY && event.id == 27) window_quit();
     }
 
-    cursor_hide();
-    koi_gfx_leave();
+    window_close_desktop();
     return 0;
 }

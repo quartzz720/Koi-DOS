@@ -353,7 +353,12 @@ static void command_ver(void) {
     print_dec(KOI_DOS_VERSION & 0xFF);
     put('.');
     print_dec(KOI_BUILD_NUMBER);
-    print(", built " KOI_BUILD_DATE " (" KOI_BUILD_COMMIT ")");
+    /* The build id, not just the commit: work between two commits all carries
+       the same commit, so without this a machine running an hour-old kernel
+       says exactly what a machine running the newest one says - and "did the
+       update land" stops being answerable. */
+    print(", built " KOI_BUILD_DATE " (" KOI_BUILD_COMMIT ", build "
+          KOI_BUILD_ID ")");
     print("\n");
 
     print_line("A DOS-like operating system for UEFI machines.");
@@ -376,6 +381,7 @@ static void command_help(void) {
     print_line("mem            memory, devices and volumes");
     print_line("pci            every function on the PCI bus");
     print_line("disk           disks and partitions, letters or not");
+    print_line("chkdsk [d:] [/F]  check a volume, /F to repair what it finds");
     print_line("format <part>  make a new filesystem - destroys everything on it");
     print_line("part <disk>    replace the partition table - destroys the whole disk");
     print_line("setup          install Koi-DOS onto a disk");
@@ -385,7 +391,8 @@ static void command_help(void) {
     print_line("time           show the time");
     print_line("echo [text]    print text");
     print_line("beep [hz] [ms] a tone, if there is a sound device");
-    print_line("sound          the sound device, and which output it picked");
+    print_line("sound [node]   the sound device; a node sends output there by hand");
+    print_line("sound volume <n>  loudness, 0 to 100");
     print_line("net [start]    the network: what it is, or ask for an address");
     print_line("net set <..>   set an address by hand, for a wire with no server");
     print_line("net usb        test the USB network device on its own");
@@ -903,7 +910,7 @@ static void command_ping(const ARGUMENTS* arguments) {
     print_line(replies ? "." : " - nothing came back.");
 }
 
-static void command_sound(void) {
+static void command_sound(const ARGUMENTS* arguments) {
     if (!audio_ready()) {
         print("No sound device: ");
         print_line(audio_failure());
@@ -914,6 +921,73 @@ static void command_sound(void) {
         print_line("there: class 04:03 is HD Audio.");
         return;
     }
+
+    /* `sound <node>` sends the output somewhere else by hand.
+     *
+     * A codec that cannot tell whether anything is in its headphone socket
+     * leaves one question that nothing else here can answer: is the jack not
+     * being sensed, or not being driven? Choosing it deliberately and
+     * listening separates those two, and there is no other way to. */
+    /* `sound volume <0-100>`. A percentage rather than the 0-255 the mixer
+       works in, because nobody thinks about loudness in eighth-bits - and the
+       first thing anybody wants after hearing this machine through headphones
+       is to turn it down. */
+    if (arguments->operand_count && word_is(arguments->operand[0], "VOLUME")) {
+        const char* text = arguments->operand[1];
+        boot_uint64_t percent = 0;
+        int digits = 0;
+
+        while (*text >= '0' && *text <= '9') {
+            percent = percent * 10 + (boot_uint64_t)(*text++ - '0');
+            digits++;
+        }
+        if (!digits || *text || percent > 100) {
+            print("Volume is ");
+            print_dec((boot_uint64_t)((audio_volume() * 100 + 127) / 255));
+            print_line(" percent.");
+            print_line("`sound volume <0-100>` changes it.");
+            return;
+        }
+        audio_set_volume((int)((percent * 255 + 50) / 100));
+        print("Volume ");
+        print_dec(percent);
+        print_line(" percent.");
+        return;
+    }
+
+    if (arguments->operand_count) {
+        boot_uint64_t node = 0;
+        const char* text = arguments->operand[0];
+        int digits = 0;
+
+        while (*text >= '0' && *text <= '9') {
+            node = node * 10 + (boot_uint64_t)(*text++ - '0');
+            digits++;
+        }
+        if (!digits || *text || node > 255) {
+            print_line("sound [node]");
+            print_line("sound volume [0-100]");
+            print_line("");
+            print_line("With no argument, what the sound hardware is doing.");
+            print_line("With a node number from the list below, sends the");
+            print_line("sound to that output instead.");
+            return;
+        }
+        if (hda_select((boot_uint8_t)node)) {
+            print("Output moved to node ");
+            print_dec(node);
+            print_line(". Play something to hear whether it worked.");
+        } else {
+            print("There is no output at node ");
+            print_dec(node);
+            print_line(", or no converter reaches it.");
+        }
+        print_line("");
+    }
+
+    /* Measured now rather than remembered from startup, so a socket can be
+       tested by plugging something into it rather than by rebooting. */
+    hda_rescan();
 
     print("Codec           : ");
     print(hda_codec_name());
@@ -926,7 +1000,9 @@ static void command_sound(void) {
     print_dec(hda_converter());
     print_line("");
     print_field("Rate            : ", HDA_RATE, " Hz, stereo, 16-bit");
-    print_field("Volume          : ", (boot_uint64_t)audio_volume(), " of 255");
+    print("Volume          : ");
+    print_dec((boot_uint64_t)((audio_volume() * 100 + 127) / 255));
+    print_line(" percent  (`sound volume <0-100>` changes it)");
     print("Voices          : ");
     print_dec(audio_voices_playing());
     print(" of ");
@@ -948,7 +1024,13 @@ static void command_sound(void) {
         case HDA_DEVICE_HEADPHONE: print("headphones "); break;
         default: print("other      "); break;
         }
-        switch (pin->sense) {
+        /* A pin the board never wired to a socket is not an empty socket, and
+           calling it one sends somebody looking for a jack that is not on the
+           machine. Two "headphones" in a list where the laptop has one is
+           exactly that. */
+        if (pin->connectivity == 1) {
+            print("not connected          ");
+        } else switch (pin->sense) {
         case HDA_SENSE_PRESENT: print("something is plugged in"); break;
         case HDA_SENSE_EMPTY: print("nothing plugged in     "); break;
         case HDA_SENSE_FIXED: print("built in               "); break;
@@ -957,7 +1039,35 @@ static void command_sound(void) {
         if (pin->chosen) print("  <- in use");
         print_line("");
     }
-    if (!hda_pin_count()) print_line("  none - every output on this codec is digital");
+    if (!hda_pin_count()) {
+        print_line("  none - every output on this codec is digital");
+        return;
+    }
+    /* Something is plugged into a socket that is not the one playing.
+     *
+     * Said rather than acted on: moving the output because a register changed
+     * would be this command doing something to the machine when it was asked
+     * to describe it. The offer is one line and the decision stays with the
+     * person wearing the headphones. */
+    for (boot_uint32_t index = 0; index < hda_pin_count(); index++) {
+        const HDA_PIN* pin = hda_pin(index);
+        if (!pin || pin->chosen) continue;
+        if (pin->sense != HDA_SENSE_PRESENT) continue;
+        print_line("");
+        print("Something is plugged into node ");
+        print_dec(pin->node);
+        print(" and the sound is not going there.");
+        print_line("");
+        print("Run `sound ");
+        print_dec(pin->node);
+        print_line("` to move it.");
+        break;
+    }
+
+    print_line("");
+    print_line("`sound <node>` sends the sound to one of these by hand - which is");
+    print_line("how to tell a socket that is not sensed from one that is not");
+    print_line("driven. The raw answers the codec gave are in the log.");
 }
 
 
@@ -1526,8 +1636,22 @@ static void dosget_list(boot_uint32_t source, boot_uint8_t* buffer) {
 }
 
 /* Fetch one package's files and write them into a directory of its own. */
-static int dosget_install(boot_uint32_t source, const char* package,
+/* Package names are upper case, the way every other name in DOS is.
+ *
+ * The shell folds the command word but not its operands, so `dosget install
+ * system` asked the server for `packages/system` - and a server whose files
+ * live on a case-sensitive filesystem answered, correctly, that there is no
+ * such thing. "The server refused the file" is a true sentence and a useless
+ * one when the only difference is the shift key. */
+static void upper_name(const char* from, char* into, boot_uint32_t size) {
+    boot_uint32_t at = 0;
+    while (from[at] && at + 1 < size) { into[at] = upper(from[at]); at++; }
+    into[at] = 0;
+}
+
+static int dosget_install(boot_uint32_t source, const char* raw_package,
                           boot_uint8_t* buffer) {
+    char package[64];
     char path[PATH_MAX];
     char directory[PATH_MAX];
     char manifest[1024];
@@ -1541,6 +1665,7 @@ static int dosget_install(boot_uint32_t source, const char* package,
 
     if (!current_volume) { print_line("No volume."); return 0; }
     volume = current_volume;
+    upper_name(raw_package, package, sizeof(package));
 
     /* The manifest first: it names the files, and a package whose manifest is
        missing is not a package this knows how to unpack. */
@@ -2622,6 +2747,192 @@ static void command_format(const ARGUMENTS* arguments) {
     print_line("Run `disk` to see the result; the drive letters may have moved.");
 }
 
+/* ---- chkdsk --------------------------------------------------------------
+ *
+ * The system had no way to say whether a volume was sound until a bug in its
+ * own writer made a directory grow past one cluster and left an
+ * end-of-directory marker in the middle of the chain. Every file after that
+ * point was written correctly and could never be found again - by us, or by
+ * any other operating system, because they all obey the same marker. The
+ * writer was fixed; the volumes it had already written were not, and nothing
+ * in the system could either see the damage or undo it.
+ *
+ * Without /F it changes nothing, which is the DOS behaviour and the right
+ * default: the first thing anybody wants from a disk checker is to be told
+ * what is wrong, not to have it decided for them.
+ */
+/* "1 sectors" is the kind of thing that makes a report look like nobody ever
+   read one. */
+static void print_count(boot_uint64_t number, const char* singular,
+                        const char* plural) {
+    print_dec(number);
+    put(' ');
+    print(number == 1 ? singular : plural);
+}
+
+static void chkdsk_fault(FAT_FAULT fault, const char* where,
+                         boot_uint64_t number, int repaired) {
+    console_set_color(repaired ? console_theme()->foreground
+                               : console_theme()->error,
+                      console_theme()->background);
+    print("  ");
+    if (where && where[0]) {
+        print(where);
+        print("  ");
+    }
+
+    switch (fault) {
+    case FAT_FAULT_TERMINATOR:
+        print("cluster ");
+        print_dec(number);
+        print(" ends the directory early and hides everything after it");
+        break;
+    case FAT_FAULT_ORPHAN_LONG_NAME:
+        print_count(number, "long-name entry belongs", "long-name entries belong");
+        print(" to no file");
+        break;
+    case FAT_FAULT_BAD_LINK:
+        print("the chain leads to cluster ");
+        print_dec(number);
+        print(", which is not on this volume");
+        break;
+    case FAT_FAULT_CROSS_LINKED:
+        print("cluster ");
+        print_dec(number);
+        print(" is claimed twice");
+        break;
+    case FAT_FAULT_SIZE_TOO_LARGE:
+        print_count(number, "cluster", "clusters");
+        print(" more than the recorded size needs");
+        break;
+    case FAT_FAULT_SIZE_TOO_SMALL:
+        print("recorded size ");
+        print_dec(number);
+        print(" is more than the clusters hold");
+        break;
+    case FAT_FAULT_PARENT_WRONG:
+        print("\"..\" points at cluster ");
+        print_dec(number);
+        break;
+    case FAT_FAULT_LOST_CLUSTERS:
+        print_count(number, "cluster is allocated and belongs",
+                            "clusters are allocated and belong");
+        print(" to nothing");
+        break;
+    case FAT_FAULT_FAT_COPIES_DIFFER:
+        print("the copies of the allocation table differ in ");
+        print_count(number, "sector", "sectors");
+        break;
+    case FAT_FAULT_FREE_COUNT_WRONG:
+        print("the free-space hint says ");
+        print_dec(number);
+        print(" clusters, and the table says otherwise");
+        break;
+    case FAT_FAULT_TOO_COMPLEX:
+        print("too many directories to check at once");
+        break;
+    }
+
+    print_line(repaired ? "  - repaired" : "");
+    console_use_theme();
+}
+
+static void command_chkdsk(const ARGUMENTS* arguments) {
+    VOLUME* volume = current_volume;
+    FAT_CHECK_RESULT result;
+    int repair = 0;
+
+    for (int index = 0; index < arguments->switch_count; index++)
+        if (upper(arguments->switches[index]) == 'F') repair = 1;
+
+    if (arguments->operand_count) {
+        const char* name = arguments->operand[0];
+        volume = name[0] && name[1] == ':' && !name[2]
+               ? volume_by_letter(name[0]) : (VOLUME*)0;
+        if (!volume) {
+            print_line("chkdsk [drive:] [/F]");
+            print_line("");
+            print_line("Checks the volume and says what is wrong with it.");
+            print_line("/F repairs what can be repaired; without it nothing");
+            print_line("on the disk is changed.");
+            return;
+        }
+    }
+    if (!volume) { print_line("No volume."); return; }
+
+    print("Checking ");
+    put(volume->letter);
+    print(":");
+    if (volume->label[0]) {
+        print(" (");
+        print(volume->label);
+        print(")");
+    }
+    print_line(repair ? " - repairing" : "");
+    print_line("");
+
+    if (!fat32_check(volume, repair, chkdsk_fault, &result)) {
+        console_set_color(console_theme()->error, console_theme()->background);
+        print_line("The volume could not be checked. It may not be FAT32, or");
+        print_line("there was not enough memory to hold the cluster map.");
+        console_use_theme();
+        return;
+    }
+
+    if (result.faults) print_line("");
+    print("  ");
+    print_dec(fat32_total_bytes(volume));
+    print_line(" bytes total disk space");
+    print("  ");
+    print_dec(result.bytes_in_files);
+    print(" bytes in ");
+    print_count(result.files, "file", "files");
+    print_line("");
+    print("  ");
+    print_count(result.directories, "directory", "directories");
+    print_line("");
+    print("  ");
+    print_dec(fat32_free_bytes(volume));
+    print_line(" bytes available");
+    print("  ");
+    print_dec(result.cluster_bytes);
+    print(" bytes in each allocation unit, holding ");
+    print_count(result.entries_per_cluster, "directory entry", "directory entries");
+    print_line("");
+    print_line("");
+
+    if (!result.faults) {
+        print_line("  No faults found.");
+    } else {
+        print("  ");
+        print_dec(result.faults);
+        print(result.faults == 1 ? " fault found, " : " faults found, ");
+        print_dec(result.repaired);
+        print_line(" repaired.");
+        if (result.repaired < result.faults) {
+            if (!repair) {
+                print("  Run `chkdsk ");
+                put(volume->letter);
+                print_line(": /F` to repair them.");
+            } else {
+                print_line("  What is left needs a decision this cannot make");
+                print_line("  on its own - a cross-linked cluster belongs to");
+                print_line("  one file or the other, and only you know which.");
+            }
+        }
+    }
+
+    /* A check that gave up partway is not a clean bill of health, and saying
+       so plainly matters more than the number above it. */
+    if (!result.complete) {
+        console_set_color(console_theme()->error, console_theme()->background);
+        print_line("");
+        print_line("  The check did not finish. Some of the volume was not");
+        print_line("  read, so this says nothing about the parts it missed.");
+        console_use_theme();
+    }
+}
+
 /* Every function on the bus, as the kernel sees it.
  *
  * This exists because a driver that reports "not found" says nothing about
@@ -3310,10 +3621,12 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
     boot_uint64_t length = 0;
     int has_extension = 0;
     FAT_ENTRY entry;
+    VOLUME* program_volume;
     int code;
     int exit_code = 0;
 
     if (!current_volume) return 0;
+    program_volume = current_volume;
 
     while (input[length] && !is_space(input[length]) && length + 5 < PATH_MAX) {
         if (input[length] == '.') has_extension = 1;
@@ -3334,6 +3647,26 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
             build_program_path(name, path, place);
             found = fat32_stat(current_volume, path, &entry);
         }
+
+        /* And then \BIN on the system volume, wherever the user is standing.
+         *
+         * The utilities are installed once, on the volume the system lives on.
+         * Standing on a USB stick and typing `play \WAV\song.wav` used to fail
+         * with "Bad command or file name" - not because the file was missing
+         * but because `play` was, on that drive. The program is found here and
+         * still runs with the user's own drive and directory, so the argument
+         * it was given still means what it said. */
+        if (!found) {
+            VOLUME* system = volume_boot();
+            if (system && system != current_volume) {
+                build_program_path(name, path, PROGRAM_SEARCH_BIN);
+                if (fat32_stat(system, path, &entry)) {
+                    found = 1;
+                    program_volume = system;
+                }
+            }
+        }
+
         if (!found) {
             /* Nothing by that name as a program; try it as a batch file. */
             if (has_extension) return 0;
@@ -3362,13 +3695,21 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
     }
 
     syscall_set_location(current_volume, current_path);
-    code = program_run(current_volume, path, arguments->tail, &exit_code);
+    code = program_run(program_volume, path, arguments->tail, &exit_code);
     syscall_close_all();
     /* And take the screen back, whether or not the program gave it up. A
        program that returns while still holding it would otherwise leave the
        shell invisible with no way to ask for it back - which is precisely the
        failure this mode was shaped to avoid. */
     graphics_leave();
+    /* And the colours back too, for the same reason and with the same
+       reasoning. A program is free to paint the console however it likes while
+       it runs; a program that exits having left the shell wearing its scheme
+       has changed the system, and nothing asked it to. The cursor comes back
+       as well - a program that hid it and exited leaves a prompt with nothing
+       blinking at the end of it. */
+    console_use_theme();
+    console_show_cursor(1);
 
     if (code == PROGRAM_NOT_LOADABLE) {
         console_set_color(console_theme()->error, console_theme()->background);
@@ -3493,6 +3834,7 @@ static void execute(const char* input) {
     if (word_is(input, "PCI")) { command_pci(); return; }
     if (word_is(input, "DISK")) { command_disk(); return; }
     if (word_is(input, "FORMAT")) { command_format(&arguments); return; }
+    if (word_is(input, "CHKDSK")) { command_chkdsk(&arguments); return; }
     if (word_is(input, "PART")) { command_part(&arguments); return; }
     if (word_is(input, "SETUP")) { command_setup(); return; }
     if (word_is(input, "SHUTDOWN")) { command_shutdown(); return; }
@@ -3501,7 +3843,7 @@ static void execute(const char* input) {
     if (word_is(input, "TIME")) { command_time(); return; }
     if (word_is(input, "VER")) { command_ver(); return; }
     if (word_is(input, "BEEP")) { command_beep(&arguments); return; }
-    if (word_is(input, "SOUND")) { command_sound(); return; }
+    if (word_is(input, "SOUND")) { command_sound(&arguments); return; }
     if (word_is(input, "NET")) {
         if (word_is(arguments.operand[0], "START")) command_net_start();
         else if (word_is(arguments.operand[0], "SET")) command_net_set(&arguments);

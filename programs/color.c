@@ -1,4 +1,5 @@
 #include "koi.h"
+#include "settings.h"
 
 /* Change the colours the shell uses, and remember the choice.
  *
@@ -7,7 +8,7 @@
  * kernel reads at boot. Nothing here reaches into kernel state to persist
  * anything, and the kernel does not have to know this program exists. */
 
-#define CONFIG_PATH "\\BOOT\\userspace.cfg"
+#define CONFIG_PATH SETTINGS_DIRECTORY "\\CONSOLE.CFG"
 
 static const char* color_names[16] = {
     "black", "blue", "green", "cyan",
@@ -88,33 +89,18 @@ static const char* next_word(const char* text, char* word, long capacity) {
     return text;
 }
 
-static void append(char* buffer, long* position, const char* text) {
-    while (*text) buffer[(*position)++] = *text++;
-}
-
+/* Three keys changed, and nothing else in the file touched.
+ *
+ * This used to build the whole file from the three things `color` knows about
+ * and write it over the top, which was fine while `color` was the only program
+ * that wrote settings and silently destructive the moment a second one existed:
+ * the commander recorded that it had been configured, somebody changed a
+ * colour, and the machine asked its first-run questions again. One writer is
+ * fine until there are two, and there are two. */
 static int save(int foreground, int background, int prompt) {
-    static char buffer[512];
-    long position = 0;
-    long handle;
-    long written;
-
-    append(buffer, &position,
-           "# Koi-DOS user settings.\r\n"
-           "# Written by color.exe; read by the kernel at boot.\r\n"
-           "# Colours may be names or numbers 0-15.\r\n\r\n");
-    append(buffer, &position, "foreground = ");
-    append(buffer, &position, color_names[foreground]);
-    append(buffer, &position, "\r\nbackground = ");
-    append(buffer, &position, color_names[background]);
-    append(buffer, &position, "\r\nprompt = ");
-    append(buffer, &position, color_names[prompt]);
-    append(buffer, &position, "\r\n");
-
-    handle = koi_open(CONFIG_PATH, OPEN_WRITE);
-    if (handle == SYSCALL_ERROR) return 0;
-    written = koi_write(handle, buffer, position);
-    koi_close(handle);
-    return written == position;
+    return settings_set("CONSOLE", "foreground", color_names[foreground]) &&
+           settings_set("CONSOLE", "background", color_names[background]) &&
+           settings_set("CONSOLE", "prompt", color_names[prompt]);
 }
 
 static void show_swatch(void) {

@@ -31,6 +31,25 @@ void serial_write_dec(boot_uint64_t value);
 
 const char* boot_log(void);
 boot_uint32_t boot_log_length(void);
+
+/* Bytes, as bytes.
+ *
+ * Everything above this line records what the system believed. This records
+ * what is actually there - and the difference between those two is where every
+ * hard bug in this project has lived. A directory entry that reads as missing
+ * and a directory entry whose first byte is 0x00 are the same event described
+ * at two levels, and only the second one can be acted on.
+ *
+ * The immediate reason it exists: diagnosing the lost-files bug meant carrying
+ * the disk to another machine and taking it apart in Python, because nothing
+ * on the machine that failed could show a sector. A system that cannot show
+ * its own bytes can only be debugged somewhere else.
+ *
+ * Classic layout - offset, sixteen bytes of hex, the printable ones again on
+ * the right - because it is the one every person reading a dump already knows
+ * how to scan. */
+void serial_write_bytes(const char* label, const void* data,
+                        boot_uint32_t length);
 int boot_log_truncated(void);
 
 #endif

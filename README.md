@@ -101,6 +101,7 @@ make at all, because it used to read 100 ms as 0.
 | `mem` | memory, and what the drivers actually found |
 | `pci` | every function on the PCI bus, with its class |
 | `disk` | disks and partitions, whether or not they have a drive letter |
+| `chkdsk [d:] [/F]` | check a volume; `/F` repairs, without it nothing is written |
 | `format <part>` | make a new filesystem — destroys everything on it |
 | `part <disk>` | replace the partition table — destroys the whole disk |
 | `setup` | install Koi-DOS onto a disk |
@@ -171,7 +172,7 @@ and `AUTOEXEC.BAT` at the root of the boot drive runs at startup.
 Anything that is not a built-in command is looked up on disk as `NAME` or `NAME.EXE` — first in
 the current directory, then at the root of the drive, then in `\BIN` — and given the rest of the
 line as its arguments. `\BIN` is where an installation puts them, because the root of the system
-volume is for the user's files and a pile of `.EXE` in it turns `dir` into a search. Seven ship
+volume is for the user's files and a pile of `.EXE` in it turns `dir` into a search. Ten ship
 in [programs/](programs/):
 
 | | |
@@ -183,40 +184,55 @@ in [programs/](programs/):
 | `color` | changes the console colours and remembers them |
 | `demo` | every drawing primitive on one screen, as a test that happens to look like something |
 | `show <file.bmp>` | displays an uncompressed 24- or 32-bit BMP, centred |
+| `play <file.wav>` | plays a WAV through the mixer; any key stops it |
+| `edit [file]` | a full-screen text editor, in the spirit of `nano` |
+| `selftest [/K]` | reproduces known failures and writes a report, in bytes and in words |
 
 `ls` and `color` exist to prove two specific things: that the directory-enumeration calls are
 enough to write a listing with no privilege the shell does not also lack, and that a program can
 change how the system looks and make it stick without reaching into kernel state.
 
-### Mizu
+### Koi-Commander
 
-**Mizu is the graphical shell, and it does not ship with the system.** It arrives with `dosget
-install mizu`, lands in `\MIZU`, is started by typing `\MIZU\MIZU`, and can be removed again — a
+**Koi-Commander is a file manager with two panels, and it does not ship with the system.** It arrives with `dosget
+install commander`, lands in `\COMMANDER`, is started by typing `\COMMANDER\COMMANDER`, and can be removed again — a
 graphical shell that cannot be taken off is an operating system with a graphical shell, and this
-is not one. The source is [programs/mizu.c](programs/mizu.c); it is built by the same `make` and
+is not one. The source is [programs/commander.c](programs/commander.c); it is built by the same `make` and
 uses nothing the SDK does not give everybody.
 
 Two panels side by side, which is Norton Commander's arrangement and Windows 1.0's conclusion
 from the other direction: overlapping windows on one screen hide more than they show. The pointer
 selects, twice quickly opens, the wheel scrolls whichever panel it is over — and on a laptop the
 wheel is two fingers on the touchpad, because the pad recognises the gesture itself and reports
-it as wheel notches. `Tab` switches panels, `F3` shows a file, `F9` changes drive, `F10` leaves.
-Everything with a pointer also has a key: on a machine with no touchpad the keys are the whole
-interface rather than a degraded version of one.
+it as wheel notches. `Tab` switches panels, `F3` shows a file, `F4` edits one, `F9` changes drive,
+`F10` leaves. Everything with a pointer also has a key: on a machine with no touchpad the keys are
+the whole interface rather than a degraded version of one.
 
-Starting a program from it goes through `SYS_CHAIN`. Mizu asks for itself to be run, then for the
+It was called Mizu while it was the only graphical thing here; the name has gone to what
+comes next - a desktop, with windows - and this kept the one that describes it. Finished rather
+than abandoned: two panels answer "where is it" and "where is it going", and a program that
+answers its question does not need to become something else.
+
+`F4` is a notepad, and it is the second front end over the same editing core as `edit` — the one
+the system ships with and draws on the console. Two editors, one buffer implementation, because a
+text buffer is where the off-by-ones live and two copies written a week apart do not stay the same
+shape. What the graphical one adds is what a pointer is for: a click puts the caret where the
+finger is, a drag selects, and the clipboard it cuts into is the kernel's, so what leaves the
+notepad can be pasted into `edit` and the other way round.
+
+Starting a program from it goes through `SYS_CHAIN`. It asks for itself to be run, then for the
 program, and exits; the requests are honoured most-recent-first, so the program runs in the memory
-Mizu was occupying and Mizu comes back afterwards with its two paths and its selection handed to
+it was occupying and it comes back afterwards with its two paths and its selection handed to
 itself as arguments.
 
 0.1 does not copy, move, delete or rename, and both panels show the same drive. Those are 0.2.
 
-**Why the source is in this repository when the program is not part of the system.** Mizu is
+**Why the source is in this repository when the program is not part of the system.** It is
 currently the only thing that calls `SYS_MOUSE`, `SYS_CHAIN` and `SYS_SETDRIVE`, and all three
-were added because Mizu needed them. While an interface is still moving, its only consumer has to
+were added because it needed them. While an interface is still moving, its only consumer has to
 be built by the same `make` — otherwise a break is found by a user rather than by the compiler.
 DOSFETCH, Games and K-DOOM live outside this tree for the opposite reason: they test that a
-*settled* SDK still works. Mizu moves out to its own repository when the interface stops moving,
+*settled* SDK still works. It moves out to its own repository when the interface stops moving,
 and joins them.
 
 Three more proofs live outside this repository on purpose, each built with nothing but the SDK:
@@ -277,6 +293,18 @@ Analogue outputs the codec describes:
   node 20 speaker    built in                 <- in use
   node 33 headphones nothing plugged in
 ```
+
+It measures the jacks when asked rather than showing what startup found, so a socket can be
+tested by plugging something into it instead of by rebooting, and `sound <node>` sends the output
+to one of them by hand — the only measurement that separates a socket that cannot be sensed from
+one that cannot be driven. Both exist because of a laptop that reported an empty headphone socket
+while headphones were in it, and the cause was worth the trouble: **a pin that is switched off
+does not measure**, and says so as "nothing there" rather than as an error. Presence was being
+read during startup, before any output had been chosen — so every jack was asked while its own
+sense circuit was off. A pin that reports nothing now has its output switched on, is asked again,
+and has its control register put back as it was. The same laptop found the other half of it: two
+pins fed by one converter both play, so switching to the headphones was adding them to the
+speaker rather than moving to them. A pin being left is now silenced.
 
 Everything above that is [kernel/audio.c](kernel/audio.c), which has no hardware in it. Sixteen
 voices, each with its own rate, volume and pan, resampled into the ring in 32.32 fixed point —
@@ -389,6 +417,11 @@ presents as a button that sometimes does not work rather than as a missed sample
 be missed: the reader compares it with what it last saw. The wheel is a running total for the
 same reason, and because a total can be read by any number of callers where a
 since-you-last-asked figure can only be read by the first one.
+
+`SYS_CLIP_PUT` and `SYS_CLIP_GET` are the clipboard — one buffer, in the kernel, outliving the
+program that filled it. It belongs to the kernel rather than to a shell for the only reason that
+matters: a clipboard that dies with its program cannot carry anything between two programs, which
+is the only thing anybody wants one for. Windows 1.0 shipped one in 1985 and put it on the box.
 
 `SYS_CHAIN` asks for a command to be run **after the calling program has exited**. One program
 runs at a time, at a fixed address, in one address space — so a program cannot call another
@@ -528,10 +561,19 @@ disk one at a time although 128 of them share a sector. And data moved one secto
 although every driver underneath accepts a run. A 16 MB file from a USB stick to NVMe did not
 finish in three minutes before; it takes five seconds now.
 
-Missing: **audio and networking**. There is no `edit` — the line editor is
-the one command from the old shell not carried over, and it belongs as a program now that
-programs exist. `chkdsk` does not exist, so an interrupted write has to be repaired from another
-system. The xHCI interrupt is not routed anywhere, so waiting for a USB key spins rather than
+**The filesystem can now be checked, and had to be.** A directory that grew past its first
+cluster kept an end-of-directory marker in the middle of its chain, and every file written after
+that point was correct on disk and invisible to everybody — to `dir`, to `type`, and to `mtools`
+on another machine, because they all obey the same marker. The writer no longer leaves one
+behind, but volumes written before the fix still carry it and nothing in the system could either
+see the damage or undo it. `chkdsk` walks every directory and the whole allocation table: markers
+that hide entries, long names belonging to no file, chains that leave the volume or claim a
+cluster twice, sizes that disagree with the clusters held, `..` pointing at the wrong parent,
+clusters allocated to nothing, and the two copies of the table drifting apart. Without `/F` it
+writes nothing at all. Each of those was tested by planting the fault in an image and asking for
+it back.
+
+Missing: the xHCI interrupt is not routed anywhere, so waiting for a USB key spins rather than
 sleeps; USB devices are enumerated once at boot, so plugging a stick in afterwards does nothing
 until a reboot; and anything behind a USB hub is invisible. `ahci_init()` stops at the first ATA
 disk it finds, so a machine with two SATA drives shows one. NVMe describes each transfer with a
@@ -793,7 +835,7 @@ programs/
   start.c              _start, calls main, turns its return into an exit
   program.ld           linker script, fixed at 16 MiB
   hello.c cat.c save.c ls.c color.c demo.c show.c
-  mizu.c               the graphical shell - built here, shipped by dosget
+  commander.c          the file manager - built here, shipped by dosget
 sdk/                   the four files a program needs, plus koicc
 legacy/                the old UEFI Boot Services shell, kept for reference
 linker.ld              kernel layout, fixed at 1 MiB
@@ -803,24 +845,25 @@ deploy.sh              find the USB stick and copy the build onto it
 
 ## License
 
-**Koi-DOS Non-Commercial License (KNCL) v1.4** — [LICENSE](LICENSE). Source-available, not
-OSI-approved open source. Use it, study it, change it, pass it on, train models on it, run it in a
-lecture or a hobby group: all free, all fine. Selling it, or building it into something sold,
-needs a separate written licence.
+**MIT** — [LICENSE](LICENSE). Use it, study it, change it, ship it, sell it, build it into
+something closed, train models on it. Keep the copyright notice and that is the whole of it.
 
-**Programs written for Koi-DOS are yours.** Running on Koi-DOS, calling its system calls, or
-compiling with the SDK does not make your program a derivative of it. Everything `koicc` compiles
-into a program — `koi.h`, `syscall.h`, `start.c`, `koilib.c`, `program.ld` — is redistributable
-inside your program under whatever licence you choose, commercial included. That is stated
-file-by-file in [LICENSE-MANIFEST](LICENSE-MANIFEST), which is what says which licence covers
-which file, and which is authoritative where anything is unclear.
+**One exception, and it is named.** The bitmap font in `kernel/font_glyphs.c` is Terminus Font
+under the SIL Open Font License 1.1, with its licence text in `third-party/terminus-font/`. OFL
+places no condition on the licence of the software it is bundled into — MIT here and OFL there is
+a combination OFL was written to allow — but its notice has to be kept, so it is kept.
+[LICENSE-MANIFEST](LICENSE-MANIFEST) says which file is under which and is the file to read
+before copying anything out of here.
 
-**If you send a patch**, read [CONTRIBUTING.md](CONTRIBUTING.md) first. The short version: you
-keep the copyright in what you wrote, and you give permission for it to be included if Koi-DOS is
-ever licensed commercially — as part of Koi-DOS, never sold as a piece on its own, and with no
-revenue share. It is written down there in plain words rather than left in the small print,
-because a term of that kind should be read before it applies. If it does not suit you, a
-contribution can be accepted as non-commercial-only instead.
+**It was not always MIT.** Koi-DOS was under a source-available non-commercial licence through
+KNCL v1.4, which forbade commercial use and reserved the right to license the whole work
+commercially to the maintainer. That reservation existed so the licence could be changed later
+without having to find every contributor; it was used once, for this, and is gone. Copies obtained
+under KNCL keep the terms they came with, and nobody is worse off, because MIT gives everything
+KNCL gave and more.
+
+**If you send a patch**, read [CONTRIBUTING.md](CONTRIBUTING.md). The short version: it goes in
+under MIT, you keep the copyright in what you wrote, and there is nothing else to agree to.
 
 ---
 

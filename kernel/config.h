@@ -14,7 +14,15 @@
  * starts a comment, unknown keys are ignored rather than rejected, and a
  * missing file is not an error. A configuration file that refuses to boot the
  * system it configures would be a poor trade. */
-#define CONFIG_PATH "\\BOOT\\userspace.cfg"
+/* One file per owner, in a directory of them. Two programs that never open the
+   same file cannot overwrite each other's keys, which is a property of the
+   arrangement rather than of everybody remembering a rule. */
+#define CONFIG_DIRECTORY "\\BOOT\\CONFIG"
+
+/* The single file everything used to share. Still read, so a machine that has
+   one keeps its settings; nothing writes it any more, and anything in the
+   directory above wins over it. */
+#define CONFIG_LEGACY_PATH "\\BOOT\\userspace.cfg"
 
 void config_load(VOLUME* volume);
 

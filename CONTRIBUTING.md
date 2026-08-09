@@ -1,107 +1,74 @@
 # Contributing to Koi-DOS
 
-Patches are welcome. This page says what happens to your code when you send it,
-in plain words first and with the exact wording afterwards, because a term that
-only appears in a licence file is a term people find out about too late.
+Patches are welcome. This page says what happens to your code when you send it.
+It is short now, and it used to be long, and the difference is the whole point.
 
 ## The short version
 
-**You keep the copyright in what you write.** Nothing here transfers ownership,
-and you remain free to use, publish, sell, or relicense your own work anywhere
-else, however you like.
+**Koi-DOS is MIT.** Send a patch and it goes in under MIT, like everything else.
 
-**Koi-DOS may one day be sold under a separate commercial licence.** By sending
-a contribution you give the Maintainer permission to include your code in such
-a licence — as part of Koi-DOS, never as a piece sold on its own.
+**You keep the copyright in what you write.** Nothing here transfers ownership.
+You remain free to use, publish, sell or relicense your own work anywhere else,
+however you like.
 
-**You are not paid for that.** There is no revenue share. If a commercial
-licence is ever issued, the money is not split, and you should know that before
-you send code rather than after.
+**There is nothing else to agree to.** No commercial-licensing grant, no
+revenue-share question to answer, no clause about what happens if the project is
+ever sold. MIT already lets anybody do all of that, including you, including
+somebody neither of us has met.
 
-Why it works this way: the alternative is that a project with twenty
-contributors can never be licensed at all, because doing so means finding
-twenty people, some of whom stopped answering email in a year nobody remembers.
-Deciding it now, while it is one person's project and costs nobody anything, is
-the honest moment to decide it.
-
-If that is not acceptable to you, say so — see [Contributions without commercial
-rights](#contributions-without-commercial-rights) below. It is a real option and
-not a polite fiction.
+This page used to explain a source-available licence that forbade commercial use
+and reserved to the maintainer the right to license the whole work commercially.
+That machinery existed so the licence could be changed later without having to
+find twenty contributors, some of whom stopped answering email in a year nobody
+remembers. It was used for exactly that, once, to move to MIT. Then it was no
+longer needed.
 
 ## Signing off
 
-Put these two lines at the end of the commit message of every commit you send:
+Put this line at the end of the commit message of every commit you send:
 
 ```
-Koi-DOS-Contribution: I grant the rights in Section 10 of KNCL, and I have the right to grant them.
 Signed-off-by: Your Name <your@email>
 ```
 
-`git commit -s` writes the second line for you.
+`git commit -s` writes it for you.
 
-The first line is the one that matters here. The licence says that submitting a
-contribution grants these rights; the sign-off is you saying so in your own
-words, in a record that stays attached to the code. Contributions without it may
-be asked for one before being merged.
+It is the Developer Certificate of Origin sign-off: you are saying the code is
+yours to give, or that you got it from somewhere that allowed you to pass it on
+under these terms. It is a record attached to the code rather than a promise in
+a thread, which is the only reason it is asked for.
 
-By signing off you are stating that:
+## What makes a patch easy to take
 
-- you wrote the contribution, or otherwise have the right to submit it;
-- nobody else — an employer, a client, a university — holds rights that would
-  prevent you granting the licences in Section 10;
-- as far as you know it does not infringe anyone's copyright, patent, or trade
-  secret; and
-- any third-party material in it is identified and comes with its licence.
+**One thing per commit**, with a message that says what changed and why. The why
+is the part that cannot be recovered from the diff a year later.
 
-That last one is not a formality. Third-party code has to be listed in
-[LICENSE-MANIFEST](LICENSE-MANIFEST) with the licence that actually applies to
-it, and "third-party" on its own is not an answer to "may I use this".
+**Comments that explain a decision, not the code.** `/* increment the counter */`
+next to `counter++` helps nobody. `/* counted rather than sampled: a click lasts
+a tenth of a second and a poll thirty times a second will sooner or later look
+between the press and the release */` is the reason the code is shaped that way,
+and is worth more than the code.
 
-## Contributions without commercial rights
+**Say what you tested and how.** "Works on my machine" and "boots in QEMU" are
+different claims. If something is untested, say that instead — a known gap is
+useful and a wrong claim is not.
 
-If you want to contribute but do not want your code included in a commercial
-release, say so in the pull request. It can be accepted as
-`KNCL-NONCOMMERCIAL-ONLY` (Section 10.8): it ships with Koi-DOS like anything
-else, it is listed by name in `LICENSE-MANIFEST`, and any commercial release has
-to build without it.
+**English in the repository.** Code, comments, commit messages and documents.
+Discussion elsewhere can be in whatever language suits.
 
-This needs agreement in writing before merging, and it will not be agreed to for
-something the system cannot run without — a driver everything depends on cannot
-be the one file a release has to be built without. For a self-contained piece it
-is straightforward.
+## Third-party material
 
-Asking for this is not held against you.
+If a patch brings in code or data somebody else wrote, say so, name its licence,
+and add it to [LICENSE-MANIFEST](LICENSE-MANIFEST) with its licence text under
+`third-party/`. A permissive licence is not a reason to skip this: MIT, BSD,
+Apache-2.0 and OFL all require the notice to be kept, and dropping a notice is
+the one way to get a permissive licence wrong.
 
-## The exact terms
+GPL code cannot go in. Not because of anything about the GPL, but because this
+is MIT and the two cannot both be true of one file.
 
-The short version above is a summary and is not the licence. Where the two
-differ, [LICENSE](LICENSE) controls — Section 10 in particular, and Section 1 for
-what the words mean.
+## If something here is wrong
 
-## Practical notes
-
-**Build it first.** `make` must finish with no warnings; `-Werror` is on, and it
-is on deliberately.
-
-```
-make            # bootloader, kernel, programs, SDK
-make check      # no undefined symbols, no relocations
-./qemu.sh       # boot it
-```
-
-**Say why, not what.** The comments in this tree explain the reason a thing is
-done the way it is — which register lies, which sequence the hardware insists
-on, what was tried first and how it failed. A comment that restates the code is
-noise; a comment recording the evening that produced the code is the most
-valuable thing in the file. Match what is around you.
-
-**English in the repository.** Code, comments, commit messages and documentation
-are in English, whatever language the discussion happened in.
-
-**No disk images, no game data, no binaries.** `.img`, `.fd`, `.wad` and build
-output do not belong in git, and a WAD file must never be committed at all.
-
-**Say what you tested it on.** "Works in QEMU" and "works on a ThinkPad T430"
-are different claims, and for a driver the second one is the one that counts.
-This system exists to run on real machines, and hardware disagrees with
-emulators in ways that only turn up on hardware.
+Say so. This document has been rewritten once already because the licence under
+it changed, and a document that describes terms that no longer apply is worse
+than no document.

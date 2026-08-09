@@ -261,22 +261,55 @@ void graphics_blit(const void* pixels, int x, int y, int width, int height,
     }
 }
 
-void graphics_text(int x, int y, const char* text, boot_uint32_t color,
-                   boot_uint32_t background, int transparent) {
+/* Text, optionally emboldened, slanted or underlined.
+ *
+ * All three are done to the glyph the font already has rather than by keeping
+ * a second and a third set of them. That is how bitmap systems have always
+ * done it and it is not a shortcut: a bold face drawn by hand is a different
+ * design, but a bitmap font at sixteen pixels has no room for one, and the
+ * mechanical version is what everybody has actually seen.
+ *
+ *   bold      the glyph drawn again one pixel to the right, so every stroke
+ *             becomes two pixels wide
+ *   italic    each row shifted right in proportion to how high it is - a
+ *             shear, which is what italic is when there is no second design
+ *   underline the row below the baseline filled
+ *
+ * The slant is by a quarter, which at eight pixels wide leans the top of a
+ * glyph two pixels past its foot: enough to read as deliberate and little
+ * enough that neighbouring letters do not collide. */
+void graphics_text_styled(int x, int y, const char* text, boot_uint32_t color,
+                          boot_uint32_t background, int transparent,
+                          int style) {
     if (!active || !text) return;
 
-    for (boot_uint64_t index = 0; text[index]; index++) {
-        const boot_uint8_t* glyph = font_8x16[(unsigned char)text[index]];
-        int origin = x + (int)index * FONT_WIDTH;
+    for (boot_uint64_t index = 0, cell = 0; text[index]; cell++) {
+        int step = 1;
+        const boot_uint8_t* glyph = font_glyph(font_decode(text + index, &step));
+        int origin = x + (int)cell * FONT_WIDTH;
+
+        index += (boot_uint64_t)step;
 
         for (int line = 0; line < FONT_HEIGHT; line++) {
-            boot_uint8_t bits = glyph[line];
+            boot_uint32_t bits = glyph[line];
+            int slant = (style & GRAPHICS_TEXT_ITALIC)
+                      ? (FONT_HEIGHT - 1 - line) / 4 : 0;
+
+            if (style & GRAPHICS_TEXT_BOLD) bits |= bits >> 1;
+            if ((style & GRAPHICS_TEXT_UNDERLINE) && line == FONT_HEIGHT - 3)
+                bits = 0xFF;
+
             for (int column = 0; column < FONT_WIDTH; column++) {
                 int set = (bits & (0x80U >> column)) != 0;
                 if (!set && transparent) continue;
-                graphics_pixel(origin + column, y + line,
+                graphics_pixel(origin + column + slant, y + line,
                                set ? color : background);
             }
         }
     }
+}
+
+void graphics_text(int x, int y, const char* text, boot_uint32_t color,
+                   boot_uint32_t background, int transparent) {
+    graphics_text_styled(x, y, text, color, background, transparent, 0);
 }

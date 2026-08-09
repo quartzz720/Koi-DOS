@@ -64,7 +64,7 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
     /* The build stamp goes out before anything else can fail, so a log that
        ends in a panic still says which kernel produced it. */
     serial_write("\n=== KOI DOS build " KOI_BUILD_DATE
-                 " (" KOI_BUILD_COMMIT ") ===\n");
+                 " (" KOI_BUILD_COMMIT ", build " KOI_BUILD_ID ") ===\n");
     /* memory_init first: console_init allocates its back buffer. */
     memory_init(info);
     console_init(info);

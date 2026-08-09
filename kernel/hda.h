@@ -58,11 +58,35 @@ typedef struct {
     boot_uint8_t sense;            /* HDA_SENSE_* */
     boot_uint8_t chosen;
     boot_uint32_t configuration;
+    /* Kept so the log can carry what the codec actually said rather than what
+       this driver concluded from it. A jack that reports nothing plugged in
+       and a jack that was never asked look identical in a summary, and they
+       are not the same problem. */
+    boot_uint32_t pin_capabilities;
+    boot_uint32_t sense_response;
     int rank;
 } HDA_PIN;
 
 boot_uint32_t hda_pin_count(void);
 const HDA_PIN* hda_pin(boot_uint32_t index);
+
+/* Ask every jack again, now.
+ *
+ * The first measurement is taken while the machine is starting, which is the
+ * one moment somebody is definitely not holding a pair of headphones. Without
+ * this, testing a socket costs a reboot per attempt - and the raw answers go
+ * to the log, so a machine that gets it wrong can say what it was told. */
+void hda_rescan(void);
+
+/* Send the sound somewhere else on purpose. Returns 0 when there is no such
+   pin or no converter reaches it.
+ *
+ * Deliberate rather than automatic: a rescan that moved the output on its own
+ * would, on a codec whose jack detection does not work, move it to a socket
+ * with nothing in it and call that an improvement. Choosing by hand is also
+ * the measurement that separates "the jack cannot be sensed" from "the jack
+ * cannot be driven", which nothing else here can tell apart. */
+int hda_select(boot_uint8_t node);
 
 /* The converter feeding the chosen pin, and what kind of output it is. */
 boot_uint8_t hda_converter(void);

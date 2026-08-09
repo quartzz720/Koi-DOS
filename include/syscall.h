@@ -67,7 +67,7 @@
  * nothing else, so raising it would refuse every program already installed on a
  * machine until each was reinstalled. A rule worth keeping is worth keeping for
  * its reason, and the reason does not apply here. */
-#define KOI_ABI_VERSION 9
+#define KOI_ABI_VERSION 10
 #define KOI_ABI_MINIMUM 8
 #define KOI_ABI_IS_ALPHA 1
 
@@ -111,6 +111,16 @@ typedef struct {
  * has happened. Reading these does not consume characters, so a program may
  * use both. */
 #define SYS_KEYEVENT 0x0A    /* () -> key, or key | KOI_KEY_RELEASED, or 0 */
+/* Put the cursor somewhere, and show or hide it.
+ *
+ * What separates a program that prints from a program that has a screen. An
+ * editor without this has to clear and reprint everything to move one
+ * character - thousands of calls per keystroke, and a visible flicker on every
+ * one of them. DOS programs reached for the BIOS or ANSI codes; this is the
+ * same thing without the detour. Columns and rows, not pixels: the sizes are
+ * KOI_INFO_TEXT_COLUMNS and KOI_INFO_TEXT_ROWS. */
+#define SYS_GOTOXY 0x0B      /* (point: column, row) -> 0 */
+#define SYS_CURSOR 0x0C      /* (visible) -> 0 */
 
 /* Keys with no ASCII value, returned by SYS_GETCHAR above 0xFF so a caller can
    switch on them alongside ordinary characters.
@@ -291,6 +301,21 @@ typedef struct {
    every one failing look identical from the inside. */
 #define KOI_INFO_AUDIO 22
 #define KOI_INFO_AUDIO_RATE 23
+/* The wall clock, packed so that one call is one moment.
+ *
+ * Not an hour call and a minute call. The clock moves between them, and a
+ * program that reads 10:59 and then 00 has produced a time that never
+ * happened - which is a bug that appears once an hour and is never
+ * reproducible. The same reason SYS_MOUSE fills in one structure. */
+#define KOI_INFO_TIME 25             /* hour << 16 | minute << 8 | second */
+#define KOI_INFO_DATE 26             /* year << 16 | month << 8 | day */
+
+#define KOI_TIME_HOUR(packed) ((int)(((packed) >> 16) & 0xFF))
+#define KOI_TIME_MINUTE(packed) ((int)(((packed) >> 8) & 0xFF))
+#define KOI_TIME_SECOND(packed) ((int)((packed) & 0xFF))
+#define KOI_DATE_YEAR(packed) ((int)(((packed) >> 16) & 0xFFFF))
+#define KOI_DATE_MONTH(packed) ((int)(((packed) >> 8) & 0xFF))
+#define KOI_DATE_DAY(packed) ((int)((packed) & 0xFF))
 
 /* Text items, written into the caller's buffer and always terminated. */
 #define KOI_TEXT_BUILD_DATE 0
@@ -339,6 +364,14 @@ typedef struct {
  * so a caller that knows what it changed need not also know where the edges
  * are. */
 #define SYS_GFX_PRESENT_RECT 0x3A  /* (point, size) */
+/* (point, text, colour, background | style << 32). Bold, italic and underline
+   are made from the glyph the font already has - see graphics.c - so they cost
+   no extra font data and work with whatever font is fitted later. */
+#define SYS_GFX_TEXT_STYLED 0x3B   /* (point, text, colour, packed) */
+
+#define KOI_TEXT_BOLD 1
+#define KOI_TEXT_ITALIC 2
+#define KOI_TEXT_UNDERLINE 4
 
 /* ---- Sound ---------------------------------------------------------------
  *
@@ -423,6 +456,49 @@ typedef struct {
  * writes to a file first. Small DOS shells did precisely this, for precisely
  * this reason. */
 #define SYS_CHAIN 0x52       /* (command) -> 1, or 0 when too many are waiting */
+
+/* ---- The clipboard -------------------------------------------------------
+ *
+ * One buffer, in the kernel, outliving the program that filled it. That is the
+ * whole feature and it is the reason it belongs to the kernel rather than to a
+ * shell: a clipboard that dies with the program cannot carry anything between
+ * two programs, which is the only thing anyone wants a clipboard for.
+ *
+ * Windows 1.0 shipped one in 1985 and it was one of the three things the box
+ * talked about. It is text only here - there is no second kind of thing this
+ * system can put on it yet, and a type tag with one value is a lie about how
+ * general something is.
+ *
+ * SYS_CLIP_GET into a null buffer returns the length without copying, which is
+ * how a caller finds out how much room to make. */
+#define SYS_CLIP_PUT 0x53    /* (text, length) -> length kept, or -1 */
+#define SYS_CLIP_GET 0x54    /* (buffer, size) -> length, 0 when empty */
+
+#define KOI_CLIP_MAX 65536
+
+/* ---- The log, and the bytes underneath -----------------------------------
+ *
+ * A program writes into the same log the kernel writes into - the one that
+ * goes to COM1, is kept in memory for `log`, and is written to a file at boot.
+ * Not a log of its own: two logs of the same run have to be interleaved by
+ * hand afterwards, by somebody guessing at the order, and the whole value of a
+ * log is that it already knows the order.
+ *
+ * SYS_LOG_BYTES is the one that matters. Everything a program can say about
+ * itself is what it believed; this is what is actually there. Diagnosing the
+ * lost-files bug meant carrying the disk to another machine and taking it
+ * apart there, because nothing on the machine that failed could show a sector.
+ *
+ * SYS_SECTOR_READ is read-only and cannot damage anything. It grants no power
+ * a program did not have - programs run in ring 0 and can already touch any
+ * memory in the machine - it makes an existing capability usable on purpose
+ * rather than by accident. There is deliberately no write counterpart. */
+#define SYS_LOG 0x55         /* (text) -> 0 */
+#define SYS_LOG_BYTES 0x56   /* (label, data, length) -> 0 */
+#define SYS_SECTOR_READ 0x57 /* (disk, lba, buffer) -> bytes read, or -1 */
+/* How many disks, and how large a sector is on one of them - which a caller
+   needs before it can offer a buffer. */
+#define SYS_SECTOR_SIZE 0x58 /* (disk) -> bytes per sector, or -1 */
 
 #define KOI_BUTTON_LEFT 0x01
 #define KOI_BUTTON_RIGHT 0x02

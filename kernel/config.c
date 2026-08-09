@@ -1,4 +1,5 @@
 #include "config.h"
+#include "audio.h"
 #include "console.h"
 #include "fat32.h"
 #include "heap.h"
@@ -63,7 +64,8 @@ static void trim(char* text) {
     }
 }
 
-static void apply(const char* key, const char* value, CONSOLE_THEME* theme) {
+static void apply_console(const char* key, const char* value, void* context) {
+    CONSOLE_THEME* theme = (CONSOLE_THEME*)context;
     int color = config_parse_color(value);
     if (color < 0) return;
 
@@ -75,20 +77,35 @@ static void apply(const char* key, const char* value, CONSOLE_THEME* theme) {
        must not stop an older kernel from booting. */
 }
 
-void config_load(VOLUME* volume) {
+static void apply_sound(const char* key, const char* value, void* context) {
+    int* percent = (int*)context;
+    int total = 0;
+
+    if (!equals_ignoring_case(key, "volume")) return;
+    for (const char* cursor = value; *cursor; cursor++) {
+        if (*cursor < '0' || *cursor > '9') return;
+        total = total * 10 + (*cursor - '0');
+    }
+    if (total <= 100) *percent = total;
+}
+
+/* One settings file, read and handed to `apply` a key at a time. Returns 0
+   when there is no such file, which is not an error anywhere here. */
+static int read_settings(VOLUME* volume, const char* path,
+                         void (*apply)(const char*, const char*, void*),
+                         void* context) {
     FAT_ENTRY entry;
-    CONSOLE_THEME theme;
     char* contents;
     boot_uint32_t offset = 0;
     boot_uint32_t index = 0;
 
-    if (!volume) return;
-    if (!fat32_stat(volume, CONFIG_PATH, &entry)) return;   /* absent is fine */
-    if (entry.attributes & FAT_ATTRIBUTE_DIRECTORY) return;
-    if (!entry.size || entry.size > 8192) return;
+    if (!volume) return 0;
+    if (!fat32_stat(volume, path, &entry)) return 0;        /* absent is fine */
+    if (entry.attributes & FAT_ATTRIBUTE_DIRECTORY) return 0;
+    if (!entry.size || entry.size > 8192) return 0;
 
     contents = (char*)kmalloc(entry.size + 1);
-    if (!contents) return;
+    if (!contents) return 0;
     while (offset < entry.size) {
         boot_uint32_t got = fat32_read(volume, &entry, offset,
                                        contents + offset, entry.size - offset);
@@ -96,8 +113,6 @@ void config_load(VOLUME* volume) {
         offset += got;
     }
     contents[offset] = 0;
-
-    theme = *console_theme();
 
     while (index < offset) {
         char line[LINE_MAX];
@@ -122,10 +137,41 @@ void config_load(VOLUME* volume) {
         *separator = 0;
         trim(line);
         trim(separator + 1);
-        apply(line, separator + 1, &theme);
+        apply(line, separator + 1, context);
     }
 
     kfree(contents);
+    return 1;
+}
+
+/* Settings, as a directory of small files with one owner each.
+ *
+ * It was one file that every program rewrote from what that program knew
+ * about, and the second writer destroyed the first one's keys - the commander
+ * recorded that it had asked its questions, somebody changed a colour, and the
+ * machine asked them again. A rule saying "read it, change one line, write it
+ * back" would have worked and would have had to be remembered by everybody
+ * forever. Two programs that never open the same file cannot collide at all,
+ * and that is a property of the arrangement rather than of anybody's care.
+ *
+ * Still plain text, still one `key = value` per line: a DOS-like system whose
+ * settings need a special program to read them would have got the wrong half
+ * of the idea.
+ *
+ * The old single file is still read first, so a machine that has one keeps its
+ * colours; anything in the new files wins over it. */
+void config_load(VOLUME* volume) {
+    CONSOLE_THEME theme;
+    int percent = -1;
+
+    if (!volume) return;
+    theme = *console_theme();
+
+    read_settings(volume, CONFIG_LEGACY_PATH, apply_console, &theme);
+    read_settings(volume, CONFIG_DIRECTORY "\\CONSOLE.CFG", apply_console, &theme);
+    read_settings(volume, CONFIG_DIRECTORY "\\SOUND.CFG", apply_sound, &percent);
+
+    if (percent >= 0) audio_set_volume(percent * 255 / 100);
 
     {
         const CONSOLE_THEME* current = console_theme();
@@ -143,5 +189,5 @@ void config_load(VOLUME* volume) {
            messages went to the serial port. */
         if (changed) console_clear();
     }
-    serial_write("CONFIG: userspace.cfg applied\n");
+    serial_write("CONFIG: settings applied\n");
 }

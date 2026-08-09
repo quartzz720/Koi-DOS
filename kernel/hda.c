@@ -419,6 +419,21 @@ static void unmute_output(boot_uint8_t node, boot_uint32_t capabilities) {
             AMP_SET_OUTPUT | AMP_SET_LEFT | AMP_SET_RIGHT | 0x7F, 0);
 }
 
+/* Silence a pin we are leaving.
+ *
+ * Two outputs on one converter both play it, so switching to the headphones
+ * without doing this is not switching - it is adding. On a laptop that is the
+ * speaker still going while somebody is wearing headphones, which is the
+ * loudest possible way to be wrong. */
+static void silence_output(boot_uint8_t node) {
+    boot_uint32_t capabilities = parameter(node, PARAM_WIDGET_CAP);
+
+    if (capabilities & WIDGET_CAP_OUT_AMP)
+        command(codec_address, node, VERB_SET_AMP,
+                AMP_SET_OUTPUT | AMP_SET_LEFT | AMP_SET_RIGHT | AMP_MUTE, 0);
+    command(codec_address, node, VERB_SET_PIN_CONTROL, 0, 0);
+}
+
 static void unmute_input(boot_uint8_t node, boot_uint32_t capabilities,
                          boot_uint32_t index) {
     if (!(capabilities & WIDGET_CAP_IN_AMP)) return;
@@ -510,11 +525,13 @@ static int trace(boot_uint8_t node, int depth) {
  * that cannot are not unusual, and guessing "empty" for those would silence a
  * machine that works. */
 static boot_uint8_t pin_sense(boot_uint8_t node, boot_uint32_t configuration,
-                              boot_uint32_t pin_capabilities) {
+                              boot_uint32_t pin_capabilities,
+                              boot_uint32_t* raw) {
     boot_uint32_t connectivity = (configuration >> 30) & 0x3;
     boot_uint32_t capabilities = parameter(node, PARAM_WIDGET_CAP);
     boot_uint32_t response = 0;
 
+    if (raw) *raw = 0;
     if (connectivity == 2) return HDA_SENSE_FIXED;
     if (!(pin_capabilities & PIN_CAP_PRESENCE)) return HDA_SENSE_UNKNOWN;
 
@@ -538,6 +555,54 @@ static boot_uint8_t pin_sense(boot_uint8_t node, boot_uint32_t configuration,
 
     if (!command(codec_address, node, VERB_GET_PIN_SENSE, 0, &response))
         return HDA_SENSE_UNKNOWN;
+
+    /* A pin that is switched off does not measure, and says so as "nothing
+     * there" rather than as an error.
+     *
+     * Found on a VIA codec in a laptop with headphones plugged in: every jack
+     * reported empty at startup, and the same jack reported occupied the
+     * moment it was chosen as the output - which is the one step between the
+     * two readings. The socket had not changed. The circuit that watches it
+     * had been switched on.
+     *
+     * So: if the pin says nothing is there, turn its output on, ask again,
+     * and put the control register back exactly as it was. Codecs that answer
+     * the first time never reach this and are not poked. */
+    if (!(response & 0x80000000U) && (pin_capabilities & PIN_CAP_OUTPUT)) {
+        boot_uint32_t previous = 0;
+        boot_uint32_t control = PIN_CONTROL_OUT;
+        boot_uint32_t second = 0;
+
+        if (pin_capabilities & PIN_CAP_HEADPHONE)
+            control |= PIN_CONTROL_HEADPHONE;
+        if (command(codec_address, node, VERB_GET_PIN_CONTROL, 0, &previous) &&
+            (previous & PIN_CONTROL_OUT) == 0) {
+            command(codec_address, node, VERB_SET_PIN_CONTROL,
+                    previous | control, 0);
+            /* Long enough for a comparator to settle, and it has to be: the
+               working reading on the machine this was written for came tens of
+               milliseconds after the pin was switched on, not two. Thirty per
+               jack is nothing at startup and the alternative is a measurement
+               taken before the thing being measured exists. */
+            timer_wait(30);
+            /* Asked for whether or not the pin claims to need it. A codec that
+               measures continuously ignores the request; one that lied about
+               needing to be asked is the case this is here for. */
+            command(codec_address, node, VERB_SET_PIN_SENSE, 0, 0);
+            timer_wait(30);
+            if (command(codec_address, node, VERB_GET_PIN_SENSE, 0, &second))
+                response = second;
+            command(codec_address, node, VERB_SET_PIN_CONTROL, previous, 0);
+
+            log("HDA: node ");
+            log_dec(node);
+            log(" said nothing was there while switched off; switched on it says ");
+            log_hex(response);
+            log("\n");
+        }
+    }
+
+    if (raw) *raw = response;
     return (response & 0x80000000U) ? HDA_SENSE_PRESENT : HDA_SENSE_EMPTY;
 }
 
@@ -596,6 +661,107 @@ static const char* device_name(boot_uint32_t device) {
     }
 }
 
+/* One line per jack, in the codec's own words.
+ *
+ * The summary on the screen says what this driver concluded. This says what it
+ * was told, which is the only thing worth having when the conclusion is wrong
+ * on somebody else's machine and the machine is not here. */
+static void log_pin(const HDA_PIN* pin) {
+    log("HDA: pin node ");
+    log_dec(pin->node);
+    log(" ");
+    log(device_name(pin->device));
+    log(", config ");
+    log_hex(pin->configuration);
+    log(", pincap ");
+    log_hex(pin->pin_capabilities);
+    log(", sense ");
+    log_hex(pin->sense_response);
+    log(pin->sense == HDA_SENSE_PRESENT ? " -> something plugged in" :
+        pin->sense == HDA_SENSE_EMPTY ? " -> nothing plugged in" :
+        pin->sense == HDA_SENSE_FIXED ? " -> built in" :
+        " -> cannot tell");
+    if (!(pin->pin_capabilities & PIN_CAP_PRESENCE))
+        log(" (no presence detect)");
+    if (pin->connectivity == 1) log(" (not wired to anything)");
+    log("\n");
+}
+
+/* Point the output at one particular pin, and bind the stream to whatever
+   converter feeds it. Used once while starting and again by hda_select. */
+static int configure_pin(boot_uint32_t index) {
+    boot_uint8_t previous_dac = path_dac;
+    boot_uint8_t previous_pin = path_pin;
+    boot_uint32_t capabilities;
+    boot_uint32_t pin_capabilities;
+    boot_uint32_t control = PIN_CONTROL_OUT;
+
+    if (index >= pin_count) return 0;
+    path_pin = pins[index].node;
+    path_dac = 0;
+    /* Tracing first, because it is the step that can fail, and a machine that
+       has just been silenced is the wrong place to discover that. */
+    if (!trace(path_pin, 0)) {
+        path_pin = previous_pin;
+        path_dac = previous_dac;
+        return 0;
+    }
+    if (previous_pin && previous_pin != path_pin) silence_output(previous_pin);
+
+    capabilities = parameter(path_pin, PARAM_WIDGET_CAP);
+    pin_capabilities = parameter(path_pin, PARAM_PIN_CAP);
+    if (pin_capabilities & PIN_CAP_HEADPHONE) control |= PIN_CONTROL_HEADPHONE;
+    power_up(path_pin, capabilities);
+    command(codec_address, path_pin, VERB_SET_PIN_CONTROL, control, 0);
+    unmute_output(path_pin, capabilities);
+    /* External amplifiers on laptops are off until told otherwise, and a
+       machine whose speakers are wired through one is silent without this
+       while every register reads correct. */
+    if (pin_capabilities & PIN_CAP_EAPD)
+        command(codec_address, path_pin, VERB_SET_EAPD, 0x02, 0);
+
+    for (boot_uint32_t other = 0; other < pin_count; other++)
+        pins[other].chosen = (other == index);
+
+    /* A stream and a converter are paired by a number they both carry, so a
+       different converter has to be given it - and the one that had it has to
+       give it up, because two converters answering to one stream tag is not a
+       described thing and not worth finding out about. */
+    if (previous_dac && path_dac != previous_dac)
+        command(codec_address, previous_dac, VERB_SET_STREAM_CHANNEL, 0, 0);
+    command(codec_address, path_dac, VERB_SET_FORMAT, FORMAT_48K_16_STEREO, 0);
+    command(codec_address, path_dac, VERB_SET_STREAM_CHANNEL,
+            (STREAM_TAG << 4) | 0, 0);
+    return 1;
+}
+
+void hda_rescan(void) {
+    if (!ready) return;
+    log("HDA: asking every jack again\n");
+    for (boot_uint32_t index = 0; index < pin_count; index++) {
+        HDA_PIN* pin = &pins[index];
+        pin->sense = pin_sense(pin->node, pin->configuration,
+                               pin->pin_capabilities, &pin->sense_response);
+        pin->rank = pin_rank(pin->configuration, pin->sense);
+        log_pin(pin);
+    }
+}
+
+int hda_select(boot_uint8_t node) {
+    if (!ready) return 0;
+    for (boot_uint32_t index = 0; index < pin_count; index++) {
+        if (pins[index].node != node) continue;
+        if (!configure_pin(index)) return 0;
+        log("HDA: output moved to node ");
+        log_dec(path_pin);
+        log(", fed by the converter at node ");
+        log_dec(path_dac);
+        log("\n");
+        return 1;
+    }
+    return 0;
+}
+
 static int find_path(boot_uint8_t first_widget, boot_uint32_t widget_count) {
     int node;
     int last = (int)first_widget + (int)widget_count;
@@ -624,12 +790,14 @@ static int find_path(boot_uint8_t first_widget, boot_uint32_t widget_count) {
         pin = &pins[pin_count++];
         pin->node = (boot_uint8_t)node;
         pin->configuration = configuration;
+        pin->pin_capabilities = pin_capabilities;
         pin->device = (boot_uint8_t)((configuration >> 20) & 0xF);
         pin->connectivity = (boot_uint8_t)((configuration >> 30) & 0x3);
         pin->sense = pin_sense((boot_uint8_t)node, configuration,
-                               pin_capabilities);
+                               pin_capabilities, &pin->sense_response);
         pin->rank = pin_rank(configuration, pin->sense);
         pin->chosen = 0;
+        log_pin(pin);
     }
 
     for (index = 0; index < pin_count; index++)
@@ -652,27 +820,8 @@ static int find_path(boot_uint8_t first_widget, boot_uint32_t widget_count) {
 
     if (best < 0) return give_up("the codec has no analogue output");
 
-    pins[best].chosen = 1;
-    path_pin = pins[best].node;
-    path_dac = 0;
-    if (!trace(path_pin, 0)) return give_up("no converter feeds the output");
-
-    {
-        boot_uint32_t capabilities = parameter(path_pin, PARAM_WIDGET_CAP);
-        boot_uint32_t pin_capabilities = parameter(path_pin, PARAM_PIN_CAP);
-        boot_uint32_t control = PIN_CONTROL_OUT;
-
-        if (pin_capabilities & PIN_CAP_HEADPHONE)
-            control |= PIN_CONTROL_HEADPHONE;
-        power_up(path_pin, capabilities);
-        command(codec_address, path_pin, VERB_SET_PIN_CONTROL, control, 0);
-        unmute_output(path_pin, capabilities);
-        /* External amplifiers on laptops are off until told otherwise, and a
-           machine whose speakers are wired through one is silent without
-           this while every register reads correct. */
-        if (pin_capabilities & PIN_CAP_EAPD)
-            command(codec_address, path_pin, VERB_SET_EAPD, 0x02, 0);
-    }
+    if (!configure_pin((boot_uint32_t)best))
+        return give_up("no converter feeds the output");
 
     log("HDA: ");
     log(device_name(pins[best].device));
@@ -988,10 +1137,17 @@ static void name_codec(void) {
 
     switch (codec_vendor >> 16) {
     case 0x1002: vendor = "ATI"; break;
+    case 0x1013: vendor = "Cirrus Logic"; break;
     case 0x10DE: vendor = "NVIDIA"; break;
     case 0x10EC: vendor = "Realtek"; break;
     case 0x1102: vendor = "Creative"; break;
+    /* The three below turned up on real laptops and were reported as
+       "unknown", which reads as a driver that failed rather than a name it
+       had never been told. */
+    case 0x1106: vendor = "VIA"; break;
+    case 0x111D: vendor = "IDT"; break;
     case 0x11D4: vendor = "Analog Devices"; break;
+    case 0x13F6: vendor = "C-Media"; break;
     case 0x14F1: vendor = "Conexant"; break;
     case 0x1AF4: vendor = "QEMU"; break;
     case 0x8086: vendor = "Intel"; break;

@@ -15,6 +15,7 @@
 #include "xhci.h"
 #include "graphics.h"
 #include "mouse.h"
+#include "rtc.h"
 #include "audio.h"
 #include "hda.h"
 #include "build.h"
@@ -111,6 +112,11 @@ typedef struct {
 } PROGRAM_BLOCK;
 
 static PROGRAM_BLOCK blocks[BLOCK_MAX];
+
+/* The clipboard. Kernel memory, and deliberately not freed when a program
+   exits: the whole point is that it survives the program that filled it. */
+static char* clipboard;
+static boot_uint32_t clipboard_length;
 
 static long do_alloc(long bytes) {
     boot_uint64_t pages;
@@ -349,6 +355,16 @@ static long system_info(long item, long index) {
         if (!volume) return SYSCALL_ERROR;
         return volume == working_volume ? 1 : 0;
     }
+    case KOI_INFO_TIME: {
+        RTC_TIME now;
+        rtc_read(&now);
+        return ((long)now.hour << 16) | ((long)now.minute << 8) | now.second;
+    }
+    case KOI_INFO_DATE: {
+        RTC_TIME now;
+        rtc_read(&now);
+        return ((long)now.year << 16) | ((long)now.month << 8) | now.day;
+    }
     case KOI_INFO_AUDIO:
         return audio_ready() ? 1 : 0;
     case KOI_INFO_AUDIO_RATE:
@@ -434,6 +450,15 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
 
     case SYS_SETCOLOR:
         console_set_color((boot_uint8_t)a, (boot_uint8_t)b);
+        return 0;
+
+    case SYS_GOTOXY:
+        console_set_cursor((boot_uint32_t)KOI_POINT_X(a),
+                           (boot_uint32_t)KOI_POINT_Y(a));
+        return 0;
+
+    case SYS_CURSOR:
+        console_show_cursor((int)a);
         return 0;
 
     case SYS_KEYPRESSED:
@@ -665,6 +690,15 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
                       KOI_POINT_X(b), KOI_POINT_Y(b), (boot_uint32_t)c);
         return 0;
 
+    case SYS_GFX_TEXT_STYLED:
+        /* The style rides in the high half of the background word: the call
+           already takes four arguments and a fifth would mean a different
+           shape for one flag. */
+        graphics_text_styled(KOI_POINT_X(a), KOI_POINT_Y(a), (const char*)b,
+                             (boot_uint32_t)c, (boot_uint32_t)(d & 0xFFFFFFFF),
+                             (int)(d & 0xFFFFFFFF) == KOI_TEXT_TRANSPARENT,
+                             (int)((d >> 32) & 0xFF));
+        return 0;
     case SYS_GFX_TEXT:
         graphics_text(KOI_POINT_X(a), KOI_POINT_Y(a), (const char*)b,
                       (boot_uint32_t)c, (boot_uint32_t)(d < 0 ? 0 : d),
@@ -697,6 +731,65 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
 
     case SYS_CHAIN:
         return program_chain((const char*)a) ? 1 : 0;
+
+    case SYS_LOG:
+        if (!a) return SYSCALL_ERROR;
+        serial_write((const char*)a);
+        return 0;
+
+    case SYS_LOG_BYTES:
+        if (!b || c <= 0) return SYSCALL_ERROR;
+        serial_write_bytes((const char*)a, (const void*)b, (boot_uint32_t)c);
+        return 0;
+
+    case SYS_SECTOR_READ: {
+        BLOCK_DEVICE* device = block_device((boot_uint32_t)a);
+
+        if (!device || !c) return SYSCALL_ERROR;
+        if (!block_read(device, (boot_uint64_t)b, 1, (void*)c))
+            return SYSCALL_ERROR;
+        return (long)device->sector_size;
+    }
+
+    case SYS_SECTOR_SIZE: {
+        BLOCK_DEVICE* device = block_device((boot_uint32_t)a);
+        return device ? (long)device->sector_size : SYSCALL_ERROR;
+    }
+
+    case SYS_CLIP_PUT: {
+        const char* text = (const char*)a;
+        long length = b;
+
+        if (!text) return SYSCALL_ERROR;
+        if (length < 0) length = (long)strlen(text);
+        if (length > KOI_CLIP_MAX) length = KOI_CLIP_MAX;
+
+        /* Taken on the first use and kept. Sixty-four kilobytes held for the
+           life of the machine is cheaper than the alternative, which is a
+           clipboard that fails on a machine that has been running a while. */
+        if (!clipboard) {
+            clipboard = (char*)kmalloc(KOI_CLIP_MAX + 1);
+            if (!clipboard) return SYSCALL_ERROR;
+        }
+        memcpy(clipboard, text, (boot_uint64_t)length);
+        clipboard[length] = 0;
+        clipboard_length = (boot_uint32_t)length;
+        return length;
+    }
+
+    case SYS_CLIP_GET: {
+        char* out = (char*)a;
+        long size = b;
+        long length = (long)clipboard_length;
+
+        if (!clipboard || !clipboard_length) return 0;
+        /* Asking with no buffer asks how much room to make. */
+        if (!out || size <= 0) return length;
+        if (length > size - 1) length = size - 1;
+        memcpy(out, clipboard, (boot_uint64_t)length);
+        out[length] = 0;
+        return length;
+    }
 
     case SYS_SETDRIVE: {
         int letter = (int)a;

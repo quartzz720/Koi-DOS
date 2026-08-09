@@ -1,4 +1,5 @@
 #include "fat32.h"
+#include "heap.h"
 #include "memory.h"
 #include "string.h"
 #include "rtc.h"
@@ -986,6 +987,33 @@ static boot_uint32_t slots_needed(const char* name) {
     return 1 + (boot_uint32_t)((length + LONG_NAME_CHARS - 1) / LONG_NAME_CHARS);
 }
 
+/* A first byte of ENTRY_END means "the directory stops here", and every reader
+   obeys it - ours, mtools, Windows. So a cluster that has a successor must not
+   contain one, or everything further along the chain becomes invisible while
+   sitting perfectly intact on disk. Where a directory grows past a tail too
+   short to use, those leftover slots become deleted entries instead: readers
+   step over ENTRY_FREE and keep going, and a later, smaller name can claim
+   them. */
+static int seal_directory_cluster(FAT_VOLUME* fat, boot_uint32_t cluster,
+                                  boot_uint8_t* sector) {
+    boot_uint64_t first = cluster_first_sector(fat, cluster);
+
+    for (boot_uint32_t index = 0; index < fat->sectors_per_cluster; index++) {
+        int changed = 0;
+        if (!read_volume_sector(fat, first + index, sector)) return 0;
+        for (boot_uint32_t slot = 0; slot < ENTRIES_PER_SECTOR; slot++) {
+            boot_uint8_t* raw = sector + slot * DIRECTORY_ENTRY_SIZE;
+            if (raw[0] == ENTRY_END) {
+                raw[0] = ENTRY_FREE;
+                changed = 1;
+            }
+        }
+        if (changed && !write_volume_sector(fat, first + index, sector))
+            return 0;
+    }
+    return 1;
+}
+
 /* Find `count` consecutive free slots, extending the directory if needed.
    Returns the entry index within the chain, and the cluster holding it. */
 static int find_free_slots(FAT_VOLUME* fat, boot_uint32_t directory_cluster,
@@ -1000,6 +1028,15 @@ static int find_free_slots(FAT_VOLUME* fat, boot_uint32_t directory_cluster,
 
     if (!sector) return 0;
     entries_per_cluster = fat->sectors_per_cluster * ENTRIES_PER_SECTOR;
+
+    /* A name needing more slots than one cluster holds can never be placed:
+       the writer addresses a single cluster. Saying so here rather than after
+       the search means a doomed create does not first grow the directory by a
+       cluster it will never use. */
+    if (count > entries_per_cluster) {
+        free_page(sector);
+        return 0;
+    }
 
     for (;;) {
         for (boot_uint32_t index = 0; index < entries_per_cluster; index++) {
@@ -1026,17 +1063,27 @@ static int find_free_slots(FAT_VOLUME* fat, boot_uint32_t directory_cluster,
         {
             boot_uint32_t following = next_cluster(fat, cluster);
             if (cluster_is_end(following) || following < 2) {
-                /* Out of room: grow the directory by one cluster. A run that
-                   was building at the tail cannot continue across the join,
-                   because the new cluster is not adjacent in the chain sense
-                   this loop assumes - so it restarts there. */
-                boot_uint32_t added = allocate_cluster(fat, cluster, 1);
+                /* Out of room: grow the directory by one cluster. An entry set
+                   cannot straddle a cluster, so a run still building at the
+                   tail is given up and the new cluster starts a fresh one.
+                   Seal the tail before linking: the ENTRY_END slots left there
+                   are exactly what the run was made of, and they would hide
+                   the cluster we are about to attach. */
+                boot_uint32_t added;
+                if (!seal_directory_cluster(fat, cluster, sector)) {
+                    free_page(sector);
+                    return 0;
+                }
+                added = allocate_cluster(fat, cluster, 1);
                 free_page(sector);
                 if (!added) return 0;
                 *out_cluster = added;
                 *out_index = 0;
-                return count <= fat->sectors_per_cluster * ENTRIES_PER_SECTOR;
+                return 1;
             }
+            /* A run may not cross into the next cluster either: the writer
+               addresses one cluster and would stop half-way through the set. */
+            run = 0;
             cluster = following;
         }
     }
@@ -1493,6 +1540,628 @@ int fat32_set_attributes(VOLUME* volume, const FAT_ENTRY* entry,
     ok = write_volume_sector(fat, entry->entry_sector, sector);
     free_page(sector);
     return ok;
+}
+
+/* ---- Checking a volume ---------------------------------------------------
+ *
+ * The order of the passes is not arbitrary. The copies of the allocation table
+ * are compared first, while the disk still holds exactly what it held before
+ * this ran - any repair afterwards writes through the cache, which goes out to
+ * every copy at once and would make them agree by accident. Then the
+ * directories, which is where reachability is established. Only then can
+ * anything be called lost, because "lost" means "allocated and not reached",
+ * and that is a claim about a walk that has finished.
+ */
+
+#define CHECK_PATH_MAX 72
+#define CHECK_QUEUE_START 64
+#define CHECK_LONG_RUN_MAX 20        /* 20 * 13 characters is the FAT limit */
+#define CHECK_CHAIN_MAX 65536        /* clusters in one directory, at most */
+#define CLUSTER_BAD 0x0FFFFFF7U
+
+typedef struct {
+    boot_uint32_t cluster;
+    boot_uint32_t parent;            /* 0 for the root, whose parent is itself */
+    char path[CHECK_PATH_MAX];
+} CHECK_DIRECTORY;
+
+typedef struct {
+    FAT_VOLUME* fat;
+    int repair;
+    FAT_CHECK_REPORT report;
+    FAT_CHECK_RESULT* result;
+
+    /* One bit per cluster: reached from the root. Setting a bit that was
+       already set is the definition of a cross-link, so the structure that
+       finds lost clusters finds those too, without a second walk. */
+    boot_uint8_t* seen;
+
+    /* Directories still to visit. A queue and not recursion: the depth of a
+       directory tree is whatever somebody made it, and a corrupt volume can
+       describe one that never ends. */
+    CHECK_DIRECTORY* queue;
+    boot_uint32_t queue_count;
+    boot_uint32_t queue_read;
+    boot_uint32_t queue_limit;
+} CHECK;
+
+static void check_note(CHECK* check, FAT_FAULT fault, const char* where,
+                       boot_uint64_t number, int repaired) {
+    check->result->faults++;
+    if (repaired) check->result->repaired++;
+    if (check->report) check->report(fault, where, number, repaired);
+}
+
+static int cluster_in_range(const FAT_VOLUME* fat, boot_uint32_t cluster) {
+    return cluster >= 2 && cluster < fat->cluster_count + 2;
+}
+
+static int check_seen(const CHECK* check, boot_uint32_t cluster) {
+    return (check->seen[cluster >> 3] >> (cluster & 7)) & 1;
+}
+
+static void check_mark(CHECK* check, boot_uint32_t cluster) {
+    check->seen[cluster >> 3] |= (boot_uint8_t)(1u << (cluster & 7));
+}
+
+/* Paths are for the person reading the report, so a long one is truncated
+   rather than allowed to decide how much memory the queue needs. */
+static void check_join(char* output, const char* parent, const char* name) {
+    boot_uint32_t length = 0;
+
+    while (parent[length] && length < CHECK_PATH_MAX - 1) {
+        output[length] = parent[length];
+        length++;
+    }
+    if (length && output[length - 1] != '\\' && length < CHECK_PATH_MAX - 1)
+        output[length++] = '\\';
+    for (boot_uint32_t index = 0; name[index] && length < CHECK_PATH_MAX - 1;
+         index++)
+        output[length++] = name[index];
+    output[length] = 0;
+}
+
+static int check_queue(CHECK* check, boot_uint32_t cluster, boot_uint32_t parent,
+                       const char* path) {
+    CHECK_DIRECTORY* slot;
+
+    if (check->queue_count == check->queue_limit) {
+        boot_uint32_t grown = check->queue_limit * 2;
+        CHECK_DIRECTORY* bigger = (CHECK_DIRECTORY*)
+            kmalloc((boot_uint64_t)grown * sizeof(CHECK_DIRECTORY));
+        if (!bigger) return 0;
+        memcpy(bigger, check->queue,
+               (boot_uint64_t)check->queue_count * sizeof(CHECK_DIRECTORY));
+        kfree(check->queue);
+        check->queue = bigger;
+        check->queue_limit = grown;
+    }
+    slot = &check->queue[check->queue_count++];
+    slot->cluster = cluster;
+    slot->parent = parent;
+    for (boot_uint32_t index = 0; index < CHECK_PATH_MAX; index++) {
+        slot->path[index] = path[index];
+        if (!path[index]) break;
+    }
+    slot->path[CHECK_PATH_MAX - 1] = 0;
+    return 1;
+}
+
+/* Follow one file's chain, marking every cluster it holds. Returns the number
+   of clusters counted. */
+static boot_uint32_t check_file_chain(CHECK* check, boot_uint32_t first,
+                                      const char* path) {
+    FAT_VOLUME* fat = check->fat;
+    boot_uint32_t cluster = first;
+    boot_uint32_t previous = 0;
+    boot_uint32_t count = 0;
+
+    while (cluster_in_range(fat, cluster)) {
+        boot_uint32_t following;
+
+        if (check_seen(check, cluster)) {
+            /* Two files claiming one cluster and a chain that has looped back
+               into itself are the same picture from here, and both mean the
+               walk stops or it never ends. Cutting the chain is the only
+               repair that terminates; somebody loses data either way, so it
+               happens only when repairs were asked for. */
+            int cut = check->repair && previous != 0;
+            if (cut) (void)write_fat_entry(fat, previous, CLUSTER_MASK);
+            check_note(check, FAT_FAULT_CROSS_LINKED, path, cluster, cut);
+            break;
+        }
+        check_mark(check, cluster);
+        count++;
+
+        following = next_cluster(fat, cluster);
+        if (cluster_is_end(following)) break;
+        if (!cluster_in_range(fat, following)) {
+            int cut = check->repair;
+            if (cut) (void)write_fat_entry(fat, cluster, CLUSTER_MASK);
+            check_note(check, FAT_FAULT_BAD_LINK, path, following, cut);
+            break;
+        }
+        previous = cluster;
+        cluster = following;
+    }
+    return count;
+}
+
+/* Cut a chain down to `keep` clusters and give the rest back. */
+static void check_truncate(CHECK* check, boot_uint32_t first,
+                           boot_uint32_t keep) {
+    FAT_VOLUME* fat = check->fat;
+    boot_uint32_t cluster = first;
+    boot_uint32_t surplus;
+
+    while (keep > 1 && cluster_in_range(fat, cluster)) {
+        boot_uint32_t following = next_cluster(fat, cluster);
+        if (!cluster_in_range(fat, following)) return;
+        cluster = following;
+        keep--;
+    }
+    if (!cluster_in_range(fat, cluster)) return;
+    surplus = next_cluster(fat, cluster);
+    (void)write_fat_entry(fat, cluster, CLUSTER_MASK);
+    if (cluster_in_range(fat, surplus)) free_chain(fat, surplus);
+}
+
+/* Where the last live entry of a directory sits, counted in slots from the
+ * start of its chain, or -1 when the directory holds nothing.
+ *
+ * This is the whole reason the directory is read twice. An end-of-directory
+ * marker is correct when nothing follows it and a catastrophe when something
+ * does, and there is no way to tell those apart while reading forwards - the
+ * reader that stops at the marker is exactly the reader that cannot see what
+ * it is hiding. */
+static long check_last_live(CHECK* check, boot_uint32_t start,
+                            boot_uint8_t* sector) {
+    FAT_VOLUME* fat = check->fat;
+    boot_uint32_t cluster = start;
+    boot_uint32_t ordinal = 0;
+    boot_uint32_t per_cluster = fat->sectors_per_cluster * ENTRIES_PER_SECTOR;
+    long last = -1;
+
+    /* This pass runs before anything is marked, so it cannot use the bitmap to
+       notice a chain that loops - and a looped directory would otherwise be
+       read until the cluster count ran out, which on a large volume is minutes
+       of disk with nothing on the screen. The cap is far past any directory
+       anybody will ever make and far short of that wait. */
+    while (cluster_in_range(fat, cluster) && ordinal < CHECK_CHAIN_MAX) {
+        boot_uint32_t following;
+
+        for (boot_uint32_t index = 0; index < fat->sectors_per_cluster; index++) {
+            if (!read_volume_sector(fat, cluster_first_sector(fat, cluster) + index,
+                                    sector))
+                return last;
+            for (boot_uint32_t slot = 0; slot < ENTRIES_PER_SECTOR; slot++) {
+                boot_uint8_t first = sector[slot * DIRECTORY_ENTRY_SIZE];
+                if (first == ENTRY_END || first == ENTRY_FREE) continue;
+                last = (long)(ordinal * per_cluster +
+                              index * ENTRIES_PER_SECTOR + slot);
+            }
+        }
+        following = next_cluster(fat, cluster);
+        if (!cluster_in_range(fat, following)) break;
+        cluster = following;
+        ordinal++;
+    }
+    return last;
+}
+
+/* Walk one directory: every slot of every cluster it owns. */
+static void check_directory(CHECK* check, boot_uint32_t index) {
+    FAT_VOLUME* fat = check->fat;
+    boot_uint32_t start = check->queue[index].cluster;
+    boot_uint32_t parent = check->queue[index].parent;
+    char path[CHECK_PATH_MAX];
+    boot_uint8_t* sector;
+    boot_uint32_t per_cluster = fat->sectors_per_cluster * ENTRIES_PER_SECTOR;
+    boot_uint32_t cluster_bytes = fat->sectors_per_cluster * fat->bytes_per_sector;
+    boot_uint32_t cluster = start;
+    boot_uint32_t ordinal = 0;
+    long last_live;
+
+    /* Long-name state, carried across slots and sectors. The positions are
+       kept so a run that turns out to belong to nothing can be marked free. */
+    char long_name[FAT_NAME_MAX];
+    int long_valid = 0;
+    boot_uint8_t long_checksum = 0;
+    boot_uint64_t long_sector[CHECK_LONG_RUN_MAX];
+    boot_uint32_t long_offset[CHECK_LONG_RUN_MAX];
+    boot_uint32_t long_count = 0;
+
+    memcpy(path, check->queue[index].path, sizeof(path));
+    sector = (boot_uint8_t*)alloc_page();
+    if (!sector) {
+        check->result->complete = 0;
+        return;
+    }
+
+    last_live = check_last_live(check, start, sector);
+    check->result->directories++;
+
+    while (cluster_in_range(fat, cluster)) {
+        boot_uint32_t following;
+
+        /* The first cluster was marked when the directory was queued; every
+           one after it is marked here, and a cluster already marked means the
+           chain has run into somebody else's - or its own tail. */
+        if (ordinal > 0) {
+            if (check_seen(check, cluster)) {
+                check_note(check, FAT_FAULT_CROSS_LINKED, path, cluster, 0);
+                break;
+            }
+            check_mark(check, cluster);
+        }
+
+        for (boot_uint32_t sector_index = 0;
+             sector_index < fat->sectors_per_cluster; sector_index++) {
+            boot_uint64_t number = cluster_first_sector(fat, cluster) + sector_index;
+            int dirty = 0;
+
+            if (!read_volume_sector(fat, number, sector)) {
+                check->result->complete = 0;
+                goto done;
+            }
+
+            for (boot_uint32_t slot = 0; slot < ENTRIES_PER_SECTOR; slot++) {
+                boot_uint32_t offset = slot * DIRECTORY_ENTRY_SIZE;
+                boot_uint8_t* raw = sector + offset;
+                long position = (long)(ordinal * per_cluster +
+                                       sector_index * ENTRIES_PER_SECTOR + slot);
+                char name[FAT_NAME_MAX];
+                boot_uint32_t first_cluster;
+                boot_uint32_t size;
+                boot_uint32_t held;
+                boot_uint32_t needed;
+                char child[CHECK_PATH_MAX];
+
+                if (raw[0] == ENTRY_END) {
+                    if (position < last_live) {
+                        int fixed = check->repair;
+                        if (fixed) { raw[0] = ENTRY_FREE; dirty = 1; }
+                        check_note(check, FAT_FAULT_TERMINATOR, path, cluster,
+                                   fixed);
+                    }
+                    long_count = 0;
+                    long_valid = 0;
+                    continue;
+                }
+                if (raw[0] == ENTRY_FREE) {
+                    long_count = 0;
+                    long_valid = 0;
+                    continue;
+                }
+
+                if ((raw[11] & FAT_ATTRIBUTE_LONG_NAME) == FAT_ATTRIBUTE_LONG_NAME) {
+                    if (raw[0] & LONG_NAME_LAST) {
+                        memset(long_name, 0, sizeof(long_name));
+                        long_checksum = raw[13];
+                        long_valid = 1;
+                        long_count = 0;
+                    }
+                    if (long_valid && raw[13] != long_checksum) long_valid = 0;
+                    if (long_valid) gather_long_name(raw, long_name);
+                    if (long_count < CHECK_LONG_RUN_MAX) {
+                        long_sector[long_count] = number;
+                        long_offset[long_count] = offset;
+                        long_count++;
+                    }
+                    continue;
+                }
+
+                /* A short entry. Whatever long-name run preceded it either
+                   belongs to it or belongs to nothing. */
+                if (long_count &&
+                    (!long_valid || long_checksum != short_name_checksum(raw))) {
+                    int fixed = check->repair;
+                    if (fixed) {
+                        for (boot_uint32_t run = 0; run < long_count; run++) {
+                            if (long_sector[run] == number) {
+                                sector[long_offset[run]] = ENTRY_FREE;
+                                dirty = 1;
+                            } else {
+                                (void)mark_entry_free(fat, long_sector[run],
+                                                      long_offset[run]);
+                            }
+                        }
+                    }
+                    check_note(check, FAT_FAULT_ORPHAN_LONG_NAME, path,
+                               long_count, fixed);
+                    long_valid = 0;
+                }
+
+                if (long_valid && long_name[0] &&
+                    long_checksum == short_name_checksum(raw)) {
+                    memcpy(name, long_name, strlen(long_name) + 1);
+                } else {
+                    format_short_name(raw, name);
+                }
+                long_count = 0;
+                long_valid = 0;
+
+                if (raw[11] & FAT_ATTRIBUTE_VOLUME_LABEL) continue;
+
+                first_cluster = ((boot_uint32_t)read16(raw + 20) << 16) |
+                                read16(raw + 26);
+
+                /* "." and ".." are not children. They are two claims about
+                   where this directory sits, and a wrong ".." sends anything
+                   walking upwards into another directory entirely. */
+                if (name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2]))) {
+                    boot_uint32_t expected = name[1] ? parent : start;
+                    /* The root is written as cluster 0 in a ".." entry, which
+                       is the specification and not a mistake. */
+                    if (expected == fat->root_cluster && name[1]) expected = 0;
+                    if (first_cluster != expected) {
+                        int fixed = check->repair;
+                        if (fixed) {
+                            write16(raw + 20, (boot_uint16_t)(expected >> 16));
+                            write16(raw + 26, (boot_uint16_t)expected);
+                            dirty = 1;
+                        }
+                        check_note(check, FAT_FAULT_PARENT_WRONG, path,
+                                   first_cluster, fixed);
+                    }
+                    continue;
+                }
+
+                check_join(child, path, name);
+
+                if (raw[11] & FAT_ATTRIBUTE_DIRECTORY) {
+                    if (!cluster_in_range(fat, first_cluster)) {
+                        check_note(check, FAT_FAULT_BAD_LINK, child,
+                                   first_cluster, 0);
+                        continue;
+                    }
+                    if (check_seen(check, first_cluster)) {
+                        check_note(check, FAT_FAULT_CROSS_LINKED, child,
+                                   first_cluster, 0);
+                        continue;
+                    }
+                    check_mark(check, first_cluster);
+                    if (!check_queue(check, first_cluster, start, child)) {
+                        check_note(check, FAT_FAULT_TOO_COMPLEX, child, 0, 0);
+                        check->result->complete = 0;
+                    }
+                    continue;
+                }
+
+                size = read32(raw + 28);
+                check->result->files++;
+                check->result->bytes_in_files += size;
+
+                if (first_cluster == 0) {
+                    /* No clusters at all. An empty file is normal; one that
+                       claims a size is describing bytes that were never
+                       anywhere. */
+                    if (size != 0) {
+                        int fixed = check->repair;
+                        if (fixed) { write32(raw + 28, 0); dirty = 1; }
+                        check_note(check, FAT_FAULT_SIZE_TOO_SMALL, child,
+                                   size, fixed);
+                    }
+                    continue;
+                }
+                if (!cluster_in_range(fat, first_cluster)) {
+                    check_note(check, FAT_FAULT_BAD_LINK, child, first_cluster, 0);
+                    continue;
+                }
+
+                held = check_file_chain(check, first_cluster, child);
+                needed = (size + cluster_bytes - 1) / cluster_bytes;
+                if (needed > held) {
+                    /* The file claims bytes that no cluster holds. Reading it
+                       would run off the end of what it owns, so the size comes
+                       down to what is actually there. */
+                    int fixed = check->repair;
+                    if (fixed) {
+                        write32(raw + 28, held * cluster_bytes);
+                        dirty = 1;
+                    }
+                    check_note(check, FAT_FAULT_SIZE_TOO_SMALL, child, size,
+                               fixed);
+                } else if (held > needed) {
+                    int fixed = check->repair;
+                    if (fixed) check_truncate(check, first_cluster, needed);
+                    check_note(check, FAT_FAULT_SIZE_TOO_LARGE, child,
+                               held - needed, fixed);
+                }
+            }
+
+            if (dirty && !write_volume_sector(fat, number, sector))
+                check->result->complete = 0;
+        }
+
+        following = next_cluster(fat, cluster);
+        if (!cluster_in_range(fat, following)) break;
+        cluster = following;
+        ordinal++;
+    }
+
+done:
+    free_page(sector);
+}
+
+/* The copies of the allocation table, compared sector by sector. */
+static void check_fat_copies(CHECK* check) {
+    FAT_VOLUME* fat = check->fat;
+    boot_uint32_t per_pass = (boot_uint32_t)(PAGE_SIZE / fat->bytes_per_sector);
+    boot_uint8_t* first = (boot_uint8_t*)alloc_page();
+    boot_uint8_t* other = (boot_uint8_t*)alloc_page();
+    boot_uint32_t differences = 0;
+    int repaired = 0;
+
+    if (fat->fat_count < 2 || !first || !other) {
+        if (fat->fat_count >= 2) check->result->complete = 0;
+        if (first) free_page(first);
+        if (other) free_page(other);
+        return;
+    }
+
+    for (boot_uint32_t copy = 1; copy < fat->fat_count; copy++) {
+        for (boot_uint32_t offset = 0; offset < fat->sectors_per_fat;
+             offset += per_pass) {
+            boot_uint32_t run = fat->sectors_per_fat - offset;
+            boot_uint64_t here = fat->reserved_sectors + offset;
+            boot_uint64_t there = here + (boot_uint64_t)copy * fat->sectors_per_fat;
+
+            if (run > per_pass) run = per_pass;
+            if (!read_volume_sectors(fat, here, run, first) ||
+                !read_volume_sectors(fat, there, run, other)) {
+                check->result->complete = 0;
+                goto done;
+            }
+            if (memcmp(first, other, run * fat->bytes_per_sector) == 0) continue;
+            /* Read a page at a time because a sector at a time is a command
+               round trip per 512 bytes, but count a sector at a time: "eight
+               sectors differ" when one of them does is a number that would
+               send somebody looking for damage that is not there. */
+            for (boot_uint32_t index = 0; index < run; index++)
+                if (memcmp(first + index * fat->bytes_per_sector,
+                           other + index * fat->bytes_per_sector,
+                           fat->bytes_per_sector) != 0)
+                    differences++;
+            if (check->repair) {
+                if (write_volume_sectors(fat, there, run, first)) repaired = 1;
+                else check->result->complete = 0;
+            }
+        }
+    }
+
+done:
+    if (differences)
+        check_note(check, FAT_FAULT_FAT_COPIES_DIFFER, "", differences,
+                   repaired);
+    free_page(first);
+    free_page(other);
+}
+
+/* Everything allocated that nothing reached, and what the free count should
+   have said. Both come out of one walk of the table. */
+static void check_lost(CHECK* check) {
+    FAT_VOLUME* fat = check->fat;
+    boot_uint32_t per_sector = fat->bytes_per_sector / 4;
+    boot_uint32_t lost = 0;
+    boot_uint32_t free_clusters = 0;
+    boot_uint32_t used = 0;
+    /* "Lost" is not a property of a cluster. It is the conclusion of a walk
+       that reached everything else, and a walk that gave up partway did not
+       earn it - the clusters it never reached look exactly like the clusters
+       that belong to nothing. Freeing those would be this checker destroying
+       live files, so an unfinished walk reports and does not touch. */
+    int may_free = check->repair && check->result->complete;
+
+    /* Read the table rather than ask next_cluster, which answers a failed read
+       and an end-of-chain with the same value. Here that difference decides
+       whether a cluster is freed, and freeing one because a sector could not
+       be read would be this checker doing the damage it exists to undo. */
+    for (boot_uint32_t index = 0; index < fat->sectors_per_fat; index++) {
+        for (boot_uint32_t slot = 0; slot < per_sector; slot++) {
+            boot_uint32_t cluster = index * per_sector + slot;
+            boot_uint8_t* sector = fat_sector(fat, index);
+            boot_uint32_t value;
+
+            if (!sector) { check->result->complete = 0; return; }
+            if (cluster < 2) continue;
+            if (cluster >= fat->cluster_count + 2) break;
+
+            value = read32(sector + slot * 4) & CLUSTER_MASK;
+            if (value == CLUSTER_FREE) { free_clusters++; continue; }
+            if (value == CLUSTER_BAD) continue;   /* marked bad, and left alone */
+            used++;
+            if (check_seen(check, cluster)) continue;
+            lost++;
+            if (may_free && write_fat_entry(fat, cluster, CLUSTER_FREE)) {
+                free_clusters++;
+                used--;
+            }
+        }
+    }
+
+    check->result->clusters_used = used;
+    check->result->clusters_free = free_clusters;
+    check->result->clusters_lost = lost;
+    if (lost)
+        check_note(check, FAT_FAULT_LOST_CLUSTERS, "", lost, may_free);
+
+    /* The free-cluster hint next to the boot sector is advisory, but a wrong
+       one is what every other system will quote back at the user. */
+    {
+        boot_uint8_t* sector = (boot_uint8_t*)alloc_page();
+        if (!sector) return;
+        if (read_volume_sector(fat, FSINFO_SECTOR, sector) &&
+            read32(sector) == FSINFO_LEAD_SIGNATURE &&
+            read32(sector + 484) == FSINFO_STRUCT_SIGNATURE) {
+            boot_uint32_t stored = read32(sector + FSINFO_FREE_COUNT_OFFSET);
+            if (stored != FSINFO_UNKNOWN && stored != free_clusters) {
+                fat->free_bytes = (boot_uint64_t)free_clusters *
+                                  fat->sectors_per_cluster * fat->bytes_per_sector;
+                fat->free_bytes_known = 1;
+                if (check->repair) update_fsinfo(fat);
+                check_note(check, FAT_FAULT_FREE_COUNT_WRONG, "", stored,
+                           check->repair);
+            }
+        }
+        free_page(sector);
+    }
+    fat->free_bytes = (boot_uint64_t)free_clusters *
+                      fat->sectors_per_cluster * fat->bytes_per_sector;
+    fat->free_bytes_known = 1;
+}
+
+int fat32_check(VOLUME* volume, int repair, FAT_CHECK_REPORT report,
+                FAT_CHECK_RESULT* result) {
+    FAT_VOLUME* fat = mount_for(volume);
+    CHECK check;
+    boot_uint64_t bitmap_bytes;
+    boot_uint64_t bitmap_pages;
+
+    if (!fat || !result) return 0;
+    memset(result, 0, sizeof(*result));
+    result->complete = 1;
+    result->clusters_total = fat->cluster_count;
+    result->cluster_bytes = fat->sectors_per_cluster * fat->bytes_per_sector;
+    result->entries_per_cluster = fat->sectors_per_cluster * ENTRIES_PER_SECTOR;
+
+    memset(&check, 0, sizeof(check));
+    check.fat = fat;
+    check.repair = repair;
+    check.report = report;
+    check.result = result;
+
+    bitmap_bytes = ((boot_uint64_t)fat->cluster_count + 2 + 7) / 8;
+    bitmap_pages = (bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    check.seen = (boot_uint8_t*)alloc_pages(bitmap_pages);
+    if (!check.seen) return 0;
+    memset(check.seen, 0, bitmap_pages * PAGE_SIZE);
+
+    check.queue_limit = CHECK_QUEUE_START;
+    check.queue = (CHECK_DIRECTORY*)
+        kmalloc((boot_uint64_t)check.queue_limit * sizeof(CHECK_DIRECTORY));
+    if (!check.queue) {
+        free_pages(check.seen, bitmap_pages);
+        return 0;
+    }
+
+    /* Whatever is held in memory goes to the disk first: the comparison of the
+       table's copies is a statement about the disk, and a cached sector that
+       has not been written back would make it a statement about neither. */
+    commit(fat);
+    check_fat_copies(&check);
+
+    check_mark(&check, fat->root_cluster);
+    (void)check_queue(&check, fat->root_cluster, fat->root_cluster, "\\");
+    while (check.queue_read < check.queue_count)
+        check_directory(&check, check.queue_read++);
+
+    check_lost(&check);
+    commit(fat);
+
+    kfree(check.queue);
+    free_pages(check.seen, bitmap_pages);
+    return 1;
 }
 
 /* ---- Making a filesystem ------------------------------------------------ */

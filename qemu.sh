@@ -268,16 +268,30 @@ for program in build/*.EXE; do
     # into a directory of its own by dosget, and it goes there below - both
     # because that is where it will actually live on a real machine, and so
     # that testing it here tests the layout it is shipped in.
-    [ "$(basename "$program")" = "mizu.EXE" ] && continue
+    case "$(basename "$program")" in
+        commander.EXE|cmdrcfg.EXE|mizu.EXE|mizucfg.EXE) continue ;;
+    esac
     mcopy -o -i "$SYSVOL" "$program" "::/BIN/$(basename "$program" | tr 'a-z' 'A-Z')"
 done
 
-# Mizu, where `dosget install mizu` would have put it. On release media it is
-# absent entirely: the graphical shell arrives over the wire, and a system
-# without it is the same system.
+# Koi-Commander, where `dosget install commander` would have put it. On release
+# media it is absent entirely: it arrives over the wire, and a system without
+# it is the same system.
+if [ -f build/commander.EXE ]; then
+    mmd -i "$SYSVOL" ::/COMMANDER 2>/dev/null || true
+    mcopy -o -i "$SYSVOL" build/commander.EXE ::/COMMANDER/COMMANDER.EXE
+    # The first-run questions travel with it, not in \BIN: they are part of
+    # the package and mean nothing on a machine that has not got it.
+    [ -f build/cmdrcfg.EXE ] && \
+        mcopy -o -i "$SYSVOL" build/cmdrcfg.EXE ::/COMMANDER/CMDRCFG.EXE
+fi
+
+# Mizu, the desktop, in a directory of its own for the same reason.
 if [ -f build/mizu.EXE ]; then
     mmd -i "$SYSVOL" ::/MIZU 2>/dev/null || true
     mcopy -o -i "$SYSVOL" build/mizu.EXE ::/MIZU/MIZU.EXE
+    [ -f build/mizucfg.EXE ] && \
+        mcopy -o -i "$SYSVOL" build/mizucfg.EXE ::/MIZU/MIZUCFG.EXE
 fi
 
 # The licence, for the installer to show and for anyone who looks.

@@ -75,4 +75,13 @@ void graphics_blit(const void* pixels, int x, int y, int width, int height,
 void graphics_text(int x, int y, const char* text, boot_uint32_t color,
                    boot_uint32_t background, int transparent);
 
+/* The same, with a style applied to the glyphs the font already has. */
+#define GRAPHICS_TEXT_BOLD 1
+#define GRAPHICS_TEXT_ITALIC 2
+#define GRAPHICS_TEXT_UNDERLINE 4
+
+void graphics_text_styled(int x, int y, const char* text, boot_uint32_t color,
+                          boot_uint32_t background, int transparent,
+                          int style);
+
 #endif

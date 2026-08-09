@@ -137,6 +137,18 @@ static inline void koi_cls(void) {
     koi_call(SYS_CLS, 0, 0, 0);
 }
 
+/* Put the cursor somewhere, in columns and rows. The screen's size is
+   KOI_INFO_TEXT_COLUMNS and KOI_INFO_TEXT_ROWS. What separates a program that
+   prints from a program that has a screen. */
+static inline void koi_gotoxy(int column, int row) {
+    (void)koi_call(SYS_GOTOXY, KOI_POINT(column, row), 0, 0);
+}
+
+/* Hide the cursor while redrawing, so it does not race across the screen. */
+static inline void koi_cursor(int visible) {
+    (void)koi_call(SYS_CURSOR, visible, 0, 0);
+}
+
 static inline void koi_color(int foreground, int background) {
     koi_call(SYS_SETCOLOR, foreground, background, 0);
 }
@@ -339,6 +351,18 @@ static inline void koi_gfx_text(int x, int y, const char* text,
                     background);
 }
 
+/* The same, with KOI_TEXT_BOLD, KOI_TEXT_ITALIC and KOI_TEXT_UNDERLINE - made
+   from the glyphs the font already carries, so they cost no font data and go
+   on working when a different font is fitted. */
+static inline void koi_gfx_text_styled(int x, int y, const char* text,
+                                       koi_uint32 color, long background,
+                                       int style) {
+    (void)koi_call4(SYS_GFX_TEXT_STYLED, KOI_POINT(x, y), (long)text,
+                    (long)color,
+                    (background & 0xFFFFFFFFL) |
+                    ((long)(style & 0xFF) << 32));
+}
+
 /* ---- Running something else ----------------------------------------------
  *
  * A program cannot call another program: one runs at a time, at a fixed
@@ -355,6 +379,53 @@ static inline void koi_gfx_text(int x, int y, const char* text,
  * save anything worth keeping before calling this. */
 static inline int koi_chain(const char* command) {
     return (int)koi_call(SYS_CHAIN, (long)command, 0, 0);
+}
+
+/* ---- The log -------------------------------------------------------------
+ *
+ * The kernel's log, not a log of its own. Two logs of one run have to be
+ * interleaved afterwards by somebody guessing at the order, and knowing the
+ * order is the whole value of a log.
+ *
+ * koi_log_bytes is the important one: everything else a program can report is
+ * what it believed, and this is what is actually there. Use it whenever a
+ * check fails - the dump taken at the moment of failure is the one nobody can
+ * take afterwards. */
+static inline void koi_log(const char* text) {
+    (void)koi_call(SYS_LOG, (long)text, 0, 0);
+}
+
+static inline void koi_log_bytes(const char* label, const void* data,
+                                 long length) {
+    (void)koi_call(SYS_LOG_BYTES, (long)label, (long)data, length);
+}
+
+/* One sector, straight off a disk. Read-only, and it grants nothing a program
+   did not already have - programs run in ring 0 - it makes looking at the
+   bytes a deliberate act rather than an accident. `buffer` must hold
+   koi_sector_size(disk) bytes. Returns that size, or -1. */
+static inline long koi_sector_read(long disk, koi_uint64 lba, void* buffer) {
+    return koi_call(SYS_SECTOR_READ, disk, (long)lba, (long)buffer);
+}
+
+static inline long koi_sector_size(long disk) {
+    return koi_call(SYS_SECTOR_SIZE, disk, 0, 0);
+}
+
+/* ---- The clipboard -------------------------------------------------------
+ *
+ * One buffer, in the kernel, outliving the program that filled it - which is
+ * the only arrangement that can carry anything between two programs, and
+ * therefore the only arrangement anybody wants. Text only.
+ *
+ * koi_clip_get with a null buffer returns the length without copying, so a
+ * caller can find out how much room to make before making it. */
+static inline long koi_clip_put(const char* text, long length) {
+    return koi_call(SYS_CLIP_PUT, (long)text, length, 0);
+}
+
+static inline long koi_clip_get(char* buffer, long size) {
+    return koi_call(SYS_CLIP_GET, (long)buffer, size, 0);
 }
 
 /* ---- The pointer ---------------------------------------------------------

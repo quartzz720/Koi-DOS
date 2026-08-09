@@ -98,3 +98,53 @@ void serial_write_dec(boot_uint64_t value) {
     } while (value);
     serial_write(&buffer[index]);
 }
+
+/* See serial.h. Written through serial_write so it lands in every place the
+   log goes - COM1, the memory ring that `log` prints, and the file that gets
+   written at boot - rather than only down the wire nobody has attached. */
+void serial_write_bytes(const char* label, const void* data,
+                        boot_uint32_t length) {
+    const boot_uint8_t* bytes = (const boot_uint8_t*)data;
+    static const char* digits = "0123456789ABCDEF";
+    char line[80];
+
+    if (label) { serial_write(label); serial_write("\n"); }
+    if (!bytes) { serial_write("  (nothing to show)\n"); return; }
+
+    for (boot_uint32_t at = 0; at < length; at += 16) {
+        boot_uint32_t index = 0;
+        boot_uint32_t run = length - at < 16 ? length - at : 16;
+
+        /* The offset, four hex digits. Dumps here are sectors and directory
+           entries; anything needing more than 65536 has a bigger problem than
+           its formatting. */
+        for (int shift = 12; shift >= 0; shift -= 4)
+            line[index++] = digits[(at >> shift) & 0xF];
+        line[index++] = ' ';
+        line[index++] = ' ';
+
+        for (boot_uint32_t byte = 0; byte < 16; byte++) {
+            if (byte < run) {
+                line[index++] = digits[bytes[at + byte] >> 4];
+                line[index++] = digits[bytes[at + byte] & 0xF];
+            } else {
+                line[index++] = ' ';
+                line[index++] = ' ';
+            }
+            line[index++] = ' ';
+            /* A gap down the middle, which is what makes counting to the
+               eleventh byte possible without counting. */
+            if (byte == 7) line[index++] = ' ';
+        }
+
+        line[index++] = '|';
+        for (boot_uint32_t byte = 0; byte < run; byte++) {
+            boot_uint8_t value = bytes[at + byte];
+            line[index++] = (value >= 0x20 && value < 0x7F) ? (char)value : '.';
+        }
+        line[index++] = '|';
+        line[index++] = '\n';
+        line[index] = 0;
+        serial_write(line);
+    }
+}

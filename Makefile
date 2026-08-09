@@ -24,7 +24,7 @@ KERNEL_ELF = kernel/kernel.elf
 KERNEL_IMAGE = $(EFI_DIR)/KERNEL.ELF
 BUILD_HEADER = kernel/build.h
 
-KERNEL_SOURCES = kernel/kernel.c kernel/console.c kernel/font.c kernel/serial.c \
+KERNEL_SOURCES = kernel/kernel.c kernel/console.c kernel/font.c kernel/font_glyphs.c kernel/serial.c \
                  kernel/string.c kernel/memory.c kernel/cpu.c kernel/idt.c \
                  kernel/isr.S kernel/pic.c kernel/acpi.c kernel/keyboard.c \
                  kernel/heap.c kernel/paging.c kernel/rtc.c kernel/block.c \
@@ -60,8 +60,23 @@ PROGRAM_LDFLAGS = -nostdlib -no-pie -Wl,-T,programs/program.ld \
                   -Wl,-z,noexecstack -Wl,--gc-sections
 
 PROGRAM_SOURCES = $(wildcard programs/*.c)
+# Sources that are part of a program rather than a program of their own. The
+# SDK's koicc has always accepted several sources as one program - "there is no
+# linker to run afterwards and no object files to keep" - and this Makefile
+# could not, which made the tree less capable than the SDK it ships.
+PROGRAM_SHARED = programs/editcore.c programs/dialog.c programs/settings.c programs/window.c programs/language.c
+
 PROGRAMS = $(patsubst programs/%.c,build/%.EXE,\
-             $(filter-out programs/start.c programs/koilib.c,$(PROGRAM_SOURCES)))
+             $(filter-out programs/start.c programs/koilib.c $(PROGRAM_SHARED),\
+               $(PROGRAM_SOURCES)))
+
+# Which programs are built from more than their own file.
+build/edit.EXE: EXTRA_SOURCES = programs/editcore.c
+build/color.EXE: EXTRA_SOURCES = programs/settings.c
+build/mizu.EXE: EXTRA_SOURCES = programs/window.c programs/editcore.c programs/language.c programs/settings.c
+build/commander.EXE: EXTRA_SOURCES = programs/editcore.c programs/settings.c
+build/cmdrcfg.EXE: EXTRA_SOURCES = programs/dialog.c programs/settings.c
+build/mizucfg.EXE: EXTRA_SOURCES = programs/dialog.c programs/settings.c programs/language.c
 
 all: $(EFI_DIR)/BOOTX64.EFI $(KERNEL_IMAGE) $(PROGRAMS) sdk
 
@@ -70,19 +85,27 @@ all: $(EFI_DIR)/BOOTX64.EFI $(KERNEL_IMAGE) $(PROGRAMS) sdk
 # and rewritten only when it actually changes - otherwise every `make` would
 # relink the kernel whether or not anything moved. Outside a git checkout the
 # numbers fall back to zero rather than failing the build.
+#
+# KOI_BUILD_ID is a hash of the sources rather than the clock, for two reasons.
+# A timestamp would differ on every `make` and relink a kernel nobody changed.
+# And a commit is not enough to identify a build: everything worked on between
+# two commits carries the same `describe`, so a machine running a kernel from
+# an hour ago reports exactly what a machine running the newest one reports -
+# which is how an update that never landed looks identical to one that did.
 $(BUILD_HEADER): FORCE
-	@printf '#ifndef KERNEL_BUILD_H\n#define KERNEL_BUILD_H\n#define KOI_BUILD_NUMBER %s\n#define KOI_BUILD_DATE "%s"\n#define KOI_BUILD_COMMIT "%s"\n#endif\n' \
+	@printf '#ifndef KERNEL_BUILD_H\n#define KERNEL_BUILD_H\n#define KOI_BUILD_NUMBER %s\n#define KOI_BUILD_DATE "%s"\n#define KOI_BUILD_COMMIT "%s"\n#define KOI_BUILD_ID "%s"\n#endif\n' \
 	  "$$(git rev-list --count HEAD 2>/dev/null || echo 0)" \
 	  "$$(date -u +%Y-%m-%d)" \
-	  "$$(git describe --always --dirty=+ --abbrev=7 2>/dev/null || echo unknown)" > $@.tmp
+	  "$$(git describe --always --dirty=+ --abbrev=7 2>/dev/null || echo unknown)" \
+	  "$$(cat $(KERNEL_SOURCES) $(filter-out $(BUILD_HEADER),$(KERNEL_HEADERS)) 2>/dev/null | sha256sum | cut -c1-8)" > $@.tmp
 	@cmp -s $@.tmp $@ || mv -f $@.tmp $@
 	@rm -f $@.tmp
 
 FORCE:
 
-build/%.EXE: programs/%.c programs/start.c programs/koilib.c programs/koi.h programs/program.ld include/syscall.h
+build/%.EXE: programs/%.c programs/start.c programs/koilib.c programs/koi.h programs/program.ld include/syscall.h $(PROGRAM_SHARED) programs/editcore.h programs/dialog.h programs/settings.h programs/window.h programs/language.h
 	mkdir -p build
-	$(KERNEL_CC) $(PROGRAM_CFLAGS) $(PROGRAM_LDFLAGS) -o $@ $< programs/start.c programs/koilib.c
+	$(KERNEL_CC) $(PROGRAM_CFLAGS) $(PROGRAM_LDFLAGS) -o $@ $< $(EXTRA_SOURCES) programs/start.c programs/koilib.c
 
 $(EFI_DIR)/BOOTX64.EFI: boot/bootloader.c include/efi.h include/bootinfo.h include/elf.h
 	mkdir -p $(EFI_DIR)
