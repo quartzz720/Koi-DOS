@@ -77,7 +77,7 @@ build/color.EXE: EXTRA_SOURCES = programs/settings.c
 build/play.EXE: EXTRA_SOURCES = programs/wav.c
 build/mizu.EXE: EXTRA_SOURCES = programs/window.c programs/editcore.c programs/language.c programs/settings.c programs/wav.c
 build/commander.EXE: EXTRA_SOURCES = programs/editcore.c programs/settings.c
-build/cmdrcfg.EXE: EXTRA_SOURCES = programs/dialog.c programs/settings.c
+build/cmdrcfg.EXE: EXTRA_SOURCES = programs/dialog.c programs/settings.c programs/language.c
 build/mizucfg.EXE: EXTRA_SOURCES = programs/dialog.c programs/settings.c programs/language.c
 
 all: $(EFI_DIR)/BOOTX64.EFI $(KERNEL_IMAGE) $(PROGRAMS) sdk

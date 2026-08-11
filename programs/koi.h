@@ -363,6 +363,14 @@ static inline void koi_gfx_text_styled(int x, int y, const char* text,
                     ((long)(style & 0xFF) << 32));
 }
 
+static inline void koi_gfx_scissor(int x, int y, int width, int height) {
+    (void)koi_call(SYS_GFX_SCISSOR, KOI_POINT(x, y), KOI_POINT(width, height), 0);
+}
+
+static inline void koi_gfx_reset_scissor(void) {
+    (void)koi_call(SYS_GFX_SCISSOR_RESET, 0, 0, 0);
+}
+
 /* Run a command and come back when it has finished.
  *
  * This program stays in memory with everything it has; the one it starts gets

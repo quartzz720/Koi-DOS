@@ -33,12 +33,22 @@
 #define MENU_SAVE 12
 #define MENU_PLAYER 13
 #define MENU_STOP 14
+#define MENU_PAUSE 15
 
 static WINDOW* control_window;
 static WINDOW* clock_window;
 static WINDOW* about_window;
 static WINDOW* note_window;
 static WINDOW* player_window;
+
+static int current_volume_index(void) {
+    long count = koi_sysinfo(KOI_INFO_VOLUME_COUNT, 0);
+
+    for (long index = 0; index < count; index++)
+        if (koi_sysinfo(KOI_INFO_VOLUME_IS_CURRENT, index) == 1)
+            return (int)index;
+    return -1;
+}
 
 
 /* ---- The control panel ---------------------------------------------------
@@ -300,7 +310,7 @@ static void paint_note(WINDOW* window, int x, int y, int width, int height) {
 
     {
         int row = (int)(caret_line - note_top_line);
-        long column = note.cursor - edit_line_start(&note, caret_line);
+        long column = edit_column_of(&note, note.cursor);
         if (row >= 0 && row < rows)
             koi_gfx_fill(x + 2 + (int)column * WINDOW_CHAR_W,
                          y + row * WINDOW_CHAR_H, 2, WINDOW_CHAR_H,
@@ -343,79 +353,208 @@ static void key_note(WINDOW* window, int key) {
  * a voice still points into it is the one way to make this crash, so the
  * buffer is freed when the voice is stopped and never before.
  */
-#define PLAYER_FILES 32
-#define PLAYER_NAME 32
-#define PLAYER_BYTES (4L * 1024L * 1024L)
+#define PLAYER_FILES 64
+#define PLAYER_PATH 96
 
-static char tracks[PLAYER_FILES][PLAYER_NAME];
+/* Whole files, in memory, for as long as they play.
+ *
+ * The mixer reads the samples where they are rather than copying them, so a
+ * track is resident from the moment it starts until it is stopped. There is no
+ * streaming: nothing in the audio interface can ask a program for more samples
+ * partway through, and inventing that is a bigger change than a player.
+ *
+ * So the limit is memory, and it used to be a made-up four megabytes - which
+ * at CD rates is twenty-three seconds, and is the sort of number that gets
+ * written once and then quietly decides what the software is for. SYS_ALLOC
+ * goes straight to the page allocator, so what is actually available is most
+ * of the machine. A file is now measured before it is read and given exactly
+ * what it needs, up to half of what is free - half, so that starting a long
+ * track cannot leave the rest of the system with nothing. */
+static char tracks[PLAYER_FILES][PLAYER_PATH];
+static char player_message[80];
 static int track_count;
 static int track_playing = -1;
 static void* track_data;
+static unsigned int track_data_at;
 static int voice = -1;
 static WAV_FORMAT voice_format;
 static unsigned int voice_frames;
+static unsigned int player_paused_frame;
+static int player_paused;
+
+static void player_sync_pause_label(void) {
+    if (player_window) player_window->menus[0].items[0].label = player_paused ? "Resume" : "Pause";
+}
 
 static void player_stop(void) {
     if (voice >= 0) koi_sound_stop(voice);
     voice = -1;
     if (track_data) { koi_free(track_data); track_data = 0; }
     track_playing = -1;
+    player_paused = 0;
+    player_paused_frame = 0;
+    player_sync_pause_label();
 }
 
-static void player_scan(void) {
+static int player_start_from(unsigned int start_frame) {
+    if (start_frame >= voice_frames) return -1;
+    voice = koi_sound_play_simple((const char*)track_data + track_data_at,
+                                  voice_frames, voice_format.rate,
+                                  voice_format.bits == 16 ? KOI_SOUND_S16
+                                                          : KOI_SOUND_U8,
+                                  voice_format.channels, 255);
+    if (voice < 0) return -1;
+    if (start_frame && koi_sound_seek(voice, start_frame) < 0) {
+        koi_sound_stop(voice);
+        voice = -1;
+        return -1;
+    }
+    return 0;
+}
+
+static void player_pause(void) {
+    if (voice < 0 || !koi_sound_active(voice) || !track_data) return;
+    player_paused_frame = koi_sound_where(voice);
+    if (player_paused_frame >= voice_frames && voice_frames)
+        player_paused_frame = voice_frames - 1;
+    koi_sound_stop(voice);
+    voice = -1;
+    player_paused = 1;
+    player_message[0] = 0;
+    player_sync_pause_label();
+}
+
+static void player_resume(void) {
+    if (!player_paused || !track_data) return;
+    if (player_start_from(player_paused_frame) < 0) {
+        koi_snprintf(player_message, sizeof(player_message),
+                     "Every voice is busy");
+        return;
+    }
+    player_paused = 0;
+    player_paused_frame = 0;
+    player_message[0] = 0;
+    player_sync_pause_label();
+}
+
+static void player_toggle_pause(void) {
+    if (player_paused) player_resume();
+    else player_pause();
+}
+
+/* The root and the two directories somebody would actually keep music in.
+   Not a file browser: a player that can only see the root is a player nobody
+   can put a song in front of, and one that browses the disk is a different
+   program. */
+static void player_scan_in(const char* directory) {
     KOI_FIND_DATA found;
+    char pattern[PLAYER_PATH];
     long search;
 
-    track_count = 0;
-    search = koi_findfirst("\\*.WAV", &found);
+    koi_snprintf(pattern, sizeof(pattern), "%s*.WAV", directory);
+    search = koi_findfirst(pattern, &found);
     if (search < 0) return;
     do {
-        long at = 0;
         if (track_count >= PLAYER_FILES) break;
-        while (found.name[at] && at < PLAYER_NAME - 1) {
-            tracks[track_count][at] = found.name[at];
-            at++;
-        }
-        tracks[track_count][at] = 0;
+        koi_snprintf(tracks[track_count], PLAYER_PATH, "%s%s", directory,
+                     found.name);
         track_count++;
     } while (koi_findnext(search, &found) == 0);
     koi_findclose(search);
 }
 
+static void player_scan(void) {
+    track_count = 0;
+    player_scan_in("\\");
+    player_scan_in("\\MUSIC\\");
+    player_scan_in("\\WAV\\");
+}
+
+/* The last component of a path, which is what a list wants to show. */
+static const char* basename_of(const char* path) {
+    const char* last = path;
+    for (int at = 0; path[at]; at++)
+        if (path[at] == '\\') last = path + at + 1;
+    return last;
+}
+
 static void player_play(int index) {
-    char path[128];
     long handle;
+    long size;
     long got;
+    long affordable;
     unsigned int data_at = 0;
     unsigned int data_size;
     const char* why;
 
     if (index < 0 || index >= track_count) return;
     player_stop();
+    player_message[0] = 0;
 
-    koi_snprintf(path, sizeof(path), "\\%s", tracks[index]);
-    handle = koi_open(path, OPEN_READ);
-    if (handle < 0) return;
-    track_data = koi_alloc(PLAYER_BYTES);
-    if (!track_data) { koi_close(handle); return; }
-    got = koi_read(handle, track_data, PLAYER_BYTES);
+    handle = koi_open(tracks[index], OPEN_READ);
+    if (handle < 0) {
+        koi_snprintf(player_message, sizeof(player_message),
+                     "Could not open %s", basename_of(tracks[index]));
+        return;
+    }
+
+    size = koi_filesize(handle);
+    /* KOI_INFO_MEMORY_FREE is in KiB. Half of it, so that playing something
+       long does not leave the machine with nothing for anything else. */
+    affordable = koi_sysinfo(KOI_INFO_MEMORY_FREE, 0) / 2 * 1024;
+    if (size <= 0) {
+        koi_close(handle);
+        koi_snprintf(player_message, sizeof(player_message), "%s is empty",
+                     basename_of(tracks[index]));
+        return;
+    }
+    if (size > affordable) {
+        koi_close(handle);
+        /* Said with both numbers. "Out of memory" leaves somebody guessing
+           whether a slightly smaller file would have worked. */
+        koi_snprintf(player_message, sizeof(player_message),
+                     "%s is %ld KiB and only %ld KiB can be spared",
+                     basename_of(tracks[index]), size / 1024,
+                     affordable / 1024);
+        return;
+    }
+
+    track_data = koi_alloc(size);
+    if (!track_data) {
+        koi_close(handle);
+        koi_snprintf(player_message, sizeof(player_message),
+                     "No room for %ld KiB", size / 1024);
+        return;
+    }
+    got = koi_read(handle, track_data, size);
     koi_close(handle);
     if (got <= 0) { player_stop(); return; }
 
     data_size = wav_parse((const unsigned char*)track_data, (unsigned int)got,
                           &voice_format, &data_at, &why);
-    if (!data_size) { player_stop(); return; }
+    if (!data_size) {
+        player_stop();
+        koi_snprintf(player_message, sizeof(player_message), "%s: %s",
+                     basename_of(tracks[index]), why);
+        return;
+    }
 
+    track_data_at = data_at;
     voice_frames = data_size /
         (unsigned int)(voice_format.channels * (voice_format.bits / 8));
-    if (!voice_frames) { player_stop(); return; }
+    if (!voice_frames) {
+        player_stop();
+        koi_snprintf(player_message, sizeof(player_message),
+                     "%s has no samples in it", basename_of(tracks[index]));
+        return;
+    }
 
-    voice = koi_sound_play_simple((const char*)track_data + data_at,
-                                  voice_frames, voice_format.rate,
-                                  voice_format.bits == 16 ? KOI_SOUND_S16
-                                                          : KOI_SOUND_U8,
-                                  voice_format.channels, 255);
-    if (voice < 0) { player_stop(); return; }
+    if (player_start_from(0) < 0) {
+        player_stop();
+        koi_snprintf(player_message, sizeof(player_message),
+                     "Every voice is busy");
+        return;
+    }
     track_playing = index;
 }
 
@@ -433,7 +572,8 @@ static void paint_player(WINDOW* window, int x, int y, int width, int height) {
     char line[64];
     char left[16];
     char right[16];
-    unsigned int at = voice >= 0 ? koi_sound_where(voice) : 0;
+    unsigned int at = voice >= 0 ? koi_sound_where(voice)
+                                 : (player_paused ? player_paused_frame : 0);
     int rows = (height - LIST_TOP) / WINDOW_CHAR_H;
 
     (void)window;
@@ -441,29 +581,38 @@ static void paint_player(WINDOW* window, int x, int y, int width, int height) {
     /* The bar. Drawn even when nothing is playing, because a control that
        appears only once it is useful is a control nobody finds. */
     window_sunken(x + 8, y + BAR_TOP, width - 16, BAR_HEIGHT);
-    if (voice >= 0 && voice_frames) {
+    if ((voice >= 0 || player_paused) && voice_frames) {
         int span = (int)((koi_uint64)(width - 18) * at / voice_frames);
         koi_gfx_fill(x + 9, y + BAR_TOP + 1, span, BAR_HEIGHT - 2, window_accent);
     }
 
     clock_text(left, sizeof(left), at, voice_format.rate);
     clock_text(right, sizeof(right), voice_frames, voice_format.rate);
-    koi_snprintf(line, sizeof(line), "%s / %s   %s", left, right,
-                 track_playing >= 0 ? tracks[track_playing] : "");
-    window_label(x + 8, y + BAR_TOP + BAR_HEIGHT + 4, line, window_text);
+    /* A message where the name goes, when there is one. A player that does
+       nothing and says nothing is a player somebody thinks is broken. */
+    if (player_message[0]) {
+        window_label(x + 8, y + BAR_TOP + BAR_HEIGHT + 4, player_message,
+                     window_shadow);
+    } else {
+        koi_snprintf(line, sizeof(line), "%s / %s   %s", left, right,
+                     track_playing >= 0 ? basename_of(tracks[track_playing])
+                                        : "");
+        window_label(x + 8, y + BAR_TOP + BAR_HEIGHT + 4, line, window_text);
+    }
 
     for (int index = 0; index < track_count && index < rows; index++) {
         int row = y + LIST_TOP + index * WINDOW_CHAR_H;
         if (index == track_playing) {
             koi_gfx_fill(x + 4, row, width - 8, WINDOW_CHAR_H, window_accent);
-            window_label(x + 8, row, tracks[index], window_client_paper);
+            window_label(x + 8, row, basename_of(tracks[index]),
+                         window_client_paper);
         } else {
-            window_label(x + 8, row, tracks[index], window_text);
+            window_label(x + 8, row, basename_of(tracks[index]), window_text);
         }
     }
     if (!track_count)
-        window_label(x + 8, y + LIST_TOP, "No .WAV files in the root.",
-                     window_shadow);
+        window_label(x + 8, y + LIST_TOP,
+                     "No .WAV files in \\, \\MUSIC or \\WAV.", window_shadow);
 }
 
 static void click_player(WINDOW* window, int x, int y, int clicks) {
@@ -475,12 +624,13 @@ static void click_player(WINDOW* window, int x, int y, int clicks) {
     /* On the bar: seek. One click, not two - a bar is a place, and asking for
        a place twice is not a different request. */
     if (y >= BAR_TOP && y < BAR_TOP + BAR_HEIGHT) {
-        if (voice >= 0 && voice_frames && client_w > 18) {
+        if ((voice >= 0 || player_paused) && voice_frames && client_w > 18) {
             koi_uint64 frame = (koi_uint64)(x - 9) * voice_frames /
                                (koi_uint64)(client_w - 18);
             if (x < 9) frame = 0;
             if (frame >= voice_frames) frame = voice_frames - 1;
-            koi_sound_seek(voice, (unsigned int)frame);
+            if (voice >= 0) koi_sound_seek(voice, (unsigned int)frame);
+            else player_paused_frame = (unsigned int)frame;
             window_repaint();
         }
         return;
@@ -498,7 +648,11 @@ static void click_player(WINDOW* window, int x, int y, int clicks) {
 /* ---- About --------------------------------------------------------------- */
 
 static void paint_about(WINDOW* window, int x, int y, int width, int height) {
-    char line[80];
+    char line[96];
+    char cpu[64];
+    int current = current_volume_index();
+    long free_volume = current >= 0 ? koi_sysinfo(KOI_INFO_VOLUME_FREE_BYTES,
+                                                  current) : -1;
 
     (void)window;
     (void)width;
@@ -507,11 +661,20 @@ static void paint_about(WINDOW* window, int x, int y, int width, int height) {
     koi_snprintf(line, sizeof(line), "Koi-DOS build %ld",
                  koi_sysinfo(KOI_INFO_BUILD_NUMBER, 0));
     window_label(x + 12, y + 34, line, window_text);
-    window_label(x + 12, y + 58, say(SAY_ONE_AT_A_TIME_1), window_shadow);
-    window_label(x + 12, y + 74, say(SAY_ONE_AT_A_TIME_2), window_shadow);
-    koi_snprintf(line, sizeof(line), "%ld %s",
-                 koi_sysinfo(KOI_INFO_MEMORY_FREE, 0), say(SAY_FREE));
-    window_label(x + 12, y + 98, line, window_text);
+    if (koi_systext(KOI_TEXT_CPU_NAME, 0, cpu, sizeof(cpu)) <= 0)
+        strcpy(cpu, "unknown CPU");
+    koi_snprintf(line, sizeof(line), "CPU: %s", cpu);
+    window_label(x + 12, y + 58, line, window_text);
+    koi_snprintf(line, sizeof(line), "RAM: %ld / %ld %s",
+                 koi_sysinfo(KOI_INFO_MEMORY_FREE, 0),
+                 koi_sysinfo(KOI_INFO_MEMORY_TOTAL, 0), say(SAY_FREE));
+    window_label(x + 12, y + 74, line, window_text);
+    if (free_volume >= 0) {
+        char volume_letter = (char)koi_sysinfo(KOI_INFO_VOLUME_LETTER, current);
+        koi_snprintf(line, sizeof(line), "Disk %c: %ld %s", volume_letter,
+                     free_volume, say(SAY_FREE));
+        window_label(x + 12, y + 98, line, window_text);
+    }
 }
 
 /* ---- Opening things ------------------------------------------------------ */
@@ -556,7 +719,7 @@ static void open_note(void) {
 
 static void open_player(void) {
     static const WINDOW_MENU menus[] = {
-        { "File", { { "Stop", MENU_STOP }, { 0, 0 }, { "Close", MENU_EXIT } }, 3 }
+        { "File", { { "Pause", MENU_PAUSE }, { "Stop", MENU_STOP }, { 0, 0 }, { "Close", MENU_EXIT } }, 4 }
     };
 
     if (player_window) { player_window->minimised = 0; window_raise(player_window); return; }
@@ -571,11 +734,12 @@ static void open_player(void) {
     player_window->click = click_player;
     player_window->menu_count = 1;
     player_window->menus[0] = menus[0];
+    player_sync_pause_label();
 }
 
 static void open_about(void) {
     if (about_window) { about_window->minimised = 0; window_raise(about_window); return; }
-    about_window = window_new(say(SAY_ABOUT), 360, 380, 360, 180);
+    about_window = window_new(say(SAY_ABOUT), 360, 380, 480, 180);
     if (!about_window) return;
     about_window->paint = paint_about;
 }
@@ -686,6 +850,7 @@ int main(void) {
             case MENU_ABOUT: open_about(); break;
             case MENU_NOTE: open_note(); break;
             case MENU_PLAYER: open_player(); break;
+            case MENU_PAUSE: player_toggle_pause(); window_repaint(); break;
             case MENU_STOP: player_stop(); window_repaint(); break;
             case MENU_SAVE:
                 if (note_ready) {

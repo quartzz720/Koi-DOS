@@ -291,6 +291,10 @@ if [ -n "$DOOM_EXE" ]; then
     fi
 fi
 
+if [ -f WALLPAPER.BMP ]; then
+    copy WALLPAPER.BMP "$MOUNT/MIZU/WALLPAPER.BMP" || die "Copy failed."
+fi
+
 sync
 
 say ""

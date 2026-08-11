@@ -1,4 +1,5 @@
 #include "dialog.h"
+#include "language.h"
 
 /* CP437 double-line box drawing, which is the frame every DOS installer used.
    Single lines exist too and are the wrong weight here: the point of the frame
@@ -237,7 +238,7 @@ static int button_key(int key, int* chosen, int count) {
 }
 
 void dialog_message(const char* title, const char* text) {
-    static const char* const labels[] = { "Ok" };
+    const char* const labels[] = { say(DIALOG_OK) };
     char lines[8][DIALOG_LINE_MAX];
     LAYOUT box;
 
@@ -253,7 +254,7 @@ void dialog_message(const char* title, const char* text) {
 }
 
 int dialog_yesno(const char* title, const char* text, int yes_by_default) {
-    static const char* const labels[] = { "Yes", "No" };
+    const char* const labels[] = { say(DIALOG_YES), say(DIALOG_NO) };
     char lines[8][DIALOG_LINE_MAX];
     LAYOUT box;
     int chosen = yes_by_default ? 0 : 1;
@@ -274,11 +275,13 @@ int dialog_yesno(const char* title, const char* text, int yes_by_default) {
 }
 
 int dialog_menu(const char* title, const char* text,
-                const char* const* items, const char* const* notes,
-                int count, int selected) {
-    static const char* const labels[] = { "Ok", "Cancel" };
-    char lines[8][DIALOG_LINE_MAX];
+                const char* const* items,
+                const char* const* notes,
+                int count,
+                int selected,
+                void (*on_change)(int selected)) {
     LAYOUT box;
+    char lines[8][DIALOG_LINE_MAX];
     int chosen = 0;
     int widest = 0;
 
@@ -293,6 +296,7 @@ int dialog_menu(const char* title, const char* text,
     box = open_box(title, text, count, lines);
     for (;;) {
         int key;
+        const char* const labels[] = { say(DIALOG_OK), say(DIALOG_CANCEL) };
 
         for (int index = 0; index < count; index++) {
             int row = box.y + 1 + box.text_lines + index;
@@ -314,8 +318,16 @@ int dialog_menu(const char* title, const char* text,
 
         koi_cursor(0);
         key = koi_getchar();
-        if (key == KOI_KEY_UP) { selected = (selected + count - 1) % count; continue; }
-        if (key == KOI_KEY_DOWN) { selected = (selected + 1) % count; continue; }
+        if (key == KOI_KEY_UP) {
+            selected = (selected + count - 1) % count;
+            if (on_change) on_change(selected);
+            continue;
+        }
+        if (key == KOI_KEY_DOWN) {
+            selected = (selected + 1) % count;
+            if (on_change) on_change(selected);
+            continue;
+        }
         if (key == '\t' || key == KOI_KEY_LEFT || key == KOI_KEY_RIGHT) {
             chosen = chosen ? 0 : 1;
             continue;
@@ -326,7 +338,7 @@ int dialog_menu(const char* title, const char* text,
 }
 
 int dialog_input(const char* title, const char* text, char* buffer, int size_of) {
-    static const char* const labels[] = { "Ok", "Cancel" };
+    const char* const labels[] = { say(DIALOG_OK), say(DIALOG_CANCEL) };
     char lines[8][DIALOG_LINE_MAX];
     LAYOUT box;
     int chosen = 0;

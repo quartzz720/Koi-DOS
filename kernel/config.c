@@ -8,6 +8,7 @@
 #include "string.h"
 
 #define LINE_MAX 128
+#define PROGRAM_PATH_MAX 256
 
 static const char* color_names[16] = {
     "black", "blue", "green", "cyan",
@@ -15,6 +16,8 @@ static const char* color_names[16] = {
     "darkgray", "lightblue", "lightgreen", "lightcyan",
     "lightred", "lightmagenta", "yellow", "white"
 };
+
+static char program_path[PROGRAM_PATH_MAX] = "\\COMMANDER;\\MIZU";
 
 static int equals_ignoring_case(const char* left, const char* right) {
     while (*left && *right) {
@@ -65,6 +68,10 @@ static void trim(char* text) {
     }
 }
 
+const char* config_program_path(void) {
+    return program_path;
+}
+
 static void apply_console(const char* key, const char* value, void* context) {
     CONSOLE_THEME* theme = (CONSOLE_THEME*)context;
     int color = config_parse_color(value);
@@ -82,12 +89,23 @@ static void apply_console(const char* key, const char* value, void* context) {
    chose Ukrainian at setup wants Ukrainian and English on Alt+Shift, and
    having to say so twice is the kind of question software asks when it has not
    been thought about. */
-static void apply_language(const char* key, const char* value, void* context) {
+static void apply_system(const char* key, const char* value, void* context) {
     (void)context;
-    if (!equals_ignoring_case(key, "language")) return;
-    if (value[0] == 'r' && value[1] == 'u') layout_set_alternate(LAYOUT_RU);
-    else if (value[0] == 'u' && value[1] == 'k') layout_set_alternate(LAYOUT_UK);
-    else if (value[0] == 'e' && value[1] == 'l') layout_set_alternate(LAYOUT_GR);
+
+    if (equals_ignoring_case(key, "language")) {
+        if (value[0] == 'r' && value[1] == 'u') layout_set_alternate(LAYOUT_RU);
+        else if (value[0] == 'u' && value[1] == 'k') layout_set_alternate(LAYOUT_UK);
+        else if (value[0] == 'e' && value[1] == 'l') layout_set_alternate(LAYOUT_GR);
+    } else if (equals_ignoring_case(key, "path")) {
+        boot_uint64_t length = 0;
+
+        while (value[length] && length + 1 < PROGRAM_PATH_MAX) {
+            program_path[length] = value[length];
+            length++;
+        }
+        program_path[length] = 0;
+        trim(program_path);
+    }
 }
 
 static void apply_sound(const char* key, const char* value, void* context) {
@@ -183,7 +201,7 @@ void config_load(VOLUME* volume) {
     read_settings(volume, CONFIG_LEGACY_PATH, apply_console, &theme);
     read_settings(volume, CONFIG_DIRECTORY "\\CONSOLE.CFG", apply_console, &theme);
     read_settings(volume, CONFIG_DIRECTORY "\\SOUND.CFG", apply_sound, &percent);
-    read_settings(volume, CONFIG_DIRECTORY "\\SYSTEM.CFG", apply_language,
+    read_settings(volume, CONFIG_DIRECTORY "\\SYSTEM.CFG", apply_system,
                   (void*)0);
 
     if (percent >= 0) audio_set_volume(percent * 255 / 100);

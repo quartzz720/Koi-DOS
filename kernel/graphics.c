@@ -19,6 +19,17 @@ static boot_uint32_t pixel_format;
 static boot_uint32_t* buffer;
 static boot_uint64_t buffer_pages;
 static int active;
+static int scissor_left;
+static int scissor_top;
+static int scissor_right;
+static int scissor_bottom;
+
+static void reset_scissor(void) {
+    scissor_left = 0;
+    scissor_top = 0;
+    scissor_right = (int)screen_width;
+    scissor_bottom = (int)screen_height;
+}
 
 void graphics_init(const BOOT_INFO* info) {
     framebuffer = (volatile boot_uint32_t*)(unsigned long long)info->framebuffer_base;
@@ -60,7 +71,48 @@ int graphics_enter(GRAPHICS_SCREEN* screen) {
     screen->bytes_per_pixel = 4;
     screen->pixels = buffer;
     active = 1;
+    reset_scissor();
     return 1;
+}
+
+void graphics_reset_scissor(void) {
+    if (!active) return;
+    reset_scissor();
+}
+
+void graphics_scissor(int x, int y, int width, int height) {
+    int left;
+    int top;
+    int right;
+    int bottom;
+
+    if (!active) return;
+    if (width <= 0 || height <= 0) {
+        scissor_left = scissor_top = scissor_right = scissor_bottom = 0;
+        return;
+    }
+
+    left = x;
+    top = y;
+    right = (int)((long long)x + width);
+    bottom = (int)((long long)y + height);
+    if (left < scissor_left) left = scissor_left;
+    if (top < scissor_top) top = scissor_top;
+    if (right > scissor_right) right = scissor_right;
+    if (bottom > scissor_bottom) bottom = scissor_bottom;
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right > (int)screen_width) right = (int)screen_width;
+    if (bottom > (int)screen_height) bottom = (int)screen_height;
+    if (left >= right || top >= bottom) {
+        scissor_left = scissor_top = scissor_right = scissor_bottom = 0;
+        return;
+    }
+
+    scissor_left = left;
+    scissor_top = top;
+    scissor_right = right;
+    scissor_bottom = bottom;
 }
 
 /* One row out to the adapter.
@@ -135,6 +187,91 @@ static boot_uint32_t* row_of(int y) {
     return buffer + (boot_uint64_t)y * screen_width;
 }
 
+static int clip_rect_to_scissor(int* x, int* y, int* width, int* height) {
+    int left;
+    int top;
+    int right;
+    int bottom;
+
+    if (*width <= 0 || *height <= 0) return 0;
+    left = *x;
+    top = *y;
+    right = (int)((long long)*x + *width);
+    bottom = (int)((long long)*y + *height);
+    if (left < scissor_left) left = scissor_left;
+    if (top < scissor_top) top = scissor_top;
+    if (right > scissor_right) right = scissor_right;
+    if (bottom > scissor_bottom) bottom = scissor_bottom;
+    if (left >= right || top >= bottom) return 0;
+    *x = left;
+    *y = top;
+    *width = right - left;
+    *height = bottom - top;
+    return 1;
+}
+
+
+/* In this function author fucked up several times, it's now working properly, you're welcome ...*/
+static int check_edge(long long p, long long q, long long* t0_num, long long* t0_den,
+                       long long* t1_num, long long* t1_den) {
+    if (p < 0) {
+        /* Incoming edge: update t0 */
+        if ((-q) * (*t0_den) > (*t0_num) * (-p)) {
+            *t0_num = -q;
+            *t0_den = -p;
+        }
+    } else if (p > 0) {
+        /* Outgoing edge: update t1 — this branch is correct, do not touch */
+        if (q * (*t1_den) < (*t1_num) * p) {
+            *t1_num = q;
+            *t1_den = p;
+        }
+    } else if (q < 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static int liang_barsky_clip(int* x0, int* y0, int* x1, int* y1) {
+    long long left = scissor_left;
+    long long top = scissor_top;
+    long long right = scissor_right - 1;
+    long long bottom = scissor_bottom - 1;
+    long long start_x = *x0;
+    long long start_y = *y0;
+    long long delta_x = (long long)*x1 - *x0;
+    long long delta_y = (long long)*y1 - *y0;
+    long long t0_num = 0;
+    long long t0_den = 1;
+    long long t1_num = 1;
+    long long t1_den = 1;
+
+    if (scissor_left >= scissor_right || scissor_top >= scissor_bottom)
+        return 0;
+
+    if (!check_edge(-delta_x, start_x - left, &t0_num, &t0_den, &t1_num, &t1_den)) return 0;
+    if (!check_edge( delta_x, right - start_x, &t0_num, &t0_den, &t1_num, &t1_den)) return 0;
+    if (!check_edge(-delta_y, start_y - top, &t0_num, &t0_den, &t1_num, &t1_den)) return 0;
+    if (!check_edge( delta_y, bottom - start_y, &t0_num, &t0_den, &t1_num, &t1_den)) return 0;
+
+    if (t0_num * t1_den > t1_num * t0_den) return 0;
+
+    *x0 = (int)((start_x * t0_den + delta_x * t0_num) / t0_den);
+    *y0 = (int)((start_y * t0_den + delta_y * t0_num) / t0_den);
+    *x1 = (int)((start_x * t1_den + delta_x * t1_num) / t1_den);
+    *y1 = (int)((start_y * t1_den + delta_y * t1_num) / t1_den);
+
+    if (*x0 < scissor_left) *x0 = scissor_left;
+    if (*y0 < scissor_top) *y0 = scissor_top;
+    if (*x1 < scissor_left) *x1 = scissor_left;
+    if (*y1 < scissor_top) *y1 = scissor_top;
+    if (*x0 > scissor_right - 1) *x0 = scissor_right - 1;
+    if (*y0 > scissor_bottom - 1) *y0 = scissor_bottom - 1;
+    if (*x1 > scissor_right - 1) *x1 = scissor_right - 1;
+    if (*y1 > scissor_bottom - 1) *y1 = scissor_bottom - 1;
+    return 1;
+}
+
 /* A run of one colour, as one instruction.
  *
  * The obvious C loop is one four-byte store per pixel, and a full-screen clear
@@ -168,53 +305,68 @@ static void fill_run(boot_uint32_t* pixels, boot_uint32_t color,
 
 void graphics_pixel(int x, int y, boot_uint32_t color) {
     if (!active) return;
-    if (x < 0 || y < 0 || (boot_uint32_t)x >= screen_width ||
-        (boot_uint32_t)y >= screen_height) return;
+    if (x < scissor_left || y < scissor_top || x >= scissor_right ||
+        y >= scissor_bottom) return;
     row_of(y)[x] = color;
 }
 
 void graphics_clear(boot_uint32_t color) {
     if (!active) return;
-    /* The buffer is one contiguous run, so the whole screen is a single fill
-       rather than one per row. */
-    fill_run(buffer, color, screen_width * screen_height);
+    if (scissor_left >= scissor_right || scissor_top >= scissor_bottom)
+        return;
+    for (int line = scissor_top; line < scissor_bottom; line++)
+        fill_run(row_of(line) + scissor_left, color,
+                 (boot_uint32_t)(scissor_right - scissor_left));
 }
 
 void graphics_fill(int x, int y, int width, int height, boot_uint32_t color) {
-    int right;
-    int bottom;
+    int left;
+    int top;
+    int clipped_width;
+    int clipped_height;
 
     if (!active || width <= 0 || height <= 0) return;
-    right = x + width;
-    bottom = y + height;
-    if (x < 0) x = 0;
-    if (y < 0) y = 0;
-    if (right > (int)screen_width) right = (int)screen_width;
-    if (bottom > (int)screen_height) bottom = (int)screen_height;
+    left = x;
+    top = y;
+    clipped_width = width;
+    clipped_height = height;
+    if (!clip_rect_to_scissor(&left, &top, &clipped_width, &clipped_height))
+        return;
 
-    for (int line = y; line < bottom; line++)
-        fill_run(row_of(line) + x, color, (boot_uint32_t)(right - x));
+    for (int line = top; line < top + clipped_height; line++)
+        fill_run(row_of(line) + left, color, (boot_uint32_t)clipped_width);
 }
 
 void graphics_rect(int x, int y, int width, int height, boot_uint32_t color) {
+    int right = (int)((long long)x + width - 1);
+    int bottom = (int)((long long)y + height - 1);
+
     if (!active || width <= 0 || height <= 0) return;
     graphics_fill(x, y, width, 1, color);
-    graphics_fill(x, y + height - 1, width, 1, color);
-    graphics_fill(x, y, 1, height, color);
-    graphics_fill(x + width - 1, y, 1, height, color);
+    if (height > 1) graphics_fill(x, bottom, width, 1, color);
+    if (height > 2) {
+        graphics_fill(x, y + 1, 1, height - 2, color);
+        graphics_fill(right, y + 1, 1, height - 2, color);
+    }
 }
 
 /* Bresenham, in the integer-only form. No division, no floating point - which
    matters here because the kernel is built with -mgeneral-regs-only and has no
    floating point registers to spare. */
 void graphics_line(int x0, int y0, int x1, int y1, boot_uint32_t color) {
-    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
-    int dy = y1 > y0 ? y1 - y0 : y0 - y1;
-    int step_x = x0 < x1 ? 1 : -1;
-    int step_y = y0 < y1 ? 1 : -1;
+    int dx;
+    int dy;
+    int step_x;
+    int step_y;
     int error;
 
     if (!active) return;
+    if (!liang_barsky_clip(&x0, &y0, &x1, &y1)) return;
+
+    dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    step_x = x0 < x1 ? 1 : -1;
+    step_y = y0 < y1 ? 1 : -1;
     dy = -dy;
     error = dx + dy;
 
@@ -240,24 +392,27 @@ void graphics_line(int x0, int y0, int x1, int y1, boot_uint32_t color) {
 void graphics_blit(const void* pixels, int x, int y, int width, int height,
                    boot_uint32_t stride) {
     const boot_uint8_t* source = (const boot_uint8_t*)pixels;
+    int left;
+    int top;
+    int clipped_width;
+    int clipped_height;
 
     if (!active || !pixels || width <= 0 || height <= 0) return;
 
-    for (int line = 0; line < height; line++) {
-        const boot_uint32_t* input =
-            (const boot_uint32_t*)(source + (boot_uint64_t)line * stride);
-        int target_y = y + line;
+    left = x;
+    top = y;
+    clipped_width = width;
+    clipped_height = height;
+    if (!clip_rect_to_scissor(&left, &top, &clipped_width, &clipped_height))
+        return;
 
-        if (target_y < 0 || (boot_uint32_t)target_y >= screen_height) continue;
-        {
-            boot_uint32_t* output = row_of(target_y);
-            for (int column = 0; column < width; column++) {
-                int target_x = x + column;
-                if (target_x < 0 || (boot_uint32_t)target_x >= screen_width)
-                    continue;
-                output[target_x] = input[column];
-            }
-        }
+    for (int line = 0; line < clipped_height; line++) {
+        const boot_uint32_t* input =
+            (const boot_uint32_t*)(source + (boot_uint64_t)(top - y + line) * stride) +
+            (left - x);
+        boot_uint32_t* output = row_of(top + line);
+        for (int column = 0; column < clipped_width; column++)
+            output[left + column] = input[column];
     }
 }
 

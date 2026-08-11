@@ -26,6 +26,9 @@
 
 void config_load(VOLUME* volume);
 
+/* Extra directories the shell searches for programs, in PATH order. */
+const char* config_program_path(void);
+
 /* Look up a colour by name or by number, 0-15. Returns -1 when it is neither.
    Shared with anything else that has to read a colour out of text. */
 int config_parse_color(const char* text);

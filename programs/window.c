@@ -11,6 +11,9 @@ koi_uint32 window_accent;
 
 static koi_uint32 desktop_top;
 static koi_uint32 desktop_bottom;
+static koi_uint32* desktop_wallpaper;
+static int desktop_wallpaper_width;
+static int desktop_wallpaper_height;
 
 static KOI_SCREEN screen;
 static WINDOW windows[WINDOW_MAX];
@@ -56,6 +59,137 @@ static koi_uint32 cursor_ink, cursor_edge;
 
 static koi_uint32* pixel_row(int y) {
     return (koi_uint32*)((koi_uint8*)screen.pixels + (koi_uint64)y * screen.pitch);
+}
+
+static koi_uint32 read32(const koi_uint8* data) {
+    return (koi_uint32)data[0] | ((koi_uint32)data[1] << 8) |
+           ((koi_uint32)data[2] << 16) | ((koi_uint32)data[3] << 24);
+}
+
+static koi_uint16 read16(const koi_uint8* data) {
+    return (koi_uint16)(data[0] | (data[1] << 8));
+}
+
+static int read_exactly(long handle, void* buffer, long length) {
+    koi_uint8* output = (koi_uint8*)buffer;
+    long done = 0;
+
+    while (done < length) {
+        long got = koi_read(handle, output + done, length - done);
+        if (got <= 0) return 0;
+        done += got;
+    }
+    return 1;
+}
+
+static void free_wallpaper(void) {
+    if (desktop_wallpaper) koi_free(desktop_wallpaper);
+    desktop_wallpaper = (koi_uint32*)0;
+    desktop_wallpaper_width = 0;
+    desktop_wallpaper_height = 0;
+}
+
+static int load_wallpaper(void) {
+    enum { HEADER_SIZE = 54, MAX_EXTRA_HEADER = 128 };
+    static const koi_uint32 MASK_RED = 0x00FF0000U;
+    static const koi_uint32 MASK_GREEN = 0x0000FF00U;
+    static const koi_uint32 MASK_BLUE = 0x000000FFU;
+    koi_uint8 header[HEADER_SIZE];
+    koi_uint8 extra_header[MAX_EXTRA_HEADER];
+    koi_uint8 row_bytes[4096 * 4];
+    long handle;
+    koi_uint32 data_offset;
+    koi_uint32 info_size;
+    long image_width;
+    long image_height;
+    koi_uint16 depth;
+    koi_uint32 compression;
+    koi_uint32 red_mask = 0;
+    koi_uint32 green_mask = 0;
+    koi_uint32 blue_mask = 0;
+    long consumed = HEADER_SIZE;
+    long bytes_per_row;
+    long padded_row;
+    int upside_down = 0;
+    long target_height;
+
+    free_wallpaper();
+    handle = koi_open("\\MIZU\\WALLPAPER.BMP", OPEN_READ);
+    if (handle < 0) return 0;
+    if (!read_exactly(handle, header, HEADER_SIZE)) { koi_close(handle); return 0; }
+    if (header[0] != 'B' || header[1] != 'M') { koi_close(handle); return 0; }
+
+    data_offset = read32(header + 10);
+    info_size = read32(header + 14);
+    image_width = (long)(int)read32(header + 18);
+    image_height = (long)(int)read32(header + 22);
+    depth = read16(header + 28);
+    compression = read32(header + 30);
+
+    if (image_height < 0) { image_height = -image_height; upside_down = 1; }
+    if (info_size > 40) {
+        long extra = (long)info_size - 40;
+        if (extra > MAX_EXTRA_HEADER) { koi_close(handle); return 0; }
+        if (!read_exactly(handle, extra_header, extra)) { koi_close(handle); return 0; }
+        consumed += extra;
+        if (extra >= 12) {
+            red_mask = read32(extra_header);
+            green_mask = read32(extra_header + 4);
+            blue_mask = read32(extra_header + 8);
+        }
+    } else if (compression == 3) {
+        if (!read_exactly(handle, extra_header, 12)) { koi_close(handle); return 0; }
+        consumed += 12;
+        red_mask = read32(extra_header);
+        green_mask = read32(extra_header + 4);
+        blue_mask = read32(extra_header + 8);
+    }
+
+    if (compression == 3) {
+        if (depth != 32 || red_mask != MASK_RED || green_mask != MASK_GREEN ||
+            blue_mask != MASK_BLUE) { koi_close(handle); return 0; }
+    } else if (compression != 0 || (depth != 24 && depth != 32)) {
+        koi_close(handle);
+        return 0;
+    }
+    if (data_offset < 14 + info_size) { koi_close(handle); return 0; }
+
+    bytes_per_row = image_width * (depth / 8);
+    padded_row = (bytes_per_row + 3) & ~3L;
+    if ((long)data_offset - consumed > 0) {
+        long skip = (long)data_offset - consumed;
+        while (skip > 0) {
+            long chunk = skip < (long)sizeof(row_bytes) ? skip : (long)sizeof(row_bytes);
+            if (!read_exactly(handle, row_bytes, chunk)) { koi_close(handle); return 0; }
+            skip -= chunk;
+        }
+    }
+
+    desktop_wallpaper_width = (int)image_width;
+    desktop_wallpaper_height = (int)image_height;
+    desktop_wallpaper = (koi_uint32*)koi_alloc((koi_uint64)desktop_wallpaper_width *
+                                              (koi_uint64)desktop_wallpaper_height *
+                                              sizeof(koi_uint32));
+    if (!desktop_wallpaper) { koi_close(handle); return 0; }
+
+    for (long line = 0; line < image_height; line++) {
+        long target = upside_down ? line : image_height - 1 - line;
+        koi_uint32* output = desktop_wallpaper + (koi_uint64)target * desktop_wallpaper_width;
+        if (!read_exactly(handle, row_bytes, padded_row)) {
+            free_wallpaper();
+            koi_close(handle);
+            return 0;
+        }
+        for (long x = 0; x < image_width; x++) {
+            const koi_uint8* pixel = row_bytes + x * (depth / 8);
+            output[x] = koi_gfx_color(pixel[2], pixel[1], pixel[0]);
+        }
+    }
+
+    koi_close(handle);
+    target_height = (long)screen.height - WINDOW_TOPBAR_H - WINDOW_TASKBAR_H;
+    if (target_height <= 0) { free_wallpaper(); return 0; }
+    return 1;
 }
 
 static void cursor_hide(void) {
@@ -172,20 +306,36 @@ static void paint_desktop(void) {
     int top = WINDOW_TOPBAR_H;
     int bottom = (int)screen.height - WINDOW_TASKBAR_H;
     int span = bottom - top;
-    int red_a = (int)((desktop_top >> 16) & 0xFF);
-    int green_a = (int)((desktop_top >> 8) & 0xFF);
-    int blue_a = (int)(desktop_top & 0xFF);
-    int red_b = (int)((desktop_bottom >> 16) & 0xFF);
-    int green_b = (int)((desktop_bottom >> 8) & 0xFF);
-    int blue_b = (int)(desktop_bottom & 0xFF);
+    if (desktop_wallpaper && desktop_wallpaper_width > 0 &&
+        desktop_wallpaper_height > 0) {
+        for (int row = 0; row < span; row++) {
+            int source_y = (int)((koi_uint64)row * desktop_wallpaper_height / span);
+            koi_uint32* target = pixel_row(top + row);
+            koi_uint32* source = desktop_wallpaper +
+                                 (koi_uint64)source_y * desktop_wallpaper_width;
 
-    if (span < 1) span = 1;
-    for (int row = 0; row < span; row++) {
-        koi_uint32 color = koi_gfx_color(
-            red_a + (red_b - red_a) * row / span,
-            green_a + (green_b - green_a) * row / span,
-            blue_a + (blue_b - blue_a) * row / span);
-        koi_gfx_line(0, top + row, (int)screen.width - 1, top + row, color);
+            for (int x = 0; x < (int)screen.width; x++) {
+                int source_x = (int)((koi_uint64)x * desktop_wallpaper_width /
+                                     (int)screen.width);
+                target[x] = source[source_x];
+            }
+        }
+    } else {
+        int red_a = (int)((desktop_top >> 16) & 0xFF);
+        int green_a = (int)((desktop_top >> 8) & 0xFF);
+        int blue_a = (int)(desktop_top & 0xFF);
+        int red_b = (int)((desktop_bottom >> 16) & 0xFF);
+        int green_b = (int)((desktop_bottom >> 8) & 0xFF);
+        int blue_b = (int)(desktop_bottom & 0xFF);
+
+        if (span < 1) span = 1;
+        for (int row = 0; row < span; row++) {
+            koi_uint32 color = koi_gfx_color(
+                red_a + (red_b - red_a) * row / span,
+                green_a + (green_b - green_a) * row / span,
+                blue_a + (blue_b - blue_a) * row / span);
+            koi_gfx_line(0, top + row, (int)screen.width - 1, top + row, color);
+        }
     }
 }
 
@@ -330,7 +480,11 @@ static void paint_window(WINDOW* window, int active) {
 
     window_client(window, &client_x, &client_y, &client_w, &client_h);
     window_sunken(client_x - 1, client_y - 1, client_w + 2, client_h + 2);
-    if (window->paint) window->paint(window, client_x, client_y, client_w, client_h);
+    if (window->paint) {
+        koi_gfx_scissor(client_x, client_y, client_w, client_h);
+        window->paint(window, client_x, client_y, client_w, client_h);
+        koi_gfx_reset_scissor();
+    }
 
     /* The grip. Three diagonal strokes in the corner, which is the shape every
        system has used for "drag me" since windows could be resized at all -
@@ -545,6 +699,8 @@ int window_open_desktop(const char* title) {
     desktop_bottom = koi_gfx_color(0x8F, 0xC6, 0xDD);
     cursor_ink = koi_gfx_color(0xFF, 0xFF, 0xFF);
     cursor_edge = koi_gfx_color(0x00, 0x1A, 0x28);
+
+    load_wallpaper();
 
     koi_mouse_place((int)screen.width / 2, (int)screen.height / 2);
     running = 1;

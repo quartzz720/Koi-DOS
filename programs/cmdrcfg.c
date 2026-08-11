@@ -143,7 +143,7 @@ int main(void) {
     loudness = dialog_menu("Sound",
         "How loud should this machine be?\n"
         "The default has been described, by somebody wearing headphones, "
-        "as too loud.", levels, notes, 3, 1);
+        "as too loud.", levels, notes, 3, 1, 0);
     if (loudness >= 0) {
         char text[8];
         koi_snprintf(text, sizeof(text), "%d", percent[loudness]);

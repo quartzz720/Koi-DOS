@@ -22,6 +22,44 @@
 #include "build.h"
 #include "string.h"
 
+static const char* cpu_brand_name(void) {
+    static char name[64];
+    static int cached;
+    boot_uint32_t a, b, c, d;
+
+    if (cached) return name;
+
+    __asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                              : "a"(0x80000000U), "c"(0));
+    if (a < 0x80000004U) {
+        memcpy(name, "unknown CPU", 12);
+        cached = 1;
+        return name;
+    }
+
+    for (int leaf = 0; leaf < 3; leaf++) {
+        __asm__ volatile ("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+                                  : "a"(0x80000002U + (boot_uint32_t)leaf),
+                                    "c"(0));
+        memcpy(name + leaf * 16 + 0, &a, 4);
+        memcpy(name + leaf * 16 + 4, &b, 4);
+        memcpy(name + leaf * 16 + 8, &c, 4);
+        memcpy(name + leaf * 16 + 12, &d, 4);
+    }
+    name[48] = 0;
+
+    {
+        int start = 0;
+        int end = 47;
+        while (name[start] == ' ') start++;
+        while (end >= start && name[end] == ' ') name[end--] = 0;
+        if (start > 0) memmove(name, name + start, strlen(name + start) + 1);
+    }
+
+    cached = 1;
+    return name;
+}
+
 /* Open files belonging to the running program. Small and fixed: one program
    runs at a time and DOS itself shipped with FILES=8 in CONFIG.SYS. */
 #define HANDLE_MAX 8
@@ -356,6 +394,16 @@ static long system_info(long item, long index) {
         if (!volume) return SYSCALL_ERROR;
         return volume == working_volume ? 1 : 0;
     }
+    case KOI_INFO_VOLUME_TOTAL_BYTES: {
+        VOLUME* volume = volume_at((boot_uint32_t)index);
+        return volume ? (long)(fat32_total_bytes(volume) / 1024U)
+                      : SYSCALL_ERROR;
+    }
+    case KOI_INFO_VOLUME_FREE_BYTES: {
+        VOLUME* volume = volume_at((boot_uint32_t)index);
+        return volume ? (long)(fat32_free_bytes(volume) / 1024U)
+                      : SYSCALL_ERROR;
+    }
     case KOI_INFO_TIME: {
         RTC_TIME now;
         rtc_read(&now);
@@ -403,6 +451,9 @@ static long system_text(long item, long index, char* buffer, long size) {
     }
     case KOI_TEXT_AUDIO_DEVICE:
         source = audio_device_name();
+        break;
+    case KOI_TEXT_CPU_NAME:
+        source = cpu_brand_name();
         break;
     case KOI_TEXT_PROGRAM_PATH:
         source = program_path();
@@ -705,6 +756,13 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
                              (boot_uint32_t)c, (boot_uint32_t)(d & 0xFFFFFFFF),
                              (int)(d & 0xFFFFFFFF) == KOI_TEXT_TRANSPARENT,
                              (int)((d >> 32) & 0xFF));
+        return 0;
+    case SYS_GFX_SCISSOR:
+        graphics_scissor(KOI_POINT_X(a), KOI_POINT_Y(a),
+                         KOI_POINT_X(b), KOI_POINT_Y(b));
+        return 0;
+    case SYS_GFX_SCISSOR_RESET:
+        graphics_reset_scissor();
         return 0;
     case SYS_GFX_TEXT:
         graphics_text(KOI_POINT_X(a), KOI_POINT_Y(a), (const char*)b,

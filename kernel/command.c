@@ -17,6 +17,8 @@
 #include "e1000.h"
 #include "tftp.h"
 #include "mouse.h"
+
+const char* config_program_path(void);
 #include "timer.h"
 #include "fat32.h"
 #include "partition.h"
@@ -324,6 +326,88 @@ static void build_program_path(const char* name, char* result, int place) {
     for (boot_uint64_t index = 0; name[index] && length + 1 < PATH_MAX; index++)
         result[length++] = name[index];
     result[length] = 0;
+}
+
+static int build_program_path_from_prefix(const char* prefix, const char* name,
+                                          VOLUME** volume, char* result) {
+    boot_uint64_t length = 0;
+    const char* cursor = prefix;
+
+    *volume = volume_boot();
+    if (!*volume) return 0;
+
+    if (cursor[0] && cursor[1] == ':') {
+        VOLUME* named = volume_by_letter(cursor[0]);
+        if (!named) return 0;
+        *volume = named;
+        cursor += 2;
+    }
+
+    if (cursor[0] != '\\') result[length++] = '\\';
+    while (cursor[0] && length + 1 < PATH_MAX) result[length++] = *cursor++;
+    if (length && result[length - 1] != '\\') result[length++] = '\\';
+    for (boot_uint64_t index = 0; name[index] && length + 1 < PATH_MAX; index++)
+        result[length++] = name[index];
+    result[length] = 0;
+    return 1;
+}
+
+static int search_configured_program_path(const char* name, VOLUME** volume,
+                                          char* path, FAT_ENTRY* entry) {
+    const char* configured = config_program_path();
+    char prefix[PATH_MAX];
+
+    if (!configured || !configured[0]) return 0;
+
+    for (const char* cursor = configured; *cursor; ) {
+        boot_uint64_t length = 0;
+
+        while (*cursor == ';' || is_space(*cursor)) cursor++;
+        while (*cursor && *cursor != ';' && length + 1 < PATH_MAX)
+            prefix[length++] = *cursor++;
+        while (length && is_space(prefix[length - 1])) length--;
+        prefix[length] = 0;
+        if (prefix[0] && build_program_path_from_prefix(prefix, name, volume, path) &&
+            fat32_stat(*volume, path, entry)) {
+            return 1;
+        }
+        while (*cursor && *cursor != ';') cursor++;
+        if (*cursor == ';') cursor++;
+    }
+    return 0;
+}
+
+static int find_program(const char* name, VOLUME** volume, char* path,
+                        FAT_ENTRY* entry) {
+    int found = 0;
+
+    if (!current_volume) return 0;
+    *volume = current_volume;
+
+    /* The current directory first, then the root of the current drive. */
+    for (int place = PROGRAM_SEARCH_CURRENT; place <= PROGRAM_SEARCH_ROOT && !found;
+         place++) {
+        build_program_path(name, path, place);
+        found = fat32_stat(current_volume, path, entry);
+    }
+
+    /* Then the user-configured search path, which defaults to the package dirs
+       that carry Commander and Mizu. */
+    if (!found) found = search_configured_program_path(name, volume, path, entry);
+
+    /* Then \\BIN on the system volume, where the built-in tools live. */
+    if (!found) {
+        VOLUME* system = volume_boot();
+        if (system) {
+            build_program_path(name, path, PROGRAM_SEARCH_BIN);
+            if (fat32_stat(system, path, entry)) {
+                found = 1;
+                *volume = system;
+            }
+        }
+    }
+
+    return found;
 }
 
 static void print_prompt(void) {
@@ -1433,7 +1517,7 @@ static int prefix_matches(const char* text, const char* key) {
 
 #define DOSGET_CONFIG "\\BOOT\\dosget.cfg"
 #define DOSGET_DEFAULT_SOURCE "192.168.50.1"
-#define DOSGET_BUFFER (1024 * 1024)
+#define DOSGET_BUFFER (4 * 1024 * 1024)
 /* What is installed and at which version. One `NAME VERSION` per line, on the
    boot volume beside the loader, because a record of what the system is made
    of belongs with the system rather than inside one of its packages. */
@@ -3660,9 +3744,6 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
     int code;
     int exit_code = 0;
 
-    if (!current_volume) return 0;
-    program_volume = current_volume;
-
     while (input[length] && !is_space(input[length]) && length + 5 < PATH_MAX) {
         if (input[length] == '.') has_extension = 1;
         name[length] = input[length];
@@ -3675,49 +3756,17 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
     }
     name[length] = 0;
 
-    /* The current directory, then the root, then \BIN. */
-    {
-        int found = 0;
-        for (int place = 0; place < PROGRAM_SEARCH_PLACES && !found; place++) {
-            build_program_path(name, path, place);
-            found = fat32_stat(current_volume, path, &entry);
+    if (!find_program(name, &program_volume, path, &entry)) {
+        /* Nothing by that name as a program; try it as a batch file. */
+        if (has_extension) return 0;
+        name[length - 4] = 0;
+        {
+            const char* batch = ".BAT";
+            for (int index = 0; index < 4; index++) name[length - 4 + index] = batch[index];
         }
-
-        /* And then \BIN on the system volume, wherever the user is standing.
-         *
-         * The utilities are installed once, on the volume the system lives on.
-         * Standing on a USB stick and typing `play \WAV\song.wav` used to fail
-         * with "Bad command or file name" - not because the file was missing
-         * but because `play` was, on that drive. The program is found here and
-         * still runs with the user's own drive and directory, so the argument
-         * it was given still means what it said. */
-        if (!found) {
-            VOLUME* system = volume_boot();
-            if (system && system != current_volume) {
-                build_program_path(name, path, PROGRAM_SEARCH_BIN);
-                if (fat32_stat(system, path, &entry)) {
-                    found = 1;
-                    program_volume = system;
-                }
-            }
-        }
-
-        if (!found) {
-            /* Nothing by that name as a program; try it as a batch file. */
-            if (has_extension) return 0;
-            name[length - 4] = 0;
-            {
-                const char* batch = ".BAT";
-                for (int index = 0; index < 4; index++) name[length - 4 + index] = batch[index];
-            }
-            for (int place = 0; place < PROGRAM_SEARCH_PLACES && !found; place++) {
-                build_program_path(name, path, place);
-                found = fat32_stat(current_volume, path, &entry);
-            }
-            if (!found) return 0;
-            run_batch(current_volume, path);
-            return 1;
-        }
+        if (!find_program(name, &program_volume, path, &entry)) return 0;
+        run_batch(program_volume, path);
+        return 1;
     }
     if (entry.attributes & FAT_ATTRIBUTE_DIRECTORY) return 0;
 

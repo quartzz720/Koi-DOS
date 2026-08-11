@@ -67,7 +67,7 @@
  * nothing else, so raising it would refuse every program already installed on a
  * machine until each was reinstalled. A rule worth keeping is worth keeping for
  * its reason, and the reason does not apply here. */
-#define KOI_ABI_VERSION 12
+#define KOI_ABI_VERSION 13
 #define KOI_ABI_MINIMUM 8
 #define KOI_ABI_IS_ALPHA 1
 
@@ -309,6 +309,8 @@ typedef struct {
  * reproducible. The same reason SYS_MOUSE fills in one structure. */
 #define KOI_INFO_TIME 25             /* hour << 16 | minute << 8 | second */
 #define KOI_INFO_DATE 26             /* year << 16 | month << 8 | day */
+#define KOI_INFO_VOLUME_TOTAL_BYTES 27 /* index selects the volume, KiB */
+#define KOI_INFO_VOLUME_FREE_BYTES 28  /* index selects the volume, KiB */
 
 #define KOI_TIME_HOUR(packed) ((int)(((packed) >> 16) & 0xFF))
 #define KOI_TIME_MINUTE(packed) ((int)(((packed) >> 8) & 0xFF))
@@ -323,6 +325,7 @@ typedef struct {
 #define KOI_TEXT_DISK_NAME 2         /* index selects the disk */
 #define KOI_TEXT_VOLUME_LABEL 3      /* index selects the volume */
 #define KOI_TEXT_AUDIO_DEVICE 4      /* the codec, or "none" */
+#define KOI_TEXT_CPU_NAME 5          /* the processor brand string */
 /* The path this program was loaded from, from the root of its drive.
  *
  * A program cannot work this out for itself: SYS_ARGS gives it the tail of the
@@ -331,7 +334,7 @@ typedef struct {
  * and wants to come back afterwards - and then guessing its own location is the
  * difference between working and working only when installed where the guess
  * happened to be right. */
-#define KOI_TEXT_PROGRAM_PATH 5
+#define KOI_TEXT_PROGRAM_PATH 6
 
 /* Graphics.
  *
@@ -368,6 +371,8 @@ typedef struct {
    are made from the glyph the font already has - see graphics.c - so they cost
    no extra font data and work with whatever font is fitted later. */
 #define SYS_GFX_TEXT_STYLED 0x3B   /* (point, text, colour, packed) */
+#define SYS_GFX_SCISSOR 0x3C       /* (point, size) - intersect clip rect */
+#define SYS_GFX_SCISSOR_RESET 0x3D /* () - restore full-screen clipping */
 
 #define KOI_TEXT_BOLD 1
 #define KOI_TEXT_ITALIC 2

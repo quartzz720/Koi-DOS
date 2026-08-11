@@ -97,7 +97,7 @@ static int set_autostart(int wanted) {
 
 /* The questions, one row per language rather than through `say`: this program
    runs before the choice has been made, so it has to be able to speak all
-   three at once. */
+   four languages at once. */
 static const char* const welcome[LANGUAGE_COUNT] = {
     "Mizu is a desktop with windows. It is a package, not part of the system: "
     "it can be removed and what is left is the same Koi-DOS.\n"
@@ -107,7 +107,11 @@ static const char* const welcome[LANGUAGE_COUNT] = {
     "Несколько вопросов перед первым запуском.",
     "Mizu - це робочий стіл з вікнами. Це пакет, а не частина системи: "
     "його можна видалити, і залишиться той самий Koi-DOS.\n"
-    "Кілька питань перед першим запуском."
+    "Кілька питань перед першим запуском.",
+    "Το Mizu είναι μια επιφάνεια εργασίας με παράθυρα. Είναι ένα πακέτο "
+    "και όχι μέρος του συστήματος: μπορεί να αφαιρεθεί και το Koi-DOS "
+    "που απομένει είναι το ίδιο.\n"
+    "Μερικές ερωτήσεις πριν από την πρώτη χρήση."
 };
 
 static const char* const ask_autostart[LANGUAGE_COUNT] = {
@@ -117,19 +121,24 @@ static const char* const ask_autostart[LANGUAGE_COUNT] = {
     "Запускать Mizu автоматически при загрузке машины?\n"
     "Это добавит одну строку в AUTOEXEC.BAT; ответ Нет позже уберёт её.",
     "Запускати Mizu автоматично під час завантаження?\n"
-    "Це додасть один рядок до AUTOEXEC.BAT; відповідь Ні згодом прибере його."
+    "Це додасть один рядок до AUTOEXEC.BAT; відповідь Ні згодом прибере його.",
+    "Να ξεκινά το Mizu αυτόματα κατά την εκκίνηση του υπολογιστή;\n"
+    "Αυτό προσθέτει μία γραμμή στο AUTOEXEC.BAT και αν αργότερα απαντήσετε "
+    "Όχι, η γραμμή θα αφαιρεθεί."
 };
 
 static const char* const ask_sound[LANGUAGE_COUNT] = {
     "How loud should this machine be?",
     "Насколько громкой должна быть эта машина?",
-    "Наскільки гучною має бути ця машина?"
+    "Наскільки гучною має бути ця машина?",
+    "Πόσο δυνατά πρέπει να ακούγεται αυτό το μηχάνημα;"
 };
 
 static const char* const levels[LANGUAGE_COUNT][3] = {
     { "Quiet", "Normal", "Loud" },
     { "Тихо", "Обычно", "Громко" },
-    { "Тихо", "Звичайно", "Гучно" }
+    { "Тихо", "Звичайно", "Гучно" },
+    { "Ήσυχα", "Κανονικά", "Δυνατά" }
 };
 
 static const char* const done[LANGUAGE_COUNT] = {
@@ -138,13 +147,20 @@ static const char* const done[LANGUAGE_COUNT] = {
     "Mizu готов. Наберите \\MIZU\\MIZU, чтобы запустить, или запустите MIZUCFG "
     "снова, чтобы это изменить.",
     "Mizu готовий. Наберіть \\MIZU\\MIZU, щоб запустити, або запустіть MIZUCFG "
-    "знову, щоб це змінити."
+    "знову, щоб це змінити.",
+    "Το Mizu είναι έτοιμο. Πληκτρολογήστε \\MIZU\\MIZU για να το ξεκινήσετε "
+    "ή εκτελέστε ξανά το MIZUCFG για να αλλάξετε αυτές τις ρυθμίσεις."
 };
+
+static void preview_language(int selected) {
+    language_preview(selected);
+}
 
 int main(void) {
     static const char* names[LANGUAGE_COUNT];
-    static const int percent[] = { 25, 60, 100 };
+    static const int percent[] = { 25, 50, 100 };
     int language;
+    int original_language;
     int autostart;
     int loudness;
 
@@ -153,11 +169,21 @@ int main(void) {
 
     for (int index = 0; index < LANGUAGE_COUNT; index++)
         names[index] = language_name(index);
-    language = dialog_menu("Language / Язык / Мова",
+
+    original_language = language_current();
+
+    language = dialog_menu("Language / Язык / Мова / Γλώσσα",
                            "Which language should this machine speak?",
-                           names, 0, LANGUAGE_COUNT, language_current());
-    if (language < 0) language = language_current();
-    language_set(language);
+                           names, 0, LANGUAGE_COUNT,
+                           original_language,
+                           preview_language);
+
+    if (language < 0) {
+        language_preview(original_language);
+        language = original_language;
+    } else {
+        language_set(language);
+    }
 
     dialog_message("Mizu", welcome[language]);
 
@@ -169,7 +195,7 @@ int main(void) {
                        "affected.");
 
     loudness = dialog_menu("Sound", ask_sound[language], levels[language], 0,
-                           3, 1);
+                           3, 1, 0);
     if (loudness >= 0) {
         char text[8];
         koi_snprintf(text, sizeof(text), "%d", percent[loudness]);

@@ -49,3 +49,7 @@ Thumbs.db
 # Host-side bench helper, not part of the system
 lan.sh
 koi.log
+
+# Other stuff
+wall.bmp
+*.txt

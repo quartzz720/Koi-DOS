@@ -36,8 +36,11 @@ int dialog_yesno(const char* title, const char* text, int yes_by_default);
 /* One of a list. `items` are the labels; `notes` may be NULL, or a matching
    list of second columns. Returns the index chosen, or -1 for Esc. */
 int dialog_menu(const char* title, const char* text,
-                const char* const* items, const char* const* notes,
-                int count, int selected);
+                const char* const* items,
+                const char* const* notes,
+                int count,
+                int selected,
+                void (*on_change)(int selected));
 
 /* A line of text. `buffer` arrives holding the default and leaves holding the
    answer. Returns 1 when accepted, 0 for Esc. */

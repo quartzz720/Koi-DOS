@@ -8,7 +8,7 @@
  * A table rather than files of translations on disk: this is a shell with
  * thirty phrases in it, and a loader, a format and a missing-file case would
  * all be larger than the thing they carry. When there are three hundred
- * phrases and somebody outside this repository wants to add a fourth language,
+ * phrases and somebody outside this repository wants to add a fifth language,
  * this is the file that changes and nothing else is.
  *
  * The choice lives in the settings under SYSTEM, not under any one program's
@@ -16,7 +16,7 @@
  * application.
  *
  * Every string is UTF-8. Nothing here is padded to a width or assumed to be
- * one byte per letter - a Russian label is twice the bytes of an English one
+ * one byte per letter - a Ukrainian, Russian, or Greek label is twice the bytes of an English one
  * and the same number of columns, and code that confuses the two draws boxes
  * of the wrong size.
  */
@@ -24,7 +24,8 @@
 #define LANGUAGE_EN 0
 #define LANGUAGE_RU 1
 #define LANGUAGE_UK 2
-#define LANGUAGE_COUNT 3
+#define LANGUAGE_EL 3
+#define LANGUAGE_COUNT 4
 
 /* Read the choice from the settings. Falls back to English, which is also what
    a machine that has never been asked gets. */
@@ -33,10 +34,15 @@ int language_current(void);
 void language_set(int language);      /* for the moment of choosing */
 const char* language_name(int language);
 
+/* Changes what say() returns without persisting it. For letting someone
+   see a language before committing to it - Esc must be able to undo this,
+   and a setting written to disk cannot be undone by walking away. */
+void language_preview(int language);
+
 /* The phrases. Kept as an enum rather than as strings looked up by name: a
    misspelt name is a run-time hole, and a misspelt enum does not build. */
 enum {
-    SAY_DESKTOP_TITLE,
+    SAY_DESKTOP_TITLE, DIALOG_YES, DIALOG_NO, DIALOG_OK, DIALOG_CANCEL,
     SAY_MENU_SYSTEM, SAY_MENU_RUN, SAY_MENU_VIEW, SAY_MENU_FILE,
     SAY_MENU_FORMAT, SAY_MENU_OPTIONS,
     SAY_ABOUT, SAY_EXIT, SAY_CONTROL_PANEL, SAY_CLOCK, SAY_COMMANDER,

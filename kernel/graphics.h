@@ -84,4 +84,9 @@ void graphics_text_styled(int x, int y, const char* text, boot_uint32_t color,
                           boot_uint32_t background, int transparent,
                           int style);
 
+/* Restrict drawing to a rectangle. New calls intersect with the current
+   scissor, and `graphics_reset_scissor` restores the full framebuffer. */
+void graphics_scissor(int x, int y, int width, int height);
+void graphics_reset_scissor(void);
+
 #endif

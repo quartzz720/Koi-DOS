@@ -292,6 +292,8 @@ if [ -f build/mizu.EXE ]; then
     mcopy -o -i "$SYSVOL" build/mizu.EXE ::/MIZU/MIZU.EXE
     [ -f build/mizucfg.EXE ] && \
         mcopy -o -i "$SYSVOL" build/mizucfg.EXE ::/MIZU/MIZUCFG.EXE
+    [ -f WALLPAPER.BMP ] && \
+        mcopy -o -i "$SYSVOL" WALLPAPER.BMP ::/MIZU/WALLPAPER.BMP
 fi
 
 # The licence, for the installer to show and for anyone who looks.
