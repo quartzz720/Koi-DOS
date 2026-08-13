@@ -385,6 +385,22 @@ static int find_program(const char* name, VOLUME** volume, char* path,
     if (!current_volume) return 0;
     *volume = current_volume;
 
+    /* A name that says which drive it is on is a location, not something to
+     * search for.
+     *
+     * `\MIZU\MIZU` already worked, because a leading backslash is handled
+     * below; `Z:\MIZU\MIZU` did not, and neither did anything else with a
+     * drive letter in front of it. Nothing complained in an obvious way - the
+     * search simply looked for a file whose name contained a colon in four
+     * directories that could not have one, and reported that there was no such
+     * command. CALL found it: writing out the full path to another batch file
+     * is the ordinary way to write one. */
+    for (boot_uint64_t index = 0; name[index]; index++) {
+        if (name[index] != ':') continue;
+        if (!resolve_path(name, volume, path)) return 0;
+        return fat32_stat(*volume, path, entry);
+    }
+
     /* The current directory first, then the root of the current drive. */
     for (int place = PROGRAM_SEARCH_CURRENT; place <= PROGRAM_SEARCH_ROOT && !found;
          place++) {
@@ -3909,7 +3925,8 @@ static void command_copy(const ARGUMENTS* arguments) {
     print_line(" bytes");
 }
 
-static void run_batch(VOLUME* volume, const char* path);
+static void run_batch(VOLUME* volume, const char* path,
+                      const char* arguments);
 
 /* Did the last thing that ran get stopped with Ctrl+C?
  *
@@ -3919,6 +3936,42 @@ static void run_batch(VOLUME* volume, const char* path);
  * AUTOEXEC.BAT, or a loop of commands - because the way out would be to
  * interrupt every command in the file one at a time. */
 static int interrupted;
+
+/* What the last thing to run returned, which is what `IF ERRORLEVEL` asks
+ * about.
+ *
+ * Kept for the built-in commands too, and set to zero by them, because DOS
+ * did: a batch file testing ERRORLEVEL after `copy` should see the result of
+ * the copy and not whatever a program left behind three lines earlier. Only
+ * the things that can fail set anything else. */
+static int last_exit_code;
+
+/* Batch state. All of it is about the file being read rather than about a
+ * command, which is why it lives here and not inside run_batch: GOTO is a
+ * command that has to tell the loop where to go next, and there is no other
+ * way for it to say so.
+ *
+ * `batch_echo` is ECHO ON/OFF, which survives across nested files as it did in
+ * DOS - a called file inherits the setting of the one that called it. */
+#define BATCH_LABEL_MAX 64
+#define BATCH_ARGUMENT_MAX 10
+
+static char batch_target[BATCH_LABEL_MAX];
+static int batch_jump;              /* a GOTO is waiting to be honoured */
+static int batch_quit;              /* GOTO :EOF, or a fault: end this file */
+static int batch_echo = 1;
+
+/* %0..%9 for the file being run. %0 is the file's own name, as in DOS. */
+static char batch_argument[BATCH_ARGUMENT_MAX][PATH_MAX];
+static int batch_argument_count;
+
+/* How many batch files are open. GOTO, IF and the loop that reads them all
+   need it, and they are spread across this file, so it is declared with the
+   rest of the batch state rather than beside the one function that used to
+   own it. */
+static int batch_depth;
+
+static void execute(const char* input);
 
 /* Page a file a screenful at a time. */
 static void command_more(const ARGUMENTS* arguments) {
@@ -4108,7 +4161,7 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
             for (int index = 0; index < 4; index++) name[length - 4 + index] = batch[index];
         }
         if (!find_program(name, &program_volume, path, &entry)) return 0;
-        run_batch(program_volume, path);
+        run_batch(program_volume, path, arguments->tail);
         return 1;
     }
     if (entry.attributes & FAT_ATTRIBUTE_DIRECTORY) return 0;
@@ -4117,7 +4170,7 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
     if (length > 4 && (name[length - 3] == 'B' || name[length - 3] == 'b') &&
         (name[length - 2] == 'A' || name[length - 2] == 'a') &&
         (name[length - 1] == 'T' || name[length - 1] == 't')) {
-        run_batch(current_volume, path);
+        run_batch(current_volume, path, arguments->tail);
         return 1;
     }
 
@@ -4144,6 +4197,10 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
         console_use_theme();
     } else if (code == PROGRAM_REFUSED) {
         /* program_run() has already said why, in more detail than this could. */
+    }
+    last_exit_code = (code == PROGRAM_OK) ? exit_code : 1;
+    if (code == PROGRAM_NOT_LOADABLE || code == PROGRAM_REFUSED) {
+        /* already reported above */
     } else if (exit_code == KOI_EXIT_INTERRUPTED) {
         /* Ctrl+C already printed itself, at the moment it happened. Saying
            "Exit code 130" underneath it would be the same news twice, in a
@@ -4238,6 +4295,240 @@ static void command_set(const char* tail) {
     }
 }
 
+/* ---- The batch language --------------------------------------------------
+ *
+ * Enough of it to write something that decides. A file of commands in order is
+ * a list; GOTO, IF and CALL are what make it a program, and the difference is
+ * the whole reason AUTOEXEC.BAT and an installer can be written at all.
+ */
+
+/* PAUSE. The message is DOS's, and so is the detail that any key will do -
+   including the ones that are not characters, which is why this reads an
+   event rather than a line. */
+static void command_pause(void) {
+    print("Press any key to continue . . .");
+    (void)keyboard_getchar();
+    print_line("");
+}
+
+/* GOTO. Says where, and lets the loop reading the file do the going: only that
+   loop knows where the lines are. `GOTO :EOF` ends the file, which is the
+   spelling later DOS versions settled on and the one people write. */
+static void command_goto(const ARGUMENTS* arguments) {
+    const char* target = skip_spaces(arguments->tail);
+    boot_uint64_t length = 0;
+
+    if (!batch_depth) {
+        print_line("GOTO is only meaningful in a batch file.");
+        return;
+    }
+    if (*target == ':') target++;
+    if (!*target) { print_line("Usage: goto label"); return; }
+    if (word_is(target, "EOF")) { batch_quit = 1; return; }
+
+    while (target[length] && !is_space(target[length]) &&
+           length + 1 < BATCH_LABEL_MAX) {
+        batch_target[length] = target[length];
+        length++;
+    }
+    batch_target[length] = 0;
+    batch_jump = 1;
+}
+
+/* Two words the same, ignoring case and nothing else.
+ *
+ * The quotes people write around the operands - IF "%A%"=="" - are not
+ * special: they are compared like any other character, which is exactly what
+ * makes the idiom work. An empty variable leaves "" on the left and "" was
+ * written on the right, and the two match. */
+static int same_text(const char* left, boot_uint64_t left_length,
+                     const char* right, boot_uint64_t right_length) {
+    if (left_length != right_length) return 0;
+    for (boot_uint64_t index = 0; index < left_length; index++)
+        if (upper(left[index]) != upper(right[index])) return 0;
+    return 1;
+}
+
+/* IF, in the three shapes DOS had:
+ *
+ *     IF [NOT] ERRORLEVEL n  command
+ *     IF [NOT] a==b          command
+ *     IF [NOT] EXIST file    command
+ *
+ * ERRORLEVEL is "n or more", which is not an accident of implementation: a
+ * program returning a larger number means something worse happened, and the
+ * test is written to read that way. */
+static void command_if(const char* tail) {
+    const char* cursor = skip_spaces(tail);
+    int negated = 0;
+    int truth = 0;
+
+    if (word_is(cursor, "NOT")) {
+        negated = 1;
+        while (*cursor && !is_space(*cursor)) cursor++;
+        cursor = skip_spaces(cursor);
+    }
+
+    if (word_is(cursor, "ERRORLEVEL")) {
+        int wanted = 0;
+        int digits = 0;
+
+        while (*cursor && !is_space(*cursor)) cursor++;
+        cursor = skip_spaces(cursor);
+        while (*cursor >= '0' && *cursor <= '9') {
+            wanted = wanted * 10 + (*cursor++ - '0');
+            digits++;
+        }
+        if (!digits) { print_line("IF ERRORLEVEL wants a number."); return; }
+        truth = last_exit_code >= wanted;
+    } else if (word_is(cursor, "EXIST")) {
+        char name[PATH_MAX];
+        char path[PATH_MAX];
+        VOLUME* volume;
+        FAT_ENTRY entry;
+        boot_uint64_t length = 0;
+
+        while (*cursor && !is_space(*cursor)) cursor++;
+        cursor = skip_spaces(cursor);
+        while (cursor[length] && !is_space(cursor[length]) &&
+               length + 1 < PATH_MAX) {
+            name[length] = cursor[length];
+            length++;
+        }
+        name[length] = 0;
+        cursor += length;
+        truth = name[0] && resolve_path(name, &volume, path) &&
+                fat32_stat(volume, path, &entry);
+    } else {
+        /* a==b. The left side runs to the `==`, so a value with a space in it
+           still compares as one thing. */
+        const char* left = cursor;
+        const char* equals = cursor;
+        const char* right;
+        boot_uint64_t right_length = 0;
+
+        while (*equals && !(equals[0] == '=' && equals[1] == '=')) equals++;
+        if (!*equals) {
+            print_line("IF wants ERRORLEVEL, EXIST, or a==b comparison.");
+            return;
+        }
+        right = equals + 2;
+        while (right[right_length] && !is_space(right[right_length]))
+            right_length++;
+        truth = same_text(left, (boot_uint64_t)(equals - left),
+                          right, right_length);
+        cursor = right + right_length;
+    }
+
+    if (negated) truth = !truth;
+
+    cursor = skip_spaces(cursor);
+    if (!*cursor) return;      /* a condition with nothing to do is not an error */
+    if (truth) execute(cursor);
+}
+
+/* FOR %v IN (a b c) DO command
+ *
+ * The loop variable is an ordinary environment variable while the loop runs,
+ * which is why the command inside can say %v and get what everything else
+ * gets. It is removed afterwards, unless it had a value before - a loop that
+ * quietly destroys somebody's variable is a loop nobody can nest.
+ *
+ * This is handed the line before %NAME% expansion, and it has to be. Every
+ * other command sees an expanded line, but `%v` in the body must survive until
+ * the loop sets it: expanded first, it would become nothing and the loop would
+ * run its command with a hole in it. DOS solved the same problem by making it
+ * `%%v` in batch files and `%v` at the prompt, which is a rule people get
+ * wrong constantly. Both are accepted here and mean the same thing.
+ */
+static void command_for(const char* tail) {
+    char name[ENVIRONMENT_NAME_MAX];
+    char item[PATH_MAX];
+    char body_line[INPUT_MAX];
+    const char* cursor = skip_spaces(tail);
+    const char* body;
+    const char* set_end;
+    boot_uint64_t length = 0;
+
+    if (*cursor != '%') { print_line("Usage: for %v in (set) do command"); return; }
+    cursor++;
+    if (*cursor == '%') cursor++;          /* %%v, as written in a batch file */
+    while (*cursor && !is_space(*cursor) && length + 1 < sizeof(name))
+        name[length++] = *cursor++;
+    name[length] = 0;
+    if (!name[0]) { print_line("Usage: for %v in (set) do command"); return; }
+
+    cursor = skip_spaces(cursor);
+    if (!word_is(cursor, "IN")) { print_line("FOR wants IN after the variable."); return; }
+    while (*cursor && !is_space(*cursor)) cursor++;
+    cursor = skip_spaces(cursor);
+    if (*cursor != '(') { print_line("FOR wants a (set) in brackets."); return; }
+    cursor++;
+
+    /* The body is found before the loop runs: the set is walked item by item
+       and the DO command does not move. */
+    body = cursor;
+    while (*body && *body != ')') body++;
+    if (!*body) { print_line("FOR is missing its closing bracket."); return; }
+    set_end = body;
+    body = skip_spaces(body + 1);
+    if (!word_is(body, "DO")) { print_line("FOR wants DO after the set."); return; }
+    while (*body && !is_space(*body)) body++;
+    body = skip_spaces(body);
+    if (!*body) { print_line("FOR has nothing to do."); return; }
+
+    while (cursor < set_end) {
+        boot_uint64_t out = 0;
+        const char* scan;
+
+        length = 0;
+        while (cursor < set_end && (is_space(*cursor) || *cursor == ',')) cursor++;
+        while (cursor < set_end && !is_space(*cursor) && *cursor != ',' &&
+               length + 1 < sizeof(item))
+            item[length++] = *cursor++;
+        item[length] = 0;
+        if (!item[0]) continue;
+
+        /* The loop puts the item into the body itself rather than into a
+         * variable for the expander to find later.
+         *
+         * That was the first attempt and it does not work: %%v is how a batch
+         * file spells the variable, and %% is also how a line escapes a
+         * percent sign - so the expander turned `%%v` into `%v` and printed
+         * it, and the loop ran three times producing the same literal text.
+         * FOR did the substituting in DOS too. Anything else on the line is
+         * left alone and expanded afterwards, so %PATH% beside %%v still
+         * works. */
+        for (scan = body; *scan && out + 1 < sizeof(body_line); ) {
+            const char* after = scan;
+            boot_uint64_t at = 0;
+
+            if (*after != '%') { body_line[out++] = *scan++; continue; }
+            after++;
+            if (*after == '%') after++;
+            while (name[at] && after[at] && upper(after[at]) == upper(name[at]))
+                at++;
+            if (name[at] || (after[at] >= 'A' && after[at] <= 'Z') ||
+                (after[at] >= 'a' && after[at] <= 'z') ||
+                (after[at] >= '0' && after[at] <= '9')) {
+                /* Some other name, or a longer one that merely starts the
+                   same. Left for the expander. */
+                body_line[out++] = *scan++;
+                continue;
+            }
+            for (const char* value = item; *value && out + 1 < sizeof(body_line); value++)
+                body_line[out++] = *value;
+            scan = after + at;
+        }
+        body_line[out] = 0;
+
+        execute(body_line);
+        /* Ctrl+C stops the loop, not only the command inside it. A loop that
+           had to be interrupted once per item would not be interruptible. */
+        if (interrupted || batch_quit || batch_jump) break;
+    }
+}
+
 /* "Z:" on its own switches drives, exactly as it always did. */
 static int try_drive_change(const char* input) {
     VOLUME* volume;
@@ -4255,7 +4546,6 @@ static int try_drive_change(const char* input) {
     return 1;
 }
 
-static void execute(const char* input);
 
 /* Run a batch file: one line, one command.
  *
@@ -4266,15 +4556,76 @@ static void execute(const char* input);
  * `@` at the start of a line suppresses the echo, `rem` and `:` are comments
  * and labels - the three pieces of syntax worth having before variables and
  * control flow exist. */
-static int batch_depth;
 
-static void run_batch(VOLUME* volume, const char* path) {
+/* Is this line the label GOTO is looking for?
+ *
+ * A label is a colon and a name. Anything after the name on the same line is
+ * ignored, which is how `:done  the end` works and how DOS behaved. */
+static int line_is_label(const char* line, const char* wanted) {
+    boot_uint64_t length = 0;
+
+    line = skip_spaces(line);
+    if (*line != ':') return 0;
+    line = skip_spaces(line + 1);
+    while (line[length] && !is_space(line[length])) length++;
+    return same_text(line, length, wanted, strlen(wanted));
+}
+
+/* %0..%9, replaced before anything else looks at the line.
+ *
+ * Done here rather than in environment_expand because these belong to the file
+ * being run, not to the machine: two batch files running one after the other
+ * have different %1 and the same PATH. A digit with no argument becomes
+ * nothing, as it did in DOS - which is what makes `IF "%1"=="" goto usage`
+ * the standard way to check. */
+static void expand_batch_arguments(const char* input, char* output,
+                                   boot_uint64_t size) {
+    boot_uint64_t out = 0;
+
+    while (*input && out + 1 < size) {
+        int which;
+
+        if (input[0] != '%' || input[1] < '0' || input[1] > '9') {
+            output[out++] = *input++;
+            continue;
+        }
+        which = input[1] - '0';
+        input += 2;
+        if (which >= batch_argument_count) continue;
+        for (const char* value = batch_argument[which];
+             *value && out + 1 < size; value++)
+            output[out++] = *value;
+    }
+    output[out] = 0;
+}
+
+/* Run a batch file: one line at a time, with somewhere to go.
+ *
+ * The whole file is in memory, which is what makes GOTO possible at all: a
+ * label is found by walking the lines from the start, and a file read a line
+ * at a time off the disk could only ever go forwards.
+ *
+ * Nesting is allowed now, to a depth. CALL is the reason - a batch file that
+ * calls another and carries on afterwards is how anything longer than a screen
+ * gets written - and a limit rather than none because a file that calls itself
+ * is a mistake somebody will make on their first afternoon, and the machine
+ * should say so rather than run out of stack. */
+#define BATCH_DEPTH_MAX 4
+
+static void run_batch(VOLUME* volume, const char* path, const char* arguments) {
     FAT_ENTRY entry;
     char* contents;
+    char raw[INPUT_MAX];
     char line[INPUT_MAX];
     boot_uint32_t offset = 0;
+    char saved_arguments[BATCH_ARGUMENT_MAX][PATH_MAX];
+    int saved_count;
+    int saved_echo = batch_echo;
 
-    if (batch_depth) { print_line("Batch files cannot be nested."); return; }
+    if (batch_depth >= BATCH_DEPTH_MAX) {
+        print_line("Batch files are nested too deeply.");
+        return;
+    }
     if (!fat32_stat(volume, path, &entry)) return;
     if (entry.attributes & FAT_ATTRIBUTE_DIRECTORY) return;
     if (!entry.size) return;
@@ -4289,8 +4640,34 @@ static void run_batch(VOLUME* volume, const char* path) {
     }
     contents[offset] = 0;
 
+    /* The caller's arguments are put back afterwards, so a called file cannot
+       change what %1 means in the file that called it. */
+    memcpy(saved_arguments, batch_argument, sizeof(saved_arguments));
+    saved_count = batch_argument_count;
+    {
+        const char* cursor = arguments ? skip_spaces(arguments) : "";
+        boot_uint64_t length = 0;
+
+        while (path[length] && length + 1 < PATH_MAX) {
+            batch_argument[0][length] = path[length];
+            length++;
+        }
+        batch_argument[0][length] = 0;
+        batch_argument_count = 1;
+
+        while (*cursor && batch_argument_count < BATCH_ARGUMENT_MAX) {
+            length = 0;
+            while (*cursor && !is_space(*cursor) && length + 1 < PATH_MAX)
+                batch_argument[batch_argument_count][length++] = *cursor++;
+            batch_argument[batch_argument_count][length] = 0;
+            if (length) batch_argument_count++;
+            cursor = skip_spaces(cursor);
+        }
+    }
+
     batch_depth++;
-    for (boot_uint32_t index = 0; index < offset;) {
+    batch_quit = 0;
+    for (boot_uint32_t index = 0; index < offset && !batch_quit;) {
         boot_uint64_t length = 0;
         int quiet = 0;
         const char* command;
@@ -4298,18 +4675,20 @@ static void run_batch(VOLUME* volume, const char* path) {
         while (index < offset && contents[index] != '\n' &&
                length + 1 < INPUT_MAX) {
             char character = contents[index++];
-            if (character != '\r') line[length++] = character;
+            if (character != '\r') raw[length++] = character;
         }
         while (index < offset && contents[index] != '\n') index++;
         if (index < offset) index++;
-        line[length] = 0;
+        raw[length] = 0;
+
+        expand_batch_arguments(raw, line, sizeof(line));
 
         command = skip_spaces(line);
         if (*command == '@') { quiet = 1; command = skip_spaces(command + 1); }
         if (!*command || *command == ':') continue;
         if (word_is(command, "REM")) continue;
 
-        if (!quiet) {
+        if (!quiet && batch_echo) {
             print_prompt();
             print_line(command);
         }
@@ -4319,8 +4698,49 @@ static void run_batch(VOLUME* volume, const char* path) {
             print_line("Batch job stopped.");
             break;
         }
+        if (!batch_jump) continue;
+
+        /* A GOTO. The label is looked for from the top, so it may be behind us
+           - which is the only way to write a loop. */
+        batch_jump = 0;
+        {
+            boot_uint32_t at = 0;
+            int found = 0;
+
+            while (at < offset) {
+                boot_uint32_t start = at;
+
+                while (at < offset && contents[at] != '\n') at++;
+                {
+                    char candidate[INPUT_MAX];
+                    boot_uint64_t copied = 0;
+
+                    while (start + copied < at && copied + 1 < INPUT_MAX) {
+                        char character = contents[start + copied];
+                        candidate[copied] = character == '\r' ? 0 : character;
+                        copied++;
+                    }
+                    candidate[copied] = 0;
+                    if (line_is_label(candidate, batch_target)) {
+                        index = at < offset ? at + 1 : at;
+                        found = 1;
+                    }
+                }
+                if (at < offset) at++;
+                if (found) break;
+            }
+            if (!found) {
+                print("Label not found: ");
+                print_line(batch_target);
+                break;
+            }
+        }
     }
     batch_depth--;
+    batch_quit = 0;
+    batch_echo = saved_echo;
+    memcpy(batch_argument, saved_arguments, sizeof(saved_arguments));
+    batch_argument_count = saved_count;
     kfree(contents);
 }
 
@@ -4339,8 +4759,27 @@ static void execute(const char* input) {
      * a command that had to remember to expand its own arguments is a command
      * that will forget. This is also what makes `set PATH=%PATH%;\GAMES` mean
      * what it says. */
+    /* FOR is looked at first, before expansion, and it is the only command
+       that is: its loop variable has to survive until the loop sets it. See
+       command_for. */
+    {
+        const char* raw = skip_spaces(input);
+        if (word_is(raw, "FOR")) {
+            while (*raw && !is_space(*raw)) raw++;
+            last_exit_code = 0;
+            command_for(raw);
+            return;
+        }
+    }
+
     environment_expand(input, expanded, sizeof(expanded));
     input = skip_spaces(expanded);
+
+    /* A built-in that has not failed leaves ERRORLEVEL at zero, as DOS did:
+       a batch file testing it after `copy` should see the copy's result and
+       not what a program left three lines earlier. The ones that can fail set
+       it themselves. */
+    last_exit_code = 0;
     if (try_drive_change(input)) return;
     parse_arguments(input, &arguments);
 
@@ -4392,7 +4831,42 @@ static void execute(const char* input) {
     /* `echo.` prints a blank line - the DOS idiom for one, since a bare
        `echo` prints the on/off state instead. */
     if (word_is(input, "ECHO.")) { print_line(""); return; }
-    if (word_is(input, "ECHO")) { print_line(arguments.tail); return; }
+    if (word_is(input, "ECHO")) {
+        const char* what = skip_spaces(arguments.tail);
+
+        /* ECHO ON and ECHO OFF are settings; everything else is text. `ECHO`
+           with nothing after it reports the setting, as DOS did, rather than
+           printing a blank line - which is what `ECHO.` is for. */
+        if (word_is(what, "ON")) { batch_echo = 1; return; }
+        if (word_is(what, "OFF")) { batch_echo = 0; return; }
+        if (!*what) {
+            print("ECHO is ");
+            print_line(batch_echo ? "on" : "off");
+            return;
+        }
+        print_line(arguments.tail);
+        return;
+    }
+    if (word_is(input, "PAUSE")) { command_pause(); return; }
+    if (word_is(input, "GOTO")) { command_goto(&arguments); return; }
+    if (word_is(input, "IF")) { command_if(arguments.tail); return; }
+    if (word_is(input, "SHIFT")) {
+        /* Everything moves down one, so a batch file can walk its arguments
+           without knowing how many there are. %0 goes with the rest, which is
+           what DOS did and what makes `:loop  ... shift  if not "%1"=="" goto
+           loop` terminate. */
+        for (int index = 0; index + 1 < batch_argument_count; index++)
+            memcpy(batch_argument[index], batch_argument[index + 1], PATH_MAX);
+        if (batch_argument_count) batch_argument_count--;
+        return;
+    }
+    if (word_is(input, "CALL")) {
+        const char* what = skip_spaces(arguments.tail);
+
+        if (!*what) { print_line("Usage: call file.bat [arguments]"); return; }
+        execute(what);
+        return;
+    }
     if (word_is(input, "MD") || word_is(input, "MKDIR")) {
         command_mkdir(&arguments);
         return;
@@ -4485,7 +4959,7 @@ __attribute__((noreturn)) void command_run(void) {
     if (current_volume) {
         FAT_ENTRY entry;
         if (fat32_stat(current_volume, "\\AUTOEXEC.BAT", &entry))
-            run_batch(current_volume, "\\AUTOEXEC.BAT");
+            run_batch(current_volume, "\\AUTOEXEC.BAT", "");
         run_chained();
     }
 

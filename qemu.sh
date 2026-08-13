@@ -241,6 +241,42 @@ mcopy -i "$SYSVOL" ARCHITECTURE.md "::/Architecture Notes.md"
 printf '@rem Koi-DOS startup\r\n@echo Welcome to Koi-DOS.\r\nver\r\n' \
   | mcopy -i "$SYSVOL" - ::/AUTOEXEC.BAT
 
+# A batch file that uses the whole language: labels and GOTO for a loop, IF in
+# its three shapes, FOR over a set, arguments and SHIFT, CALL into another
+# file, ECHO OFF and PAUSE. One file, because these are only worth having if
+# they work together.
+#
+# A here-document rather than printf: a backslash inside single quotes does not
+# continue a line, it is a backslash, and the first version of this wrote a
+# file full of stray ones.
+cat <<'BATCH' | mcopy -i "$SYSVOL" - ::/TRY.BAT
+@echo off
+@echo --- arguments ---
+:args
+if "%1"=="" goto noargs
+echo argument: %1
+shift
+goto args
+:noargs
+@echo --- for ---
+for %%c in (one two three) do echo item %%c
+@echo --- if exist ---
+if exist Z:\AUTOEXEC.BAT echo AUTOEXEC.BAT is there
+if not exist Z:\NOTHING.XYZ echo NOTHING.XYZ is not
+@echo --- errorlevel ---
+where
+if not errorlevel 1 echo it returned zero
+@echo --- call ---
+call Z:\SUB.BAT from-the-caller
+@echo --- back, and echo is still off ---
+goto :eof
+echo THIS MUST NOT PRINT
+BATCH
+
+cat <<'BATCH' | mcopy -i "$SYSVOL" - ::/SUB.BAT
+@echo sub.bat says: %1
+BATCH
+
 # A WAD, if there is one on this machine, so the DOOM package has data to find.
 #
 # Copied from ~/TestOS/doom and never from the package tree: the port is
