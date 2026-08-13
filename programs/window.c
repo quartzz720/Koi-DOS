@@ -114,7 +114,18 @@ static int load_wallpaper(void) {
     long target_height;
 
     free_wallpaper();
-    handle = koi_open("\\MIZU\\WALLPAPER.BMP", OPEN_READ);
+    /* Beside the program, not at a written-down address.
+     *
+     * This said "\MIZU\WALLPAPER.BMP", which was true of every machine until
+     * the day somebody installed the package somewhere else - and dosget
+     * chooses that directory, not this file. Asking where the program was
+     * loaded from costs one call and is right wherever it ends up. */
+    {
+        char path[128];
+
+        if (!koi_beside("WALLPAPER.BMP", path, sizeof(path))) return 0;
+        handle = koi_open(path, OPEN_READ);
+    }
     if (handle < 0) return 0;
     if (!read_exactly(handle, header, HEADER_SIZE)) { koi_close(handle); return 0; }
     if (header[0] != 'B' || header[1] != 'M') { koi_close(handle); return 0; }

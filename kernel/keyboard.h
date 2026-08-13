@@ -37,6 +37,18 @@ int keyboard_init(void);
    reaches the shell the same way whichever kind of keyboard produced it. */
 void keyboard_submit(int key);
 
+/* Has Ctrl+C been pressed since this was last asked? Taking it clears it, so
+ * two askers cannot both act on one press.
+ *
+ * The keyboard only records it. Where a program is actually stopped is a
+ * decision for the kernel, and the only safe place to make it is somewhere the
+ * program has entered the kernel deliberately - see syscall.c. */
+int keyboard_break_taken(void);
+
+/* Forget any press that has not been acted on. Called before a program starts,
+   so a Ctrl+C aimed at the last one does not land on the next. */
+void keyboard_break_clear(void);
+
 /* Non-blocking: returns 0 when nothing is buffered. */
 /* Is there any way at all to read a keystroke - PS/2 or USB?
  *

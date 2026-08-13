@@ -19,6 +19,7 @@
 #include "mouse.h"
 
 #include "config.h"
+#include "environment.h"
 #include "timer.h"
 #include "fat32.h"
 #include "partition.h"
@@ -410,13 +411,74 @@ static int find_program(const char* name, VOLUME** volume, char* path,
     return found;
 }
 
-static void print_prompt(void) {
-    console_set_color(console_theme()->prompt, console_theme()->background);
-    if (current_volume) put(current_volume->letter);
-    else put('?');
+/* Just the numbers, for the prompt. The commands below say "Current time is"
+   around them, which is right there and wrong in a prompt. */
+static void print_time_of_day(void) {
+    RTC_TIME now;
+    rtc_read(&now);
+    print_two_digits(now.hour);
     put(':');
-    print(current_path);
-    print("> ");
+    print_two_digits(now.minute);
+}
+
+static void print_date_of_today(void) {
+    RTC_TIME now;
+    rtc_read(&now);
+    print_dec(now.year);
+    put('-');
+    print_two_digits(now.month);
+    put('-');
+    print_two_digits(now.day);
+}
+
+/* The prompt, which is `$P$G` unless somebody has said otherwise.
+ *
+ * The codes are DOS's, and the reason to use theirs rather than invent any is
+ * that people already have `SET PROMPT=$P$G` in their fingers. Anything after
+ * a `$` that is not a code prints as itself, so a prompt with a stray dollar
+ * in it is odd-looking rather than swallowed. */
+static void print_prompt(void) {
+    const char* format = environment_get("PROMPT");
+
+    console_set_color(console_theme()->prompt, console_theme()->background);
+    if (!format || !format[0]) format = "$P$G";
+
+    while (*format) {
+        char code;
+
+        if (*format != '$') { put(*format++); continue; }
+        if (!format[1]) { put('$'); break; }
+        code = format[1];
+        format += 2;
+        if (code >= 'a' && code <= 'z') code = (char)(code - 32);
+        switch (code) {
+        case 'P':                                   /* drive and directory */
+            if (current_volume) put(current_volume->letter);
+            else put('?');
+            put(':');
+            print(current_path);
+            break;
+        case 'N':                                   /* the drive alone */
+            if (current_volume) put(current_volume->letter);
+            else put('?');
+            break;
+        case 'G': put('>'); break;
+        case 'L': put('<'); break;
+        case 'B': put('|'); break;
+        case 'Q': put('='); break;
+        case 'S': put(' '); break;
+        case '$': put('$'); break;
+        case '_': put('\n'); break;
+        case 'T': print_time_of_day(); break;
+        case 'D': print_date_of_today(); break;
+        default:
+            /* Not a code. Both characters, as they were typed. */
+            put('$');
+            put(format[-1]);
+            break;
+        }
+    }
+    print(" ");
     console_use_theme();
 }
 
@@ -464,6 +526,7 @@ static void command_help(void) {
     print_line("attrib [+-RHSA] file   show or change attributes");
     print_line("vol            show the volume label");
     print_line("mem            memory, devices and volumes");
+    print_line("set [n=v]      environment variables; PATH and PROMPT live here");
     print_line("pci            every function on the PCI bus");
     print_line("disk           disks and partitions, letters or not");
     print_line("chkdsk [d:] [/F]  check a volume, /F to repair what it finds");
@@ -3848,6 +3911,15 @@ static void command_copy(const ARGUMENTS* arguments) {
 
 static void run_batch(VOLUME* volume, const char* path);
 
+/* Did the last thing that ran get stopped with Ctrl+C?
+ *
+ * A batch file is a list of commands somebody wanted run in order, and
+ * stopping one of them means stopping that. Carrying on to the next line would
+ * make Ctrl+C useless against exactly the case it exists for - a long
+ * AUTOEXEC.BAT, or a loop of commands - because the way out would be to
+ * interrupt every command in the file one at a time. */
+static int interrupted;
+
 /* Page a file a screenful at a time. */
 static void command_more(const ARGUMENTS* arguments) {
     char path[PATH_MAX];
@@ -4072,6 +4144,11 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
         console_use_theme();
     } else if (code == PROGRAM_REFUSED) {
         /* program_run() has already said why, in more detail than this could. */
+    } else if (exit_code == KOI_EXIT_INTERRUPTED) {
+        /* Ctrl+C already printed itself, at the moment it happened. Saying
+           "Exit code 130" underneath it would be the same news twice, in a
+           form nobody asked for. What it does do is stop a batch file. */
+        interrupted = 1;
     } else if (exit_code != 0) {
         /* DOS reported a non-zero exit only through ERRORLEVEL in batch files;
            printing it is more use at an interactive prompt. A negative one is
@@ -4087,6 +4164,78 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
         print("\n");
     }
     return 1;
+}
+
+/* `SET`, and the rule about what counts as the name.
+ *
+ * `SET NAME=VALUE` sets, `SET NAME=` removes, `SET` alone lists. The split is
+ * at the first `=` and nowhere else, because a value may contain one and a
+ * name may not - `SET PROMPT=$P$G` and `SET GREETING=a=b` both mean what they
+ * look like.
+ *
+ * Spaces around the `=` are not eaten. DOS did not eat them either, and it
+ * matters: `SET PATH = \BIN` sets a variable called "PATH " to " \BIN", and a
+ * shell that quietly tidied that up would be a shell where the same line means
+ * two different things depending on who typed it. The name is trimmed of what
+ * comes before it and nothing else. */
+static void command_set(const char* tail) {
+    char name[ENVIRONMENT_NAME_MAX];
+    const char* cursor = skip_spaces(tail);
+    const char* equals = cursor;
+    boot_uint64_t length = 0;
+
+    if (!*cursor) {
+        const char* variable;
+        const char* value;
+
+        for (int index = 0; environment_at(index, &variable, &value); index++) {
+            print(variable);
+            put('=');
+            print_line(value);
+        }
+        return;
+    }
+
+    while (*equals && *equals != '=') equals++;
+    if (!*equals) {
+        /* `SET NAME` on its own shows one, which is what somebody checking
+           reaches for before they find that `SET` lists everything. */
+        const char* value;
+
+        while (cursor[length] && length + 1 < sizeof(name))
+            { name[length] = cursor[length]; length++; }
+        name[length] = 0;
+        while (length && name[length - 1] == ' ') name[--length] = 0;
+        value = environment_get(name);
+        if (!value) {
+            print(name);
+            print_line(" is not set.");
+            return;
+        }
+        /* Printed under the name it is stored as, not the one that was just
+           typed: names are matched without case, and echoing back `path` when
+           the variable is `PATH` would suggest there are two of them. */
+        {
+            const char* stored;
+            const char* ignored;
+
+            for (int index = 0; environment_at(index, &stored, &ignored); index++)
+                if (environment_get(stored) == value) { print(stored); break; }
+        }
+        put('=');
+        print_line(value);
+        return;
+    }
+
+    while (cursor + length < equals && length + 1 < sizeof(name))
+        { name[length] = cursor[length]; length++; }
+    name[length] = 0;
+
+    if (!name[0]) { print_line("Usage: set NAME=value"); return; }
+    if (!environment_set(name, equals + 1)) {
+        print_line("No room for another variable, or the value is too long.");
+        return;
+    }
 }
 
 /* "Z:" on its own switches drives, exactly as it always did. */
@@ -4164,7 +4313,12 @@ static void run_batch(VOLUME* volume, const char* path) {
             print_prompt();
             print_line(command);
         }
+        interrupted = 0;
         execute(command);
+        if (interrupted) {
+            print_line("Batch job stopped.");
+            break;
+        }
     }
     batch_depth--;
     kfree(contents);
@@ -4175,9 +4329,18 @@ void command_execute_line(const char* line) {
 }
 
 static void execute(const char* input) {
+    char expanded[INPUT_MAX];
     ARGUMENTS arguments;
 
-    input = skip_spaces(input);
+    /* %NAME% becomes its value before anything else looks at the line.
+     *
+     * Before, and not inside each command, because it has to work everywhere a
+     * word can appear - a file name, a switch, the right-hand side of SET - and
+     * a command that had to remember to expand its own arguments is a command
+     * that will forget. This is also what makes `set PATH=%PATH%;\GAMES` mean
+     * what it says. */
+    environment_expand(input, expanded, sizeof(expanded));
+    input = skip_spaces(expanded);
     if (try_drive_change(input)) return;
     parse_arguments(input, &arguments);
 
@@ -4202,6 +4365,7 @@ static void execute(const char* input) {
     if (word_is(input, "DATE")) { command_date(); return; }
     if (word_is(input, "TIME")) { command_time(); return; }
     if (word_is(input, "VER")) { command_ver(); return; }
+    if (word_is(input, "SET")) { command_set(arguments.tail); return; }
     if (word_is(input, "BEEP")) { command_beep(&arguments); return; }
     if (word_is(input, "SOUND")) { command_sound(&arguments); return; }
     if (word_is(input, "NET")) {

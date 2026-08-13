@@ -241,6 +241,21 @@ mcopy -i "$SYSVOL" ARCHITECTURE.md "::/Architecture Notes.md"
 printf '@rem Koi-DOS startup\r\n@echo Welcome to Koi-DOS.\r\nver\r\n' \
   | mcopy -i "$SYSVOL" - ::/AUTOEXEC.BAT
 
+# A WAD, if there is one on this machine, so the DOOM package has data to find.
+#
+# Copied from ~/TestOS/doom and never from the package tree: the port is
+# GPL-2.0 and the game data is not ours to ship. It lands in the root rather
+# than in \DOOM, so that a test can move it and prove where the program looks.
+# Nothing here fails when the file is absent.
+if [ -f "$HOME/TestOS/doom/DOOM.WAD" ]; then
+    mcopy -o -i "$SYSVOL" "$HOME/TestOS/doom/DOOM.WAD" ::/DOOM.WAD
+fi
+
+# A batch file that runs something which does not stop, so Ctrl+C can be shown
+# to end the batch rather than only the command inside it.
+printf '@echo before\r\n@spin\r\n@echo AFTER - this line must not run\r\n' \
+  | mcopy -i "$SYSVOL" - ::/LOOP.BAT
+
 # Where packages come from, on this bench.
 #
 # 10.0.2.2 is slirp's own address, and slirp is already serving the package

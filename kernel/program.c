@@ -1,4 +1,5 @@
 #include "program.h"
+#include "keyboard.h"
 #include "fat32.h"
 #include "memory.h"
 #include "string.h"
@@ -439,6 +440,11 @@ int program_run(VOLUME* volume, const char* path, const char* arguments,
         slots[slot].path[index] = 0;
     }
     slots[slot].exit_code = 0;
+    /* A Ctrl+C nobody acted on belongs to whatever it was aimed at, which is
+       not this. Pressed at the prompt it stops here; pressed at a program that
+       had already finished, likewise. Without this it would be waiting for the
+       next program to make its first system call, and stop that one instead. */
+    keyboard_break_clear();
 
     if (program_save(&resume[slot])) {
         /* Arrived here through program_exit(). Whatever this program was

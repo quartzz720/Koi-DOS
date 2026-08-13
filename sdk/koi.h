@@ -133,6 +133,23 @@ static inline long koi_readline(char* buffer, long size) {
     return koi_call(SYS_READLINE, (long)buffer, size, 0);
 }
 
+/* The environment, as the shell has it. Returns the length, or 0 when there is
+ * no such variable - so `koi_getenv("PATH", ...)` both fetches it and answers
+ * whether it is set.
+ *
+ * Read-only, deliberately: there is one environment because there is one
+ * program running at a time, and a program that wrote it would be changing the
+ * shell's for good. */
+static inline long koi_getenv(const char* name, char* buffer, long size) {
+    return koi_call(SYS_GETENV, (long)name, (long)buffer, size);
+}
+
+/* The name of the index-th variable, for listing them. Returns 0 when there
+   are no more. */
+static inline long koi_env_at(long index, char* name, long size) {
+    return koi_call(SYS_ENVAT, index, (long)name, size);
+}
+
 static inline void koi_cls(void) {
     koi_call(SYS_CLS, 0, 0, 0);
 }
@@ -270,6 +287,42 @@ static inline long koi_sysinfo(long item, long index) {
 
 static inline long koi_systext(long item, long index, char* buffer, long size) {
     return koi_call4(SYS_SYSTEXT, item, index, (long)buffer, size);
+}
+
+/* Where this program's own files are.
+ *
+ * A package installs into a directory of its own and keeps its data there:
+ * DOOM and its WAD, Mizu and its wallpaper. The current directory is the
+ * user's - it is wherever they were standing when they typed the name - and
+ * once a package is on the search path, that is somewhere else entirely. A
+ * program that opens "DOOM.WAD" and expects to find its own copy is asking the
+ * wrong directory, and one that opens "\\MIZU\\WALLPAPER.BMP" has guessed
+ * where it was installed, which is the same mistake spelled confidently.
+ *
+ * So: ask. The kernel knows the path it loaded, and everything beside the
+ * program is one join away from it.
+ *
+ * `koi_beside` writes the full path to a file that ships with the program.
+ * Returns its length, or 0 when it will not fit. A program loaded from the
+ * root gets the name back unchanged, which is correct there. */
+static inline long koi_beside(const char* name, char* buffer, long size) {
+    long cut = 0;
+    long length = 0;
+
+    if (!name || !buffer || size <= 0) return 0;
+    if (koi_systext(KOI_TEXT_PROGRAM_PATH, 0, buffer, size) <= 0) buffer[0] = 0;
+
+    /* Everything up to and including the last backslash is the directory. */
+    for (long index = 0; buffer[index]; index++)
+        if (buffer[index] == '\\') cut = index + 1;
+    length = cut;
+
+    for (long index = 0; name[index]; index++) {
+        if (length + 1 >= size) { buffer[0] = 0; return 0; }
+        buffer[length++] = name[index];
+    }
+    buffer[length] = 0;
+    return length;
 }
 
 /* ---- Graphics ------------------------------------------------------------

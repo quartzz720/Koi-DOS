@@ -4,6 +4,7 @@
 #include "console.h"
 #include "serial.h"
 #include "keyboard.h"
+#include "environment.h"
 #include "fat32.h"
 #include "partition.h"
 #include "program.h"
@@ -476,6 +477,56 @@ static long system_text(long item, long index, char* buffer, long size) {
 long syscall_dispatch(long function, long a, long b, long c, long d);
 
 long syscall_dispatch(long function, long a, long b, long c, long d) {
+    /* Ctrl+C, acted on here and nowhere else.
+     *
+     * A program is stopped at a system call because that is the one moment it
+     * is known to be between two pieces of its own work and standing in the
+     * kernel on purpose. Ending it from the keyboard interrupt instead would
+     * mean abandoning a stack mid-instruction, with whatever the program was
+     * holding still held.
+     *
+     * The unwind itself is not new: it is exactly what SYS_EXIT does below,
+     * and has done since programs existed. What Ctrl+C adds is the decision,
+     * not the mechanism.
+     *
+     * What this cannot catch, and it is worth being plain about: a program
+     * that loops forever without calling anything. It never enters the kernel,
+     * so the kernel never gets a turn. Everything that prints, reads a key,
+     * sleeps, or touches a file is interruptible - which is nearly everything,
+     * including the accidental loops people actually write. The rest waits for
+     * a scheduler that can take the processor away, and that is a different
+     * piece of work.
+     *
+     * SYS_EXIT is exempt: a program already leaving does not need stopping,
+     * and its exit code is its own. */
+    if (function != SYS_EXIT && program_depth() > 0) {
+        /* Ask the USB controllers whether anything was typed.
+         *
+         * Their interrupt is not routed, so a USB keyboard is silent until
+         * somebody drains its event ring - and the only place that happened
+         * was the loop that waits for a keystroke. A program that is not
+         * waiting for one therefore never heard anything, which is precisely
+         * the program Ctrl+C is for. On a machine whose keyboard is USB, and
+         * that is most machines, this key would not have worked at all.
+         *
+         * Not on every call: a program printing in a loop makes thousands a
+         * second and draining a ring is not free. Twenty milliseconds is far
+         * below what anybody notices between pressing a key and the program
+         * stopping, and far above the cost. */
+        static boot_uint64_t last_poll;
+        boot_uint64_t now = timer_ticks();
+
+        if (now - last_poll >= 20) {
+            last_poll = now;
+            if (xhci_controller_count()) xhci_poll();
+        }
+
+        if (keyboard_break_taken()) {
+            write_out("^C\n");
+            program_exit(KOI_EXIT_INTERRUPTED);
+        }
+    }
+
     switch (function) {
     case SYS_EXIT:
         program_exit((int)a);
@@ -488,6 +539,33 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
     case SYS_PUTS:
         if (a) write_out((const char*)a);
         return 0;
+
+    case SYS_GETENV:
+    case SYS_ENVAT: {
+        const char* source = (const char*)0;
+        char* into;
+        long size;
+        long length = 0;
+
+        if (function == SYS_GETENV) {
+            if (!a || !b || c <= 0) return 0;
+            source = environment_get((const char*)a);
+            into = (char*)b;
+            size = c;
+        } else {
+            if (!b || c <= 0) return 0;
+            if (!environment_at((int)a, &source, (const char**)0)) source = 0;
+            into = (char*)b;
+            size = c;
+        }
+        if (!source) { into[0] = 0; return 0; }
+        while (source[length] && length + 1 < size) {
+            into[length] = source[length];
+            length++;
+        }
+        into[length] = 0;
+        return length;
+    }
 
     case SYS_GETCHAR:
         return keyboard_getchar();

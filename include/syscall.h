@@ -67,7 +67,7 @@
  * nothing else, so raising it would refuse every program already installed on a
  * machine until each was reinstalled. A rule worth keeping is worth keeping for
  * its reason, and the reason does not apply here. */
-#define KOI_ABI_VERSION 13
+#define KOI_ABI_VERSION 14
 #define KOI_ABI_MINIMUM 8
 #define KOI_ABI_IS_ALPHA 1
 
@@ -80,6 +80,16 @@ typedef struct {
     unsigned int abi_version;
     unsigned int reserved[2];
 } KOI_PROGRAM_HEADER;
+
+/* The exit code of a program that was stopped with Ctrl+C rather than one that
+ * finished. 130 is what the unix world uses for it - 128 plus the signal
+ * number - and borrowing a number somebody else has already agreed on beats
+ * inventing one that only means something here.
+ *
+ * A program never returns this itself; the kernel supplies it. A batch file
+ * can therefore tell "the command failed" from "somebody stopped it", which
+ * are different things to carry on from. */
+#define KOI_EXIT_INTERRUPTED 130
 
 /* Console and process. */
 #define SYS_EXIT 0x00        /* (code) - does not return */
@@ -526,6 +536,22 @@ typedef struct {
  * nothing here does that for it, because a program that only wants to run
  * `dir` should not have its window torn down. */
 #define SYS_RUN 0x59         /* (command) -> the program's exit code, or -1 */
+
+/* The environment, as the shell has it.
+ *
+ * Read-only from a program, and that is a decision rather than an omission.
+ * There is one environment because there is one program running at a time; a
+ * program that could write it would be changing the shell's, and the change
+ * would outlive the program that made it. DOS gave each program a copy for
+ * exactly that reason, and copies are what this will get when programs are
+ * isolated - at which point a setter can be added and will mean something.
+ *
+ * SYS_GETENV fills `buffer` with the value and returns its length, or 0 when
+ * there is no such variable. SYS_ENVAT is how a program lists them: it takes
+ * an index from zero and fills `name`, returning 0 when the index is past the
+ * end. */
+#define SYS_GETENV 0x5A      /* (name, buffer, size) -> length, or 0 */
+#define SYS_ENVAT 0x5B       /* (index, name, size) -> length, or 0 */
 
 #define KOI_BUTTON_LEFT 0x01
 #define KOI_BUTTON_RIGHT 0x02

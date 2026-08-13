@@ -6,6 +6,7 @@
 #include "heap.h"
 #include "serial.h"
 #include "string.h"
+#include "environment.h"
 
 #define LINE_MAX 128
 #define PROGRAM_PATH_MAX 256
@@ -17,7 +18,17 @@ static const char* color_names[16] = {
     "lightred", "lightmagenta", "yellow", "white"
 };
 
-static char program_path[PROGRAM_PATH_MAX] = "\\COMMANDER;\\MIZU";
+/* The search path lives in the environment now, not in a buffer here.
+ *
+ * There were two answers to "where are programs looked for" - this file's, and
+ * whatever `SET PATH=` would have meant - and two answers is how they end up
+ * disagreeing. The environment is the one, because it is the one a person can
+ * see and change; this file seeds it at boot and writes it back when dosget
+ * changes it, which is what a settings file is for.
+ *
+ * The default is what a machine has before anybody has said otherwise: the two
+ * packages that were once part of the system. */
+#define PROGRAM_PATH_DEFAULT "\\COMMANDER;\\MIZU"
 
 static int equals_ignoring_case(const char* left, const char* right) {
     while (*left && *right) {
@@ -69,7 +80,14 @@ static void trim(char* text) {
 }
 
 const char* config_program_path(void) {
-    return program_path;
+    /* Whatever the environment says, including nothing.
+     *
+     * The default above is a seed, applied once at boot, and not a value this
+     * falls back to - otherwise `set PATH=` would quietly restore two
+     * directories nobody asked for, and the one command whose whole meaning is
+     * "look nowhere else" would not do it. */
+    const char* value = environment_get("PATH");
+    return value ? value : "";
 }
 
 /* Is `directory` already one of the entries in the search path?
@@ -78,7 +96,7 @@ const char* config_program_path(void) {
  * a substring test says it is. Case-insensitive because the path is written by
  * people and read by a filesystem that does not care. */
 static int path_contains(const char* directory) {
-    const char* cursor = program_path;
+    const char* cursor = config_program_path();
 
     while (*cursor) {
         const char* entry;
@@ -232,32 +250,35 @@ static int write_setting(VOLUME* volume, const char* path, const char* key,
 }
 
 int config_add_program_path(VOLUME* volume, const char* directory) {
-    boot_uint64_t length;
-    boot_uint64_t at;
+    char rebuilt[PROGRAM_PATH_MAX];
+    const char* current = config_program_path();
+    boot_uint64_t length = strlen(current);
+    boot_uint64_t extra = strlen(directory ? directory : "");
 
     if (!directory || !directory[0]) return 0;
     if (path_contains(directory)) return 1;
 
-    length = strlen(program_path);
-    at = strlen(directory);
     /* No room is not a reason to write half a path: the file would then name a
        directory that does not exist, forever. */
-    if (length + at + 2 >= PROGRAM_PATH_MAX) return 0;
+    if (length + extra + 2 >= PROGRAM_PATH_MAX) return 0;
 
-    if (length) program_path[length++] = ';';
-    for (boot_uint64_t index = 0; index < at; index++)
-        program_path[length++] = directory[index];
-    program_path[length] = 0;
+    for (boot_uint64_t index = 0; index < length; index++)
+        rebuilt[index] = current[index];
+    if (length) rebuilt[length++] = ';';
+    for (boot_uint64_t index = 0; index < extra; index++)
+        rebuilt[length++] = directory[index];
+    rebuilt[length] = 0;
 
+    if (!environment_set("PATH", rebuilt)) return 0;
     if (!volume) return 1;   /* on the path now, but not after a reboot */
     return write_setting(volume, CONFIG_DIRECTORY "\\SYSTEM.CFG", "path",
-                         program_path);
+                         rebuilt);
 }
 
 int config_remove_program_path(VOLUME* volume, const char* directory) {
     char rebuilt[PROGRAM_PATH_MAX];
     boot_uint64_t out = 0;
-    const char* cursor = program_path;
+    const char* cursor = config_program_path();
     int removed = 0;
 
     if (!directory || !directory[0]) return 0;
@@ -299,13 +320,11 @@ int config_remove_program_path(VOLUME* volume, const char* directory) {
     }
     rebuilt[out] = 0;
     if (!removed) return 1;
-
-    for (boot_uint64_t index = 0; index <= out; index++)
-        program_path[index] = rebuilt[index];
+    if (!environment_set("PATH", rebuilt)) return 0;
 
     if (!volume) return 1;
     return write_setting(volume, CONFIG_DIRECTORY "\\SYSTEM.CFG", "path",
-                         program_path);
+                         rebuilt);
 }
 
 static void apply_console(const char* key, const char* value, void* context) {
@@ -333,14 +352,16 @@ static void apply_system(const char* key, const char* value, void* context) {
         else if (value[0] == 'u' && value[1] == 'k') layout_set_alternate(LAYOUT_UK);
         else if (value[0] == 'e' && value[1] == 'l') layout_set_alternate(LAYOUT_GR);
     } else if (equals_ignoring_case(key, "path")) {
+        char text[PROGRAM_PATH_MAX];
         boot_uint64_t length = 0;
 
         while (value[length] && length + 1 < PROGRAM_PATH_MAX) {
-            program_path[length] = value[length];
+            text[length] = value[length];
             length++;
         }
-        program_path[length] = 0;
-        trim(program_path);
+        text[length] = 0;
+        trim(text);
+        environment_set("PATH", text);
     }
 }
 
@@ -470,5 +491,11 @@ void config_load(VOLUME* volume) {
            messages went to the serial port. */
         if (changed) console_clear();
     }
+    /* A machine that has never had a path written still has one, and `set`
+       should show it. Seeded rather than left implicit: a variable that governs
+       where programs are found and does not appear in the list is a variable
+       somebody will spend an afternoon looking for. */
+    if (!environment_get("PATH")) environment_set("PATH", PROGRAM_PATH_DEFAULT);
+
     serial_write("CONFIG: settings applied\n");
 }

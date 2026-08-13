@@ -9,6 +9,7 @@
 #include "xhci.h"
 #include "net.h"
 #include "timer.h"
+#include "program.h"
 
 #define PS2_DATA 0x60U
 #define PS2_STATUS 0x64U
@@ -376,10 +377,41 @@ int keyboard_init(void) {
  * a start byte until its continuations arrive, and the editors step through
  * text by character. Nothing had to change to receive Cyrillic - it only had
  * to be sent. */
+/* Somebody has asked for the running program to stop.
+ *
+ * Noticed here rather than in either driver, because this is where both kinds
+ * of keyboard already meet: a PS/2 keyboard and a USB one must not need to
+ * agree about anything for Ctrl+C to work on both.
+ *
+ * Recorded rather than acted on. This runs inside an interrupt handler, and
+ * the program it is about is somewhere in the middle of its own work with
+ * kernel state half-changed around it. Stopping it here would mean unwinding
+ * a stack from an interrupt, which is a way of turning a stuck program into a
+ * stuck machine. So the flag waits for a moment the kernel chooses. */
+static int break_requested;
+
+int keyboard_break_taken(void) {
+    int asked = break_requested;
+    break_requested = 0;
+    return asked;
+}
+
+void keyboard_break_clear(void) { break_requested = 0; }
+
 void keyboard_submit(int key) {
     boot_uint32_t code;
 
     if (!key) return;
+
+    /* ETX, which is what Ctrl+C has produced since teletypes. It is not put
+       into the buffer as well: a program that is being stopped has no use for
+       the character, and one that is not being stopped never sees a Ctrl+C
+       that meant anything else. */
+    if (key == 3) {
+        break_requested = 1;
+        return;
+    }
+
     if (key < 0x20 || key > 0x7E) {   /* control codes, arrows, F-keys */
         buffer_push((boot_uint16_t)key);
         return;
@@ -428,6 +460,19 @@ int keyboard_getchar(void) {
     console_show_cursor(1);
     for (;;) {
         if ((key = keyboard_poll())) break;
+        /* Waiting for a key is where a program spends most of a hang, and it
+         * is a wait no keystroke can end - Ctrl+C is not put into the buffer,
+         * so without this the one thing somebody presses to get out is the one
+         * thing that cannot arrive.
+         *
+         * The flag is left set for the kernel to act on, except at the prompt,
+         * where nobody else will take it and a Ctrl+C aimed at nothing must
+         * not go on to land on the next program that starts. */
+        if (break_requested) {
+            if (!program_depth()) break_requested = 0;
+            console_show_cursor(0);
+            return 3;
+        }
         /* Before the sleep, whichever keyboard we are waiting on: this is the
            only place a device plugged in while somebody sits at the prompt can
            be noticed. */
@@ -470,6 +515,14 @@ boot_uint64_t keyboard_read_line(char* buffer_out, boot_uint64_t capacity) {
     for (;;) {
         int key = keyboard_getchar();
         if (!key) break;
+        /* Ctrl+C abandons the line. At the prompt that is all it does, and it
+           says so the way DOS did; inside a program the kernel is about to
+           stop it and will print its own. */
+        if (key == 3) {
+            if (!program_depth()) console_write("^C\n");
+            length = 0;
+            break;
+        }
         if (key == '\n') {
             console_putchar('\n');
             break;
