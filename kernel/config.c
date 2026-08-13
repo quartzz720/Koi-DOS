@@ -72,6 +72,242 @@ const char* config_program_path(void) {
     return program_path;
 }
 
+/* Is `directory` already one of the entries in the search path?
+ *
+ * Entry by entry rather than a substring search: `\GAME` is not `\GAMES`, and
+ * a substring test says it is. Case-insensitive because the path is written by
+ * people and read by a filesystem that does not care. */
+static int path_contains(const char* directory) {
+    const char* cursor = program_path;
+
+    while (*cursor) {
+        const char* entry;
+        boot_uint64_t length = 0;
+
+        while (*cursor == ';' || *cursor == ' ' || *cursor == '\t') cursor++;
+        entry = cursor;
+        while (*cursor && *cursor != ';') cursor++;
+        length = (boot_uint64_t)(cursor - entry);
+        while (length && (entry[length - 1] == ' ' || entry[length - 1] == '\t'))
+            length--;
+
+        if (length == strlen(directory)) {
+            boot_uint64_t index = 0;
+            while (index < length) {
+                char a = entry[index];
+                char b = directory[index];
+                if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+                if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+                if (a != b) break;
+                index++;
+            }
+            if (index == length) return 1;
+        }
+        if (*cursor == ';') cursor++;
+    }
+    return 0;
+}
+
+/* Write the file out with one key replaced and everything else kept.
+ *
+ * Kept, because this file is not ours alone: the language lives in it too, and
+ * a writer that rebuilds a settings file from what it happens to know destroys
+ * whatever it does not. That mistake has already been made here once, when
+ * every program shared one file and the second writer erased the first.
+ *
+ * Beside the real file and renamed on top of it when it is whole. A rename
+ * cannot be half-done: the directory entry names the new file or the old one,
+ * and there is no third answer. This is not a journalled filesystem and
+ * nothing here pretends otherwise; what it buys is that losing power gives
+ * "the change did not happen" rather than "the settings are now rubbish". */
+static int write_setting(VOLUME* volume, const char* path, const char* key,
+                         const char* value) {
+    static char rebuilt[2048];
+    char temporary[80];
+    FAT_ENTRY entry;
+    boot_uint64_t out = 0;
+    boot_uint64_t length;
+
+    /* Everything already there except the line being replaced. */
+    if (fat32_stat(volume, path, &entry) &&
+        !(entry.attributes & FAT_ATTRIBUTE_DIRECTORY) &&
+        entry.size && entry.size < sizeof(rebuilt) / 2) {
+        static char existing[1024];
+        boot_uint32_t offset = 0;
+        boot_uint32_t index = 0;
+
+        while (offset < entry.size) {
+            boot_uint32_t got = fat32_read(volume, &entry, offset,
+                                           existing + offset,
+                                           entry.size - offset);
+            if (!got) break;
+            offset += got;
+        }
+        existing[offset] = 0;
+
+        while (index < offset) {
+            boot_uint32_t start = index;
+            boot_uint32_t end;
+            char line[LINE_MAX];
+            boot_uint64_t at = 0;
+            char* separator = (char*)0;
+
+            while (index < offset && existing[index] != '\n') index++;
+            end = index;
+            if (index < offset) index++;
+            while (end > start && existing[end - 1] == '\r') end--;
+
+            while (start + at < end && at + 1 < LINE_MAX)
+                { line[at] = existing[start + at]; at++; }
+            line[at] = 0;
+
+            /* Only a line that sets this very key is dropped. A comment that
+               mentions it, or a line whose value happens to look like it, is
+               somebody's and stays. Same rule about comments as above: the
+               whole line, decided by the first thing on it. */
+            {
+                boot_uint64_t first = 0;
+                while (line[first] == ' ' || line[first] == '\t') first++;
+                if (line[first] != '#' && line[first] != ';') {
+                    for (boot_uint64_t position = 0; line[position]; position++)
+                        if (line[position] == '=')
+                            { separator = &line[position]; break; }
+                }
+            }
+            if (separator) {
+                char name[LINE_MAX];
+                boot_uint64_t copied = 0;
+
+                while (copied < (boot_uint64_t)(separator - line) &&
+                       copied + 1 < LINE_MAX)
+                    { name[copied] = line[copied]; copied++; }
+                name[copied] = 0;
+                trim(name);
+                if (equals_ignoring_case(name, key)) continue;
+            }
+
+            for (boot_uint64_t copied = 0; line[copied] && out + 2 < sizeof(rebuilt);
+                 copied++)
+                rebuilt[out++] = line[copied];
+            rebuilt[out++] = '\n';
+        }
+    }
+
+    for (boot_uint64_t index = 0; key[index] && out + 4 < sizeof(rebuilt); index++)
+        rebuilt[out++] = key[index];
+    if (out + 4 < sizeof(rebuilt))
+        { rebuilt[out++] = ' '; rebuilt[out++] = '='; rebuilt[out++] = ' '; }
+    for (boot_uint64_t index = 0; value[index] && out + 2 < sizeof(rebuilt); index++)
+        rebuilt[out++] = value[index];
+    rebuilt[out++] = '\n';
+
+    /* The directory may not exist on a machine that has never had a setting
+       written; a directory that is already there is not an error. */
+    if (!fat32_stat(volume, CONFIG_DIRECTORY, &entry))
+        fat32_create(volume, CONFIG_DIRECTORY, 1, &entry);
+
+    length = strlen(path);
+    if (length + 1 >= sizeof(temporary) || length < 4) return 0;
+    for (boot_uint64_t index = 0; index <= length; index++)
+        temporary[index] = path[index];
+    /* The same name with a different extension, so the rename stays inside one
+       directory and therefore inside one filesystem. */
+    temporary[length - 3] = 'T';
+    temporary[length - 2] = 'M';
+    temporary[length - 1] = 'P';
+
+    if (fat32_stat(volume, temporary, &entry)) fat32_remove(volume, temporary);
+    if (!fat32_create(volume, temporary, 0, &entry)) return 0;
+    if (fat32_write(volume, &entry, 0, rebuilt, (boot_uint32_t)out) !=
+        (boot_uint32_t)out) {
+        fat32_remove(volume, temporary);
+        return 0;
+    }
+    if (fat32_stat(volume, path, &entry)) fat32_remove(volume, path);
+    if (fat32_rename(volume, temporary, path) < 0) {
+        fat32_remove(volume, temporary);
+        return 0;
+    }
+    return 1;
+}
+
+int config_add_program_path(VOLUME* volume, const char* directory) {
+    boot_uint64_t length;
+    boot_uint64_t at;
+
+    if (!directory || !directory[0]) return 0;
+    if (path_contains(directory)) return 1;
+
+    length = strlen(program_path);
+    at = strlen(directory);
+    /* No room is not a reason to write half a path: the file would then name a
+       directory that does not exist, forever. */
+    if (length + at + 2 >= PROGRAM_PATH_MAX) return 0;
+
+    if (length) program_path[length++] = ';';
+    for (boot_uint64_t index = 0; index < at; index++)
+        program_path[length++] = directory[index];
+    program_path[length] = 0;
+
+    if (!volume) return 1;   /* on the path now, but not after a reboot */
+    return write_setting(volume, CONFIG_DIRECTORY "\\SYSTEM.CFG", "path",
+                         program_path);
+}
+
+int config_remove_program_path(VOLUME* volume, const char* directory) {
+    char rebuilt[PROGRAM_PATH_MAX];
+    boot_uint64_t out = 0;
+    const char* cursor = program_path;
+    int removed = 0;
+
+    if (!directory || !directory[0]) return 0;
+    if (!path_contains(directory)) return 1;
+
+    /* Kept entry by entry rather than cut out of the middle: the separators
+       have to come out with it, and a path that ends in a `;` names an entry
+       with no directory in it. */
+    while (*cursor) {
+        const char* entry;
+        boot_uint64_t length;
+
+        while (*cursor == ';' || *cursor == ' ' || *cursor == '\t') cursor++;
+        entry = cursor;
+        while (*cursor && *cursor != ';') cursor++;
+        length = (boot_uint64_t)(cursor - entry);
+        while (length && (entry[length - 1] == ' ' || entry[length - 1] == '\t'))
+            length--;
+        if (*cursor == ';') cursor++;
+        if (!length) continue;
+
+        if (length == strlen(directory)) {
+            boot_uint64_t index = 0;
+            while (index < length) {
+                char a = entry[index];
+                char b = directory[index];
+                if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+                if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+                if (a != b) break;
+                index++;
+            }
+            if (index == length) { removed = 1; continue; }
+        }
+
+        if (out && out + 1 < sizeof(rebuilt)) rebuilt[out++] = ';';
+        for (boot_uint64_t index = 0; index < length && out + 1 < sizeof(rebuilt);
+             index++)
+            rebuilt[out++] = entry[index];
+    }
+    rebuilt[out] = 0;
+    if (!removed) return 1;
+
+    for (boot_uint64_t index = 0; index <= out; index++)
+        program_path[index] = rebuilt[index];
+
+    if (!volume) return 1;
+    return write_setting(volume, CONFIG_DIRECTORY "\\SYSTEM.CFG", "path",
+                         program_path);
+}
+
 static void apply_console(const char* key, const char* value, void* context) {
     CONSOLE_THEME* theme = (CONSOLE_THEME*)context;
     int color = config_parse_color(value);
@@ -156,13 +392,25 @@ static int read_settings(VOLUME* volume, const char* path,
         if (index < offset) index++;
         line[length] = 0;
 
-        for (boot_uint64_t position = 0; line[position]; position++) {
-            if (line[position] == '#' || line[position] == ';') {
-                line[position] = 0;
-                break;
-            }
-            if (line[position] == '=' && !separator) separator = &line[position];
+        /* A comment is a whole line, marked by the first thing on it.
+         *
+         * It used to be any `#` or `;` anywhere, which cut the line short
+         * there - and `;` is what separates the entries of the program search
+         * path. So `path = \COMMANDER;\MIZU` was read as `\COMMANDER` and
+         * everything after the first entry silently disappeared, one boot
+         * after it was written. Nothing complained: a path with one entry is a
+         * perfectly good path, and the programs in the others were simply not
+         * found any more.
+         *
+         * Trailing comments after a value are gone with it, which is the same
+         * rule the program side has always used. */
+        {
+            boot_uint64_t first = 0;
+            while (line[first] == ' ' || line[first] == '\t') first++;
+            if (line[first] == '#' || line[first] == ';') continue;
         }
+        for (boot_uint64_t position = 0; line[position]; position++)
+            if (line[position] == '=') { separator = &line[position]; break; }
         if (!separator) continue;
 
         *separator = 0;

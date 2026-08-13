@@ -112,6 +112,27 @@ static int set_autostart(int wanted) {
     return write_file(AUTOEXEC, rebuilt, out);
 }
 
+/* Cancel means cancel.
+ *
+ * It used to mean "skip this question", so the button was drawn, and pressing
+ * it moved on to the next question exactly as OK did with the default answer -
+ * a Cancel with no way to cancel. Now it stops.
+ *
+ * What has already been answered stays answered: those settings were applied
+ * when they were given, and pretending otherwise would mean undoing work
+ * somebody deliberately did. What does not happen is the rest of the
+ * questions, and the flag that says these were asked - so the machine asks
+ * again next time rather than quietly deciding on somebody's behalf. */
+static int cancelled(void) {
+    dialog_message("Cancelled",
+        "Nothing else was changed. Anything already answered has been kept.\n"
+        "Run CMDRCFG again to finish; until then Koi-Commander will ask "
+        "these questions the next time it starts.");
+    dialog_end();
+    koi_print("Cancelled. Run CMDRCFG again to finish.\n");
+    return 0;
+}
+
 int main(void) {
     static const char* const levels[] = { "Quiet", "Normal", "Loud" };
     static const char* const notes[] = {
@@ -133,18 +154,18 @@ int main(void) {
         "Start Koi-Commander automatically when the machine boots?\n"
         "This adds one line to AUTOEXEC.BAT, and answering No later takes "
         "it out again.", autostart_is_set());
-    if (autostart >= 0) {
-        if (!set_autostart(autostart))
-            dialog_message("Starting up",
-                "AUTOEXEC.BAT could not be written. The setting was not "
-                "saved; everything else still works.");
-    }
+    if (autostart < 0) return cancelled();
+    if (!set_autostart(autostart))
+        dialog_message("Starting up",
+            "AUTOEXEC.BAT could not be written. The setting was not "
+            "saved; everything else still works.");
 
     loudness = dialog_menu("Sound",
         "How loud should this machine be?\n"
         "The default has been described, by somebody wearing headphones, "
         "as too loud.", levels, notes, 3, 1, 0);
-    if (loudness >= 0) {
+    if (loudness < 0) return cancelled();
+    {
         char text[8];
         koi_snprintf(text, sizeof(text), "%d", percent[loudness]);
         koi_sound_volume(percent[loudness] * 255 / 100);
@@ -161,7 +182,7 @@ int main(void) {
                      "Run CMDRCFG at any time to change these, or start it now "
                      "by typing \\COMMANDER\\COMMANDER.",
                      autostart == 1 ? "will" : "will not",
-                     loudness >= 0 ? levels[loudness] : "unchanged");
+                     levels[loudness]);
         dialog_message("Done", summary);
     }
 

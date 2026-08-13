@@ -241,6 +241,15 @@ mcopy -i "$SYSVOL" ARCHITECTURE.md "::/Architecture Notes.md"
 printf '@rem Koi-DOS startup\r\n@echo Welcome to Koi-DOS.\r\nver\r\n' \
   | mcopy -i "$SYSVOL" - ::/AUTOEXEC.BAT
 
+# Where packages come from, on this bench.
+#
+# 10.0.2.2 is slirp's own address, and slirp is already serving the package
+# tree over TFTP - see the `tftp=` on the ethernet netdev below. Without this
+# file dosget falls back to the address of the cable this is developed on,
+# which nothing in QEMU can reach, so the whole install path was untestable
+# here and only ever tried on real hardware.
+printf 'source = 10.0.2.2\r\n' | mcopy -i "$SYSVOL" - ::/BOOT/dosget.cfg
+
 # The stick gets its own files, named so that a `dir` on it cannot be confused
 # with a `dir` on the system volume.
 mmd -i "$STICK" ::/STICK
@@ -269,7 +278,7 @@ for program in build/*.EXE; do
     # because that is where it will actually live on a real machine, and so
     # that testing it here tests the layout it is shipped in.
     case "$(basename "$program")" in
-        commander.EXE|cmdrcfg.EXE|mizu.EXE|mizucfg.EXE) continue ;;
+        commander.EXE|cmdrcfg.EXE) continue ;;
     esac
     mcopy -o -i "$SYSVOL" "$program" "::/BIN/$(basename "$program" | tr 'a-z' 'A-Z')"
 done
@@ -286,15 +295,9 @@ if [ -f build/commander.EXE ]; then
         mcopy -o -i "$SYSVOL" build/cmdrcfg.EXE ::/COMMANDER/CMDRCFG.EXE
 fi
 
-# Mizu, the desktop, in a directory of its own for the same reason.
-if [ -f build/mizu.EXE ]; then
-    mmd -i "$SYSVOL" ::/MIZU 2>/dev/null || true
-    mcopy -o -i "$SYSVOL" build/mizu.EXE ::/MIZU/MIZU.EXE
-    [ -f build/mizucfg.EXE ] && \
-        mcopy -o -i "$SYSVOL" build/mizucfg.EXE ::/MIZU/MIZUCFG.EXE
-    [ -f WALLPAPER.BMP ] && \
-        mcopy -o -i "$SYSVOL" WALLPAPER.BMP ::/MIZU/WALLPAPER.BMP
-fi
+# Mizu is not built here at all any more: it is a package in a repository of
+# its own, and it arrives with `dosget install mizu`. Its absence from this
+# image is the check that Koi-DOS is complete without it.
 
 # The licence, for the installer to show and for anyone who looks.
 mcopy -o -i "$SYSVOL" LICENSE ::/LICENSE

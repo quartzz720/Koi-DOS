@@ -1389,7 +1389,12 @@ int main(void) {
         while (koi_keypressed()) {
             int key = koi_getchar();
 
-            if (key == 27) { running = 0; break; }
+            /* Escape does not leave. F10 does, and it says so along the
+               bottom of the screen; Escape sat next to it as an undocumented
+               second way out, which is a key people press to get out of
+               something smaller and then find they are back at the prompt. It
+               still closes the viewer and the editor, where getting out of
+               something smaller is exactly what it means. */
             if (key == KOI_KEY_UP) { move_selection(-1); redraw = 1; }
             else if (key == KOI_KEY_DOWN) { move_selection(1); redraw = 1; }
             else if (key == KOI_KEY_PAGE_UP) {

@@ -12,8 +12,44 @@
 
 static const boot_uint8_t blank[FONT_HEIGHT] = { 0 };
 
+/* The shapes code page 437 already has, under the names the rest of the world
+ * calls them by.
+ *
+ * The first 256 shapes are code page 437, and its boxes and blocks are exactly
+ * the ones ASCII art is made of - but a person writing art types `█`, which is
+ * U+2588, and nothing here looked past 255 for it. So the glyph was present,
+ * correct, and unreachable: art pasted into a program came out as a screenful
+ * of gaps, and the only clue was that the same drawing worked in the editor it
+ * was written in.
+ *
+ * A translation rather than more glyphs. The shapes are in font_glyphs.c and
+ * are not ours to copy about; which byte holds each one is a fact about a code
+ * page from 1981. */
+typedef struct { boot_uint32_t codepoint; boot_uint8_t byte; } CP437_NAME;
+
+static const CP437_NAME cp437_names[] = {
+    /* Blocks and shades - what block art is drawn with. */
+    { 0x2591, 0xB0 }, { 0x2592, 0xB1 }, { 0x2593, 0xB2 }, { 0x2588, 0xDB },
+    { 0x2584, 0xDC }, { 0x258C, 0xDD }, { 0x2590, 0xDE }, { 0x2580, 0xDF },
+    /* Single-line box drawing. */
+    { 0x2500, 0xC4 }, { 0x2502, 0xB3 }, { 0x250C, 0xDA }, { 0x2510, 0xBF },
+    { 0x2514, 0xC0 }, { 0x2518, 0xD9 }, { 0x251C, 0xC3 }, { 0x2524, 0xB4 },
+    { 0x252C, 0xC2 }, { 0x2534, 0xC1 }, { 0x253C, 0xC5 },
+    /* And double-line, which is what a DOS dialogue box is made of. */
+    { 0x2550, 0xCD }, { 0x2551, 0xBA }, { 0x2554, 0xC9 }, { 0x2557, 0xBB },
+    { 0x255A, 0xC8 }, { 0x255D, 0xBC }, { 0x2560, 0xCC }, { 0x2563, 0xB9 },
+    { 0x2566, 0xCB }, { 0x2569, 0xCA }, { 0x256C, 0xCE },
+    /* The odds and ends with a glyph already in the page. */
+    { 0x25A0, 0xFE }, { 0x00A0, 0xFF }
+};
+
 const boot_uint8_t* font_glyph(boot_uint32_t codepoint) {
     if (codepoint < 256) return font_8x16[codepoint];
+
+    for (unsigned index = 0;
+         index < sizeof(cp437_names) / sizeof(cp437_names[0]); index++)
+        if (cp437_names[index].codepoint == codepoint)
+            return font_8x16[cp437_names[index].byte];
 
     for (int index = 0; index < font_beyond_count; index++)
         if (font_beyond[index].codepoint == codepoint)

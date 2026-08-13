@@ -18,7 +18,7 @@
 #include "tftp.h"
 #include "mouse.h"
 
-const char* config_program_path(void);
+#include "config.h"
 #include "timer.h"
 #include "fat32.h"
 #include "partition.h"
@@ -483,7 +483,7 @@ static void command_help(void) {
     print_line("net set <..>   set an address by hand, for a wire with no server");
     print_line("net usb        test the USB network device on its own");
     print_line("ping <host>    is it there, and how far away");
-    print_line("dosget <..>    packages: list, install, update");
+    print_line("dosget <..>    packages: list, install, update, remove");
     print_line("pointer        move the pointer about; hold the button to draw");
     print_line("log [file]     the kernel log: on screen, or written to a file");
     print_line("log net <addr> send the kernel log to another machine over UDP");
@@ -1547,6 +1547,19 @@ static int prefix_matches(const char* text, const char* key) {
    of belongs with the system rather than inside one of its packages. */
 #define DOSGET_DATABASE "\\BOOT\\DOSGET.DB"
 
+/* And what each one put where: one file per package, named after it.
+ *
+ * The database above says a package is installed and at which version, which
+ * is everything `update` needs and nothing `remove` does. Removing something
+ * means knowing what was written, and the only moment anybody knows that is
+ * while it is being written - guessing afterwards means either deleting a
+ * directory whole, along with the WAD somebody put in it, or deleting nothing.
+ *
+ * Beside the system rather than inside the package, for the same reason as the
+ * database: a record of what the system is made of should not disappear
+ * together with the thing it describes. */
+#define DOSGET_RECORDS "\\BOOT\\DOSGET"
+
 /* Where packages come from, asked afresh every time.
  *
  * Read rather than remembered on purpose. A setting that is loaded at boot is
@@ -1676,7 +1689,8 @@ static void dosget_installed(const char* package, char* into,
     }
 }
 
-/* Write one down, replacing whatever was there for that name. */
+/* Write one down, replacing whatever was there for that name. A null version
+   drops the line instead, which is what removing a package needs. */
 static void dosget_record(const char* package, const char* version) {
     FAT_ENTRY entry;
     char text[1024];
@@ -1713,15 +1727,73 @@ static void dosget_record(const char* package, const char* version) {
        rubbish in front of every name in this file, and made a package that was
        plainly installed look like one that was not. */
     rebuilt[out] = 0;
-    string_join(rebuilt + out, sizeof(rebuilt) - out, "", package);
-    while (rebuilt[out]) out++;
-    rebuilt[out] = 0;
-    string_join(rebuilt + out, sizeof(rebuilt) - out, " ", version);
-    while (rebuilt[out]) out++;
-    if (out + 2 < sizeof(rebuilt)) rebuilt[out++] = '\r', rebuilt[out++] = '\n';
+    if (version) {
+        string_join(rebuilt + out, sizeof(rebuilt) - out, "", package);
+        while (rebuilt[out]) out++;
+        rebuilt[out] = 0;
+        string_join(rebuilt + out, sizeof(rebuilt) - out, " ", version);
+        while (rebuilt[out]) out++;
+        if (out + 2 < sizeof(rebuilt)) rebuilt[out++] = '\r', rebuilt[out++] = '\n';
+    }
 
     if (fat32_create(current_volume, DOSGET_DATABASE, 0, &entry))
         (void)fat32_write(current_volume, &entry, 0, rebuilt, out);
+}
+
+/* \BOOT\DOSGET\<PACKAGE>.PKG, where what a package installed is written. */
+static void dosget_record_path(const char* package, char* into,
+                               boot_uint32_t size) {
+    into[0] = 0;
+    string_join(into, size, "", DOSGET_RECORDS "\\");
+    string_join(into, size, "", package);
+    string_join(into, size, "", ".PKG");
+}
+
+/* Write down what was just installed, and where.
+ *
+ * The same dull format as everything else here, one `key = value` per line:
+ *
+ *     directory = \GAMES
+ *     file = GAMES.EXE
+ */
+static void dosget_record_files(const char* package, const char* directory,
+                                const char* manifest,
+                                boot_uint32_t manifest_length) {
+    char path[PATH_MAX];
+    char text[1024];
+    char name[64];
+    FAT_ENTRY entry;
+    boot_uint32_t out = 0;
+    boot_uint32_t at = 0;
+
+    if (!current_volume) return;
+    if (!fat32_stat(current_volume, DOSGET_RECORDS, &entry))
+        fat32_create(current_volume, DOSGET_RECORDS, 1, &entry);
+
+    text[0] = 0;
+    string_join(text, sizeof(text), "", "directory = ");
+    string_join(text, sizeof(text), "", directory);
+    string_join(text, sizeof(text), "", "\r\n");
+    while (text[out]) out++;
+
+    for (;;) {
+        const char* value = manifest_value(manifest, manifest_length, "file",
+                                           &at);
+        if (!value) break;
+        take_line(value, name, sizeof(name));
+        if (!name[0]) continue;
+        text[out] = 0;
+        string_join(text + out, sizeof(text) - out, "", "file = ");
+        string_join(text + out, sizeof(text) - out, "", name);
+        string_join(text + out, sizeof(text) - out, "", "\r\n");
+        while (text[out]) out++;
+    }
+
+    dosget_record_path(package, path, sizeof(path));
+    if (fat32_stat(current_volume, path, &entry))
+        fat32_remove(current_volume, path);
+    if (fat32_create(current_volume, path, 0, &entry))
+        (void)fat32_write(current_volume, &entry, 0, text, out);
 }
 
 /* `dosget list` - what the source has. */
@@ -1918,12 +1990,52 @@ static int dosget_install(boot_uint32_t source, const char* raw_package,
         return 0;
     }
 
+    /* And make it runnable.
+     *
+     * A package installs into a directory of its own, which is the right place
+     * for a program with data files beside it and the wrong place for the
+     * shell to find it: nothing searches \GAMES. So the directory goes on the
+     * program search path, and stays there across a reboot.
+     *
+     * Without this, installing succeeded, every file landed correctly, and
+     * typing the program's name answered "Bad command or file name" - which is
+     * the same sentence a machine gives for a package that was never installed
+     * at all. That is how DOSFETCH came to be copied into \BIN by hand.
+     *
+     * `path = no` in the manifest opts out, and the two packages that are part
+     * of the system say it: the kernel goes to \BOOT, which holds no programs,
+     * and the utilities go to \BIN, which the shell already searches. The
+     * default is to add, so a package written by somebody else is runnable
+     * without their having known to ask. */
+    {
+        const char* wanted = manifest_value(manifest, manifest_length, "path",
+                                            (boot_uint32_t*)0);
+        char answer[16];
+
+        answer[0] = 0;
+        if (wanted) take_line(wanted, answer, sizeof(answer));
+        if (!word_is(answer, "NO") && volume == current_volume) {
+            if (config_add_program_path(current_volume, directory)) {
+                print("  on the search path: ");
+                print_line(directory);
+            } else {
+                print("  could not add ");
+                print(directory);
+                print_line(" to the search path");
+            }
+        }
+    }
+
     {
         const char* value = manifest_value(manifest, manifest_length,
                                            "version", (boot_uint32_t*)0);
         take_line(value, version, sizeof(version));
         dosget_record(package, version[0] ? version : "0");
     }
+    /* Recorded on the volume the shell is standing on even when the files went
+       to the loader's, because that is where the record of the system lives
+       and there is only one of it. */
+    dosget_record_files(package, directory, manifest, manifest_length);
     return 1;
 }
 
@@ -1933,6 +2045,129 @@ static int dosget_install(boot_uint32_t source, const char* raw_package,
  * SYSTEM is a special case and an obvious one: a machine that is running is
  * running a kernel, so the system is installed by definition. Everything else
  * has a directory of its own, and the directory being there is the evidence. */
+/* `dosget remove` - take a package off this machine.
+ *
+ * The rule, and it is the whole design: it deletes the files a package
+ * installed, inside that package's own directory, and nothing else. It is not
+ * a command that can be aimed at the system.
+ *
+ * That is enforced by a property rather than by a list of names to protect. A
+ * package's directory has to be a directory of its own - not the root, not
+ * \BIN, not \BOOT - and only the files written down at install time are
+ * deleted from it. Anything else in there is somebody's: DOOM's WAD is the
+ * obvious one, and it is not the package manager's to throw away. The
+ * directory itself goes only if it is empty afterwards, which the filesystem
+ * enforces for us: fat32_remove refuses a directory with anything left in it.
+ *
+ * A package installed before there were records cannot be removed, and says
+ * so, because the alternative is guessing what belongs to it. Reinstalling
+ * writes the record, and then it can be. */
+static int dosget_protected(const char* directory) {
+    return !directory[0] || directory[0] != '\\' ||
+           word_is(directory, "\\") || word_is(directory, "\\BIN") ||
+           word_is(directory, "\\BOOT");
+}
+
+static int dosget_remove(const char* raw_package) {
+    char package[64];
+    char record[PATH_MAX];
+    char directory[PATH_MAX];
+    char text[1024];
+    char name[64];
+    char path[PATH_MAX];
+    FAT_ENTRY entry;
+    boot_uint32_t length;
+    boot_uint32_t at = 0;
+    int removed = 0;
+    int kept = 0;
+
+    if (!current_volume) { print_line("No volume."); return 0; }
+    upper_name(raw_package, package, sizeof(package));
+
+    if (word_is(package, "SYSTEM")) {
+        print_line("SYSTEM is the kernel this machine is running. It can be "
+                   "updated, not removed.");
+        return 0;
+    }
+
+    dosget_record_path(package, record, sizeof(record));
+    if (!fat32_stat(current_volume, record, &entry)) {
+        print(package);
+        print_line(" is not installed, or was installed before this system "
+                   "recorded what a package contains.");
+        print_line("Install it again and it can then be removed.");
+        return 0;
+    }
+    length = fat32_read(current_volume, &entry, 0, text, sizeof(text) - 1);
+    text[length] = 0;
+
+    {
+        const char* value = manifest_value(text, length, "directory",
+                                           (boot_uint32_t*)0);
+        directory[0] = 0;
+        if (value) take_line(value, directory, sizeof(directory));
+    }
+    if (dosget_protected(directory)) {
+        print("The record for ");
+        print(package);
+        print(" says its files are in ");
+        print(directory[0] ? directory : "no directory at all");
+        print_line(", which is the system's. Nothing was removed.");
+        return 0;
+    }
+
+    for (;;) {
+        const char* value = manifest_value(text, length, "file", &at);
+
+        if (!value) break;
+        take_line(value, name, sizeof(name));
+        if (!name[0]) continue;
+
+        path[0] = 0;
+        string_join(path, sizeof(path), "", directory);
+        string_join(path, sizeof(path), "\\", name);
+        if (!fat32_stat(current_volume, path, &entry)) continue;
+        if (fat32_remove(current_volume, path)) {
+            print("  removed ");
+            print_line(path);
+            removed++;
+        } else {
+            print("  could not remove ");
+            print_line(path);
+            kept++;
+        }
+    }
+
+    /* The directory goes only when nothing is left in it, and what is left
+       belongs to whoever put it there. */
+    if (!kept && fat32_stat(current_volume, directory, &entry)) {
+        if (fat32_remove(current_volume, directory)) {
+            print("  removed ");
+            print_line(directory);
+        } else {
+            print("  ");
+            print(directory);
+            print_line(" was left: there is something in it that this did not "
+                       "install.");
+        }
+    }
+
+    config_remove_program_path(current_volume, directory);
+    fat32_remove(current_volume, record);
+    dosget_record(package, (const char*)0);
+
+    print(package);
+    if (!removed && !kept) {
+        print_line(" was recorded but none of its files were there. The record "
+                   "is gone now.");
+        return 1;
+    }
+    print(" removed, ");
+    print_dec((boot_uint64_t)removed);
+    print_line(removed == 1 ? " file." : " files.");
+    return 1;
+}
+
 static int dosget_present(const char* package) {
     char path[PATH_MAX];
     FAT_ENTRY entry;
@@ -2035,6 +2270,17 @@ static void command_dosget(const ARGUMENTS* arguments) {
     boot_uint8_t* buffer;
     char shown[16];
 
+    /* Before the network is looked at, because removing something needs no
+       source at all - and a machine that has been carried away from its
+       network is exactly where somebody wants to free some space. */
+    if (word_is(arguments->operand[0], "REMOVE")) {
+        if (!arguments->operand[1][0])
+            print_line("Usage: dosget remove <name>");
+        else
+            (void)dosget_remove(arguments->operand[1]);
+        return;
+    }
+
     if (!net_configured()) {
         print_line("No address yet. Run `net start`, or `net set` on a cable.");
         return;
@@ -2062,6 +2308,7 @@ static void command_dosget(const ARGUMENTS* arguments) {
         print_line("dosget list              what the source has");
         print_line("dosget install <name>    fetch it and unpack it");
         print_line("dosget update            bring everything here up to date");
+        print_line("dosget remove <name>     delete what it installed");
         print_line("");
         print("The source is read from " DOSGET_CONFIG);
         print_line(" every time,");
@@ -2093,7 +2340,7 @@ static void command_dosget(const ARGUMENTS* arguments) {
     } else if (word_is(arguments->operand[0], "UPDATE")) {
         dosget_update(source, buffer);
     } else {
-        print_line("dosget: list, install or update.");
+        print_line("dosget: list, install, update or remove.");
     }
 
     free_pages(buffer, DOSGET_BUFFER / PAGE_SIZE);

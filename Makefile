@@ -75,10 +75,8 @@ PROGRAMS = $(patsubst programs/%.c,build/%.EXE,\
 build/edit.EXE: EXTRA_SOURCES = programs/editcore.c
 build/color.EXE: EXTRA_SOURCES = programs/settings.c
 build/play.EXE: EXTRA_SOURCES = programs/wav.c
-build/mizu.EXE: EXTRA_SOURCES = programs/window.c programs/editcore.c programs/language.c programs/settings.c programs/wav.c
 build/commander.EXE: EXTRA_SOURCES = programs/editcore.c programs/settings.c
 build/cmdrcfg.EXE: EXTRA_SOURCES = programs/dialog.c programs/settings.c programs/language.c
-build/mizucfg.EXE: EXTRA_SOURCES = programs/dialog.c programs/settings.c programs/language.c
 
 all: $(EFI_DIR)/BOOTX64.EFI $(KERNEL_IMAGE) $(PROGRAMS) sdk
 
@@ -151,6 +149,14 @@ check: $(KERNEL_ELF)
 sdk:
 	cp programs/koi.h programs/start.c programs/koilib.c programs/program.ld sdk/
 	cp include/syscall.h sdk/syscall.h
+	@# The libraries programs are written against, not only the ones the
+	@# system's own programs are. Windows, dialogues, settings, language and
+	@# WAV files are how a program is written here; a program outside this
+	@# tree that had to carry its own copy of them would be a program whose
+	@# copy goes stale, which is the whole reason Mizu now lives elsewhere and
+	@# still builds against these.
+	cp $(PROGRAM_SHARED) sdk/
+	cp $(PROGRAM_SHARED:.c=.h) sdk/
 	@printf '# Written by `make sdk`. The flags koicc builds with, taken from\n' > sdk/koiflags
 	@printf '# the Makefile that builds Koi-DOS itself, so the two cannot drift.\n' >> sdk/koiflags
 	@# -Werror is right for this repository and wrong to impose on somebody
