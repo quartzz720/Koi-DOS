@@ -270,13 +270,20 @@ static void assign_letters(boot_uint32_t boot_serial, int serial_known) {
             if (serials[index] == boot_serial) { boot_index = index; break; }
     }
 
+    /* Counting down from Z, and stopping at A rather than walking past it.
+     *
+     * A machine with enough volumes would have been handed '@', '?', '>' and
+     * eventually bytes that are not letters at all - each of them printed as a
+     * drive letter and accepted by anything that parses one. A volume with no
+     * letter left is a volume without a letter, which is a state this already
+     * has and already handles. */
     if (boot_index < volumes_found) {
         volumes[boot_index].is_boot_volume = 1;
         volumes[boot_index].letter = letter--;
     }
     for (boot_uint32_t index = 0; index < volumes_found; index++) {
         if (index == boot_index) continue;
-        volumes[index].letter = letter--;
+        volumes[index].letter = (letter >= 'A') ? letter-- : 0;
     }
 }
 

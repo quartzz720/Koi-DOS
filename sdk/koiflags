@@ -1,0 +1,4 @@
+# Written by `make sdk`. The flags koicc builds with, taken from
+# the Makefile that builds Koi-DOS itself, so the two cannot drift.
+KOI_CFLAGS="-ffreestanding -fno-stack-protector -fno-stack-check -fno-builtin -fpie -mno-red-zone -mgeneral-regs-only -fno-asynchronous-unwind-tables -ffunction-sections -fdata-sections -Wall -Wextra -std=c11 -I ."
+KOI_LDFLAGS="-nostdlib -pie -Wl,--no-dynamic-linker -Wl,-T,program.ld -Wl,--build-id=none -Wl,-z,max-page-size=0x1000 -Wl,-z,noexecstack -Wl,--gc-sections"

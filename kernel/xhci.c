@@ -241,6 +241,22 @@ typedef struct {
        it. */
     int is_hub;
     boot_uint32_t hub_ports;
+
+    /* Every page allocated on this device's behalf and kept for as long as it
+     * is plugged in: its output context, its transfer rings, and whatever
+     * buffers its class driver needs.
+     *
+     * They are recorded rather than merely allocated because unplugging has to
+     * give them back, and the alternative - each class driver remembering its
+     * own and being asked to release them - is the arrangement that leaked.
+     * Six pages a device, none returned, is a machine that gets smaller every
+     * time somebody moves a keyboard from one socket to another.
+     *
+     * Eight is above the largest a device has ever needed: two for addressing
+     * it, and at most four for a class driver on top. */
+#define USB_DEVICE_PAGES 8
+    void* pages[USB_DEVICE_PAGES];
+    boot_uint32_t page_count;
 } USB_DEVICE;
 
 /* One host controller. Everything here was file-scope until a machine with two
@@ -318,6 +334,66 @@ static void log_controller(const XHCI_CONTROLLER* self) {
     log("XHCI");
     log_dec((boot_uint64_t)(self - controllers));
     log(": ");
+}
+
+/* A page that belongs to a device and goes when the device does.
+ *
+ * Anything the controller reads for as long as the device is present - a
+ * transfer ring, an output context, a class driver's buffer - is allocated
+ * through here. Anything used only for the duration of one command is not:
+ * that is an ordinary alloc_page with a free_page after it, and mixing the two
+ * is how the frees got lost in the first place.
+ *
+ * Returns zero when there is no memory or no room to record it, and the caller
+ * fails the way it would have failed on a plain allocation. */
+static void* device_page(USB_DEVICE* device) {
+    void* page;
+
+    if (device->page_count >= USB_DEVICE_PAGES) return (void*)0;
+    page = alloc_page();
+    if (!page) return (void*)0;
+    device->pages[device->page_count++] = page;
+    return page;
+}
+
+/* Give all of them back. Safe to call on a device that never got as far as
+   allocating any, which is the point: every failed enumeration passes through
+   here too. */
+static void free_device_pages(USB_DEVICE* device) {
+    for (boot_uint32_t index = 0; index < device->page_count; index++)
+        free_page(device->pages[index]);
+    device->page_count = 0;
+    device->context = (boot_uint8_t*)0;
+    device->control.trbs = (TRB*)0;
+}
+
+/* What a device cost, and what it gave back.
+ *
+ * A driver that allocates on plug and frees on unplug has to be able to say
+ * whether those two numbers are the same, because nothing else in the machine
+ * can: memory that is lost this way is lost quietly, a few pages at a time,
+ * and the only symptom hours later is a system that cannot open a file. The
+ * laptop where this was first suspected has no serial port, so the count has
+ * to be something the driver states rather than something a debugger finds.
+ *
+ * Free pages before minus free pages after: positive is spent, negative is
+ * returned. */
+static void log_pages(const XHCI_CONTROLLER* self, const char* what,
+                      boot_uint64_t before) {
+    boot_uint64_t now = memory_free_pages();
+
+    log_controller(self);
+    log(what);
+    log(", ");
+    if (now <= before) {
+        log_dec(before - now);
+        log(" pages spent, ");
+    } else {
+        log_dec(now - before);
+        log(" pages returned, ");
+    }
+    log_dec(now);
+    log(" free\n");
 }
 
 /* Spin until a bit clears, giving up after `timeout_ms`.
@@ -898,12 +974,15 @@ static int address_device(USB_DEVICE* device) {
     boot_uint8_t* output;
     TRB* transfer_trbs;
 
+    /* The output context and the control ring stay for as long as the device
+       does; the input context is read once, by the command below. */
     input = (boot_uint8_t*)alloc_page();
-    output = (boot_uint8_t*)alloc_page();
-    transfer_trbs = (TRB*)alloc_page();
+    output = (boot_uint8_t*)device_page(device);
+    transfer_trbs = (TRB*)device_page(device);
     if (!input || !output || !transfer_trbs) {
         log_controller(self);
         log("out of memory addressing the device\n");
+        if (input) free_page(input);
         return 0;
     }
     memset(input, 0, PAGE_SIZE);
@@ -928,8 +1007,11 @@ static int address_device(USB_DEVICE* device) {
     if (!run_command(self, "address device",
                      (boot_uint64_t)(unsigned long long)input,
                      (TRB_ADDRESS_DEVICE << TRB_TYPE_SHIFT) |
-                     (device->slot << 24)))
+                     (device->slot << 24))) {
+        free_page(input);
         return 0;
+    }
+    free_page(input);
 
     /* The controller writes the assigned address into the output slot
        context; reading it back proves the device really answered. */
@@ -1516,10 +1598,13 @@ static int configure_keyboard(USB_DEVICE* device,
         memset(keyboard, 0, sizeof(*keyboard));
         keyboard->dci = endpoint * 2 + 1;
 
-    trbs = (TRB*)alloc_page();
-    keyboard->report = (boot_uint8_t*)alloc_page();
+    trbs = (TRB*)device_page(device);
+    keyboard->report = (boot_uint8_t*)device_page(device);
     input = (boot_uint8_t*)alloc_page();
-    if (!trbs || !keyboard->report || !input) return 0;
+    if (!trbs || !keyboard->report || !input) {
+        if (input) free_page(input);
+        return 0;
+    }
     memset(keyboard->report, 0, PAGE_SIZE);
     memset(input, 0, PAGE_SIZE);
     ring_init(&keyboard->ring, trbs);
@@ -1535,8 +1620,11 @@ static int configure_keyboard(USB_DEVICE* device,
     if (!run_command(self, "configure endpoint",
                      (boot_uint64_t)(unsigned long long)input,
                      (TRB_CONFIGURE_ENDPOINT << TRB_TYPE_SHIFT) |
-                     (device->slot << 24)))
+                     (device->slot << 24))) {
+        free_page(input);
         return 0;
+    }
+    free_page(input);
 
     /* Select the configuration, then ask for the boot protocol - without the
        second the device would send report-descriptor-defined data that needs
@@ -2074,14 +2162,15 @@ static int configure_storage(USB_DEVICE* device,
     storage->in_dci = (boot_uint32_t)(storage->in_address & 0x0F) * 2 + 1;
     storage->out_dci = (boot_uint32_t)(storage->out_address & 0x0F) * 2;
 
-    in_trbs = (TRB*)alloc_page();
-    out_trbs = (TRB*)alloc_page();
-    storage->blocks = (boot_uint8_t*)alloc_page();
-    storage->bounce = (boot_uint8_t*)alloc_page();
+    in_trbs = (TRB*)device_page(device);
+    out_trbs = (TRB*)device_page(device);
+    storage->blocks = (boot_uint8_t*)device_page(device);
+    storage->bounce = (boot_uint8_t*)device_page(device);
     input = (boot_uint8_t*)alloc_page();
     if (!in_trbs || !out_trbs || !storage->blocks || !storage->bounce || !input) {
         log_controller(self);
         log("out of memory configuring storage\n");
+        if (input) free_page(input);
         return 0;
     }
     memset(storage->blocks, 0, PAGE_SIZE);
@@ -2107,8 +2196,11 @@ static int configure_storage(USB_DEVICE* device,
     if (!run_command(self, "configure endpoint",
                      (boot_uint64_t)(unsigned long long)input,
                      (TRB_CONFIGURE_ENDPOINT << TRB_TYPE_SHIFT) |
-                     (device->slot << 24)))
+                     (device->slot << 24))) {
+        free_page(input);
         return 0;
+    }
+    free_page(input);
 
     if (control_in(device, 0x00, USB_SET_CONFIGURATION, configuration[5],
                    0, 0, 0) < 0) {
@@ -2813,16 +2905,17 @@ static int configure_network(USB_DEVICE* device,
         boot_uint32_t in_dci = (boot_uint32_t)(network.in_address & 0x0F) * 2 + 1;
         boot_uint32_t out_dci = (boot_uint32_t)(network.out_address & 0x0F) * 2;
         boot_uint32_t last = in_dci > out_dci ? in_dci : out_dci;
-        TRB* in_trbs = (TRB*)alloc_page();
-        TRB* out_trbs = (TRB*)alloc_page();
+        TRB* in_trbs = (TRB*)device_page(device);
+        TRB* out_trbs = (TRB*)device_page(device);
         boot_uint8_t* input = (boot_uint8_t*)alloc_page();
 
-        network_receive_buffer = (boot_uint8_t*)alloc_page();
-        network_send_buffer = (boot_uint8_t*)alloc_page();
+        network_receive_buffer = (boot_uint8_t*)device_page(device);
+        network_send_buffer = (boot_uint8_t*)device_page(device);
         if (!in_trbs || !out_trbs || !input ||
             !network_receive_buffer || !network_send_buffer) {
             log_controller(self);
             log("out of memory opening the network endpoints\n");
+            if (input) free_page(input);
             return 0;
         }
         memset(input, 0, PAGE_SIZE);
@@ -3577,6 +3670,7 @@ static USB_DEVICE* attach_at(XHCI_CONTROLLER* self, boot_uint32_t root_port,
     USB_DEVICE* device;
     boot_uint8_t* configuration;
     boot_uint32_t length;
+    boot_uint64_t free_before = memory_free_pages();
 
     device = free_device(self);
     if (!device) {
@@ -3627,12 +3721,14 @@ static USB_DEVICE* attach_at(XHCI_CONTROLLER* self, boot_uint32_t root_port,
         log_controller(self);
         log("the device would not take an address\n");
         disable_slot(self, device->slot);
+        free_device_pages(device);
         return (USB_DEVICE*)0;
     }
     if (!identify_device(device)) {
         log_controller(self);
         log("the device would not describe itself\n");
         disable_slot(self, device->slot);
+        free_device_pages(device);
         return (USB_DEVICE*)0;
     }
 
@@ -3641,6 +3737,7 @@ static USB_DEVICE* attach_at(XHCI_CONTROLLER* self, boot_uint32_t root_port,
         log_controller(self);
         log("out of memory enumerating a device\n");
         disable_slot(self, device->slot);
+        free_device_pages(device);
         return (USB_DEVICE*)0;
     }
     memset(configuration, 0, PAGE_SIZE);
@@ -3650,6 +3747,7 @@ static USB_DEVICE* attach_at(XHCI_CONTROLLER* self, boot_uint32_t root_port,
         log("could not read the configuration descriptor\n");
         free_page(configuration);
         disable_slot(self, device->slot);
+        free_device_pages(device);
         return (USB_DEVICE*)0;
     }
 
@@ -3666,6 +3764,7 @@ static USB_DEVICE* attach_at(XHCI_CONTROLLER* self, boot_uint32_t root_port,
     }
 
     free_page(configuration);
+    log_pages(self, "device up", free_before);
     return device;
 }
 
@@ -3722,6 +3821,8 @@ static int attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
    device too, and forgetting half of it in one of the two places is a driver
    that talks to hardware that is not there any more. */
 static void release_device(XHCI_CONTROLLER* self, USB_DEVICE* device) {
+    boot_uint64_t free_before = memory_free_pages();
+
     for (boot_uint32_t index = 0; index < storage_count; index++) {
         USB_STORAGE* gone = &storages[index];
 
@@ -3731,6 +3832,13 @@ static void release_device(XHCI_CONTROLLER* self, USB_DEVICE* device) {
         gone->used = 0;
         gone->ready = 0;
         gone->device = (USB_DEVICE*)0;
+        /* Its buffers are about to be handed back to the page allocator, so
+           the pointers to them stop being pointers here rather than staying
+           plausible until something dereferences one. */
+        gone->blocks = (boot_uint8_t*)0;
+        gone->bounce = (boot_uint8_t*)0;
+        gone->in.trbs = (TRB*)0;
+        gone->out.trbs = (TRB*)0;
         /* The "current" pointer must not be left aimed at a stick that has
            gone: the next block transfer sets it, but nothing else does. */
         if (storage == gone) storage = (USB_STORAGE*)0;
@@ -3738,17 +3846,29 @@ static void release_device(XHCI_CONTROLLER* self, USB_DEVICE* device) {
     if (device == network_device) {
         network_ready = 0;
         network_device = (USB_DEVICE*)0;
+        network_receive_buffer = (boot_uint8_t*)0;
+        network_send_buffer = (boot_uint8_t*)0;
+        network_in.trbs = (TRB*)0;
+        network_out.trbs = (TRB*)0;
     }
     for (boot_uint32_t slot = 0; slot < keyboard_count; slot++)
-        if (keyboards[slot].used && keyboards[slot].device == device)
+        if (keyboards[slot].used && keyboards[slot].device == device) {
             keyboards[slot].used = 0;
+            keyboards[slot].report = (boot_uint8_t*)0;
+            keyboards[slot].ring.trbs = (TRB*)0;
+        }
     for (boot_uint32_t index = 0; index < hub_count; index++)
         if (hubs[index].used && hubs[index].device == device)
             hubs[index].used = 0;
 
+    /* The slot goes first, and the memory second. Both orders free the same
+       pages; only this one guarantees the controller has been told to stop
+       reading them before they belong to somebody else. */
     disable_slot(self, device->slot);
+    free_device_pages(device);
     device->used = 0;
     device->slot = 0;
+    log_pages(self, "device gone", free_before);
 }
 
 /* Everything at a route, and everything below it.

@@ -138,9 +138,27 @@ check: $(KERNEL_ELF)
 # linker script gained a section, the copy did not, and programs built with the
 # SDK were quietly missing it. Copying four files on every build costs nothing
 # and makes that impossible.
+# The SDK is a copy of what a third-party program needs - and, since it drifted
+# once and broke every program built with it, of how to build it.
+#
+# koicc used to carry its own copy of the compiler flags. The linker script
+# here became position-independent, koicc kept -no-pie, and every program the
+# SDK produced was refused by the loader with one unhelpful sentence. Two
+# copies of one truth, exactly like the font and the WAV parser before it.
+#
+# So the flags are written out of this Makefile and koicc reads them. There is
+# one place they can be wrong now, and it is the place they are used.
 sdk:
 	cp programs/koi.h programs/start.c programs/koilib.c programs/program.ld sdk/
 	cp include/syscall.h sdk/syscall.h
+	@printf '# Written by `make sdk`. The flags koicc builds with, taken from\n' > sdk/koiflags
+	@printf '# the Makefile that builds Koi-DOS itself, so the two cannot drift.\n' >> sdk/koiflags
+	@# -Werror is right for this repository and wrong to impose on somebody
+	@# else's code: a warning in a contributor's own style should not stop
+	@# their program building. -I include goes because the SDK has no such
+	@# directory; its headers sit beside koicc.
+	@printf 'KOI_CFLAGS="%s"\n' "$$(echo '$(PROGRAM_CFLAGS)' | sed -e 's| -I include||' -e 's| -Werror||')" >> sdk/koiflags
+	@printf 'KOI_LDFLAGS="%s"\n' "$$(echo '$(PROGRAM_LDFLAGS)' | sed 's|programs/program.ld|program.ld|')" >> sdk/koiflags
 	@echo "sdk/ refreshed"
 
 clean:

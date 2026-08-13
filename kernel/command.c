@@ -578,15 +578,39 @@ static void command_mem(void) {
     }
     print_line("");
 
-    print("Volumes         : ");
-    print_dec(volume_count());
-    for (boot_uint32_t index = 0; index < volume_count(); index++) {
-        VOLUME* volume = volume_at(index);
-        print(index ? ", " : "  ");
-        put(volume ? volume->letter : '?');
-        put(':');
+    /* Only the ones with a letter, and a count of the ones without.
+     *
+     * This printed every volume's letter without asking whether it had one.
+     * The loader's partition deliberately has none, so its letter is a zero
+     * byte - and a zero byte was invisible in the font this was written
+     * against and is a hollow rectangle in Terminus. The bug did not arrive
+     * with the new font; it arrived with the old one and hid there. */
+    {
+        boot_uint32_t lettered = 0;
+        boot_uint32_t hidden = 0;
+
+        for (boot_uint32_t index = 0; index < volume_count(); index++) {
+            VOLUME* volume = volume_at(index);
+            if (volume && volume->letter) lettered++;
+            else hidden++;
+        }
+
+        print("Volumes         : ");
+        print_dec(lettered);
+        for (boot_uint32_t index = 0; index < volume_count(); index++) {
+            VOLUME* volume = volume_at(index);
+            if (!volume || !volume->letter) continue;
+            print("  ");
+            put(volume->letter);
+            put(':');
+        }
+        if (hidden) {
+            print("  (");
+            print_dec(hidden);
+            print(hidden == 1 ? " without a letter)" : " without letters)");
+        }
+        print_line("");
     }
-    print_line("");
 
     print("USB             : ");
     if (!xhci_port_count()) {

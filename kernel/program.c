@@ -235,22 +235,50 @@ static int relocate(const boot_uint8_t* contents, boot_uint32_t length,
     return 1;
 }
 
+/* Why a file could not be loaded, in words somebody can act on.
+ *
+ * Every one of these used to be "Not a valid Koi-DOS program", which is true
+ * of a corrupt file, a program for another machine, a program built by an SDK
+ * whose flags had drifted, and a text file somebody typed the name of. Four
+ * different mornings, one sentence. */
 static int load_segments(const boot_uint8_t* contents, boot_uint32_t length,
-                         boot_uint64_t base, boot_uint64_t* entry_point) {
+                         boot_uint64_t base, boot_uint64_t* entry_point,
+                         const char** reason) {
     const ELF64_HEADER* header = (const ELF64_HEADER*)contents;
     const ELF64_PROGRAM_HEADER* segments;
 
+    *reason = "the file is damaged";
     if (length < sizeof(ELF64_HEADER)) return 0;
     if (header->e_ident[0] != 0x7F || header->e_ident[1] != 'E' ||
-        header->e_ident[2] != 'L' || header->e_ident[3] != 'F') return 0;
+        header->e_ident[2] != 'L' || header->e_ident[3] != 'F') {
+        *reason = "not a program at all - no ELF header";
+        return 0;
+    }
     if (header->e_ident[ELF_INDEX_CLASS] != ELF_CLASS_64 ||
-        header->e_ident[ELF_INDEX_DATA] != ELF_DATA_LSB) return 0;
+        header->e_ident[ELF_INDEX_DATA] != ELF_DATA_LSB) {
+        *reason = "not a 64-bit little-endian program";
+        return 0;
+    }
+    if (header->e_machine != ELF_MACHINE_X86_64) {
+        *reason = "built for a different processor";
+        return 0;
+    }
     /* Position-independent, so that a second program can be resident at a
-       different address while the first one waits. A fixed-address program
-       could only ever be loaded in slot zero, and refusing it outright says so
-       once rather than crashing later in whichever slot it landed in. */
-    if (header->e_type != ET_DYN ||
-        header->e_machine != ELF_MACHINE_X86_64) return 0;
+     * different address while the first one waits.
+     *
+     * A fixed-address program could only ever live in slot zero. Refusing it
+     * is right; refusing it without saying which flag is wrong is what made
+     * every program built by the SDK fail with one useless sentence after the
+     * linker script here changed and the SDK's did not. */
+    if (header->e_type == ET_EXEC) {
+        *reason = "built to load at a fixed address. Rebuild it with the "
+                  "current SDK: koicc now links -pie";
+        return 0;
+    }
+    if (header->e_type != ET_DYN) {
+        *reason = "not an executable ELF";
+        return 0;
+    }
     if (!header->e_phnum || header->e_phentsize != sizeof(ELF64_PROGRAM_HEADER))
         return 0;
     if (header->e_phoff > length ||
@@ -266,11 +294,16 @@ static int load_segments(const boot_uint8_t* contents, boot_uint32_t length,
            malformed or hostile file from writing over the kernel: there is no
            memory protection to fall back on. */
         if (segment->p_vaddr + segment->p_memsz >
-            PROGRAM_SLOT_SIZE - PROGRAM_STACK_SIZE)
+            PROGRAM_SLOT_SIZE - PROGRAM_STACK_SIZE) {
+            *reason = "too large for the memory a program is given";
             return 0;
+        }
         if (segment->p_filesz > segment->p_memsz) return 0;
         if (segment->p_offset > length ||
-            segment->p_filesz > length - segment->p_offset) return 0;
+            segment->p_filesz > length - segment->p_offset) {
+            *reason = "the file is shorter than its own headers claim";
+            return 0;
+        }
 
         memset((void*)(unsigned long long)(base + segment->p_vaddr), 0,
                (boot_uint64_t)segment->p_memsz);
@@ -280,7 +313,11 @@ static int load_segments(const boot_uint8_t* contents, boot_uint32_t length,
     }
 
     if (header->e_entry >= PROGRAM_SLOT_SIZE) return 0;
-    if (!relocate(contents, length, base)) return 0;
+    if (!relocate(contents, length, base)) {
+        *reason = "it needs a kind of relocation this loader does not do";
+        return 0;
+    }
+    *reason = 0;
     *entry_point = base + header->e_entry;
     return 1;
 }
@@ -355,9 +392,20 @@ int program_run(VOLUME* volume, const char* path, const char* arguments,
 
     contents = read_program(volume, path, &length);
     if (!contents) return PROGRAM_NOT_LOADABLE;
-    if (!load_segments(contents, length, base, &entry_point)) {
-        kfree(contents);
-        return PROGRAM_NOT_LOADABLE;
+    {
+        const char* reason = "the file is damaged";
+        if (!load_segments(contents, length, base, &entry_point, &reason)) {
+            kfree(contents);
+            /* Said here, where the reason is known, rather than by a caller
+               that only sees a number. */
+            console_write("Cannot run this program: ");
+            console_write(reason);
+            console_write(".\n");
+            serial_write("PROGRAM: refused - ");
+            serial_write(reason);
+            serial_write("\n");
+            return PROGRAM_REFUSED;
+        }
     }
     kfree(contents);
 
