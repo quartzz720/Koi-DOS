@@ -2,6 +2,7 @@
 #include "layout.h"
 #include "serial.h"
 #include "acpi.h"
+#include "cpu.h"
 #include "console.h"
 #include "idt.h"
 #include "io.h"
@@ -213,6 +214,9 @@ static void handle_scancode(boot_uint8_t code) {
     if (escape_pending) {
         escape_pending = 0;
         keyboard_submit_event(scancode_identity(code, 1), released);
+        if (!released)
+            keyboard_attention(control_held, alt_held,
+                               (int)translate_escaped(code));
         /* The right-hand modifiers arrive escaped; treat them as their
            left-hand twins. */
         if (code == 0x1D) { control_held = !released; return; }
@@ -397,6 +401,21 @@ int keyboard_break_taken(void) {
 }
 
 void keyboard_break_clear(void) { break_requested = 0; }
+
+void keyboard_attention(int control_down, int alt_down, int key) {
+    if (!control_down || !alt_down || key != KEY_DELETE) return;
+
+    /* Said out loud before it happens. A machine that restarts in silence
+       looks like a machine that crashed, and somebody who pressed this by
+       accident deserves to know which of the two it was. */
+    serial_write("KEYBOARD: Ctrl+Alt+Del, restarting\n");
+    console_write("\nCtrl+Alt+Del - restarting.\n");
+
+    /* ACPI first, because it is the machine's own answer, then the fallback
+       that needs nothing: an empty interrupt table and one interrupt. */
+    (void)acpi_reset();
+    cpu_reset();
+}
 
 void keyboard_submit(int key) {
     boot_uint32_t code;

@@ -1442,6 +1442,11 @@ static void handle_report(USB_KEYBOARD* keyboard, const boot_uint8_t* report) {
         if (report_holds(keyboard->previous, usage)) continue;
 
         keyboard_submit_event(hid_identity(usage), 0);
+        /* Ctrl+Alt+Del, from the modifier byte this report carries rather than
+           from any state kept here: a machine can have two keyboards and only
+           the one being typed on knows what is held down on it. */
+        keyboard_attention((modifiers & 0x11) != 0, (modifiers & 0x44) != 0,
+                           hid_identity(usage));
         keyboard_submit(hid_to_key(usage, modifiers));
     }
 

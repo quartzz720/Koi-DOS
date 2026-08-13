@@ -4,6 +4,7 @@
 #include "console.h"
 #include "serial.h"
 #include "keyboard.h"
+#include "layout.h"
 #include "environment.h"
 #include "fat32.h"
 #include "partition.h"
@@ -459,6 +460,9 @@ static long system_text(long item, long index, char* buffer, long size) {
     case KOI_TEXT_PROGRAM_PATH:
         source = program_path();
         break;
+    case KOI_TEXT_VERSION_NAME:
+        source = KOI_VERSION_NAME;
+        break;
     default:
         return SYSCALL_ERROR;
     }
@@ -538,6 +542,10 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
 
     case SYS_PUTS:
         if (a) write_out((const char*)a);
+        return 0;
+
+    case SYS_LAYOUT_GESTURE:
+        layout_gesture_enable((int)a);
         return 0;
 
     case SYS_GETENV:

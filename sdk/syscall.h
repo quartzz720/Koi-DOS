@@ -35,7 +35,16 @@
  * it is the point at which it stopped needing a USB stick to be changed. A
  * machine that updates itself over the network is a different thing to live
  * with than one that does not, and that is what beta means here. */
-#define KOI_DOS_VERSION 0x0033
+#define KOI_DOS_VERSION 0x005A
+
+/* What to call it, in words. 0x005A is 0.90 and reads as "0.9"; the number is
+ * what orders correctly - 0.9 encoded as nine would sort below the 0.51 it
+ * follows - and the string is what people see.
+ *
+ * One definition rather than a literal in the shell and another in dosfetch,
+ * which is how a machine came to describe itself as Beta on one screen and
+ * Alpha on the next. Programs read it through KOI_TEXT_VERSION_NAME. */
+#define KOI_VERSION_NAME "0.9 Pre-release"
 
 /* The interface's own version, which moves independently of the system's.
  *
@@ -346,6 +355,10 @@ typedef struct {
  * happened to be right. */
 #define KOI_TEXT_PROGRAM_PATH 6
 
+/* The version in words - "0.9 Pre-release" - so a program prints what the
+   system calls itself rather than its own guess at it. */
+#define KOI_TEXT_VERSION_NAME 7
+
 /* Graphics.
  *
  * A program takes the screen, draws, shows the result, and gives the screen
@@ -550,6 +563,15 @@ typedef struct {
  * there is no such variable. SYS_ENVAT is how a program lists them: it takes
  * an index from zero and fills `name`, returning 0 when the index is past the
  * end. */
+/* Turn the Alt+Shift layout gesture on for as long as this program runs.
+ *
+ * Off everywhere else, because the shell is ASCII and a stray Alt+Shift there
+ * is a keyboard that has quietly stopped obeying. A program that takes text in
+ * somebody's own language - an editor, a notepad - asks for it; the kernel
+ * turns it off again when the program exits, so forgetting to is not a way to
+ * leave the machine odd. */
+#define SYS_LAYOUT_GESTURE 0x5C  /* (enabled) -> 0 */
+
 #define SYS_GETENV 0x5A      /* (name, buffer, size) -> length, or 0 */
 #define SYS_ENVAT 0x5B       /* (index, name, size) -> length, or 0 */
 

@@ -16,6 +16,14 @@
 int tftp_fetch(boot_uint32_t server, const char* name, void* buffer,
                boot_uint32_t size, const char** why);
 
+/* Where to report progress to, for as long as it is set.
+ *
+ * `total` is called once when the server says how big the file is - which it
+ * may not, in which case it is never called and the caller shows what it can
+ * without a percentage. `received` is called as blocks arrive. */
+void tftp_progress(void (*total)(boot_uint32_t),
+                   void (*received)(boot_uint32_t));
+
 void tftp_report(boot_uint32_t bytes);
 
 #endif

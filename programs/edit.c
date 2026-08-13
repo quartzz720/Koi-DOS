@@ -219,6 +219,10 @@ static void do_find(void) {
 }
 
 int main(void) {
+    /* Text in somebody's own language is the whole point of an editor, so this
+       is one of the few programs that asks for Alt+Shift. The kernel takes it
+       away again when this exits. */
+    koi_layout_gesture(1);
     const char* name = koi_arguments();
     char path[EDIT_PATH_MAX];
     int marking = 0;

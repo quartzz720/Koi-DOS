@@ -83,7 +83,20 @@ void layout_toggle(void) {
 
 static int gesture_armed;
 
+static int gesture_allowed;
+
+void layout_gesture_enable(int enabled) {
+    gesture_allowed = enabled != 0;
+    /* Switching it off puts the keyboard back to English rather than leaving
+       whatever was selected: a program that ended while the other layout was
+       on would otherwise hand the shell a keyboard typing in Cyrillic. */
+    if (!gesture_allowed) layout_select(LAYOUT_EN);
+}
+
+int layout_gesture_enabled(void) { return gesture_allowed; }
+
 void layout_gesture(int shift_down, int alt_down) {
+    if (!gesture_allowed) return;
     if (shift_down && alt_down) {
         if (!gesture_armed) { gesture_armed = 1; layout_toggle(); }
         return;

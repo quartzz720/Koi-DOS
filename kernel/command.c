@@ -503,12 +503,45 @@ static void print_prompt(void) {
    number is the only way to tell from the screen which one is running. It is
    the commit count, so it only moves when history does; a trailing `+` on the
    hash means the tree had uncommitted changes when this was built. */
+/* Who and what this is made of.
+ *
+ * An operating system that cannot say where it came from is a strange object.
+ * The licences are here because they have to be somewhere a person can reach
+ * without a browser, and the last line is here because it is the truest thing
+ * on the list.
+ *
+ * The name at the end is a person, not a joke. Typing it on its own prints the
+ * dedication by itself - which is the only kind of memorial a program can
+ * really offer: it waits, and it is there when somebody looks. */
+static void dedication(void) {
+    console_set_color(console_theme()->prompt, console_theme()->background);
+    print_line("");
+    print_line("  Built through intense pain and heartbreak.");
+    print_line("  I miss you so much... Rest in peace, @nonconformie.");
+    print_line("");
+    console_use_theme();
+}
+
+static void command_credits(void) {
+    print_line("");
+    print("Koi-DOS ");
+    print(KOI_VERSION_NAME);
+    print_line(" - a DOS-like operating system for UEFI machines.");
+    print_line("");
+    print_line("Written by Koi Ayame (quartzz720), in freestanding C, with no");
+    print_line("standard library and nothing borrowed but the font.");
+    print_line("");
+    print_line("  Koi-DOS        MIT");
+    print_line("  Terminus Font  SIL Open Font License 1.1");
+    print_line("  K-DOOM         GPL-2.0, from id Software's release of DOOM");
+    print_line("");
+    print_line("The full text is in \\LICENSE on this volume.");
+    dedication();
+}
+
 static void command_ver(void) {
     print("Koi-DOS ");
-    print_dec(KOI_DOS_VERSION >> 8);
-    put('.');
-    print_dec(KOI_DOS_VERSION & 0xFF);
-    print_line(" Beta");
+    print_line(KOI_VERSION_NAME);
 
     print("Kernel ");
     print_dec(KOI_DOS_VERSION >> 8);
@@ -543,6 +576,7 @@ static void command_help(void) {
     print_line("vol            show the volume label");
     print_line("mem            memory, devices and volumes");
     print_line("set [n=v]      environment variables; PATH and PROMPT live here");
+    print_line("credits        what this is made of, and who it is for");
     print_line("find sort      filter text; both read a pipe when given no file");
     print_line("xcopy          a directory and everything under it");
     print_line("label mode     what a volume is called, and how the console is set");
@@ -1625,7 +1659,15 @@ static int prefix_matches(const char* text, const char* key) {
 }
 
 #define DOSGET_CONFIG "\\BOOT\\dosget.cfg"
-#define DOSGET_DEFAULT_SOURCE "192.168.50.1"
+/* Where packages come from when nobody has said otherwise.
+ *
+ * It used to be the cable this is developed on, which is the right answer for
+ * exactly one machine and means everybody else has to create a file before
+ * `dosget` does anything at all. The public server is the answer that works
+ * without being told, and \BOOT\dosget.cfg still overrides it - read fresh on
+ * every invocation, so somebody running their own server changes one line and
+ * needs no reboot. */
+#define DOSGET_DEFAULT_SOURCE "195.133.195.44"
 #define DOSGET_BUFFER (4 * 1024 * 1024)
 /* What is installed and at which version. One `NAME VERSION` per line, on the
    boot volume beside the loader, because a record of what the system is made
@@ -1690,11 +1732,78 @@ static int dosget_source(boot_uint32_t* address) {
     return net_parse_address(text, address);
 }
 
+/* How a download looks while it is happening.
+ *
+ * A third of a megabyte over a phone tethered to a router is slow enough that
+ * a still screen and a hung machine are the same picture, and the person
+ * watching has no way to tell them apart. So: a bar, a percentage when the
+ * server said how big the file is, and the rate - which answers the other
+ * question, "is it slow or is it stuck".
+ *
+ * One line, rewritten in place with a carriage return, because a progress
+ * report that scrolls is a progress report that buries what came before it. */
+static boot_uint32_t fetch_total;
+static boot_uint32_t fetch_started;
+static boot_uint32_t fetch_painted;
+
+static void fetch_total_is(boot_uint32_t total) { fetch_total = total; }
+
+static void fetch_progress(boot_uint32_t received) {
+    boot_uint32_t elapsed = (boot_uint32_t)(timer_ticks() - fetch_started);
+    boot_uint32_t width = 32;
+    boot_uint32_t filled;
+
+    /* Twenty times a second is plenty for something a person is watching, and
+       repainting per block would spend more time drawing than downloading. */
+    if (elapsed - fetch_painted < 50 && received != fetch_total) return;
+    fetch_painted = elapsed;
+
+    put('\r');
+    print("  [");
+    filled = fetch_total ? (received * width) / fetch_total : 0;
+    for (boot_uint32_t index = 0; index < width; index++)
+        put(index < filled ? '=' : (fetch_total ? ' ' : '.'));
+    print("] ");
+
+    if (fetch_total) {
+        print_dec((boot_uint64_t)received * 100 / fetch_total);
+        print("%  ");
+    }
+    print_dec(received / 1024);
+    print(" KiB");
+
+    if (elapsed > 200) {
+        print("  ");
+        print_dec((boot_uint64_t)received * 1000 / elapsed / 1024);
+        print(" KiB/s");
+    }
+    print("     ");
+}
+
+static void fetch_progress_begin(void) {
+    fetch_total = 0;
+    fetch_started = (boot_uint32_t)timer_ticks();
+    fetch_painted = 0;
+    tftp_progress(fetch_total_is, fetch_progress);
+}
+
+static void fetch_progress_end(void) {
+    tftp_progress((void (*)(boot_uint32_t))0, (void (*)(boot_uint32_t))0);
+    /* The bar is left on screen only when it means something: a file small
+       enough to arrive in one breath does not need a line saying so. */
+    if (fetch_painted) print_line("");
+    else { put('\r'); print("                                                        "); put('\r'); }
+}
+
 /* Fetch one file from the source into `buffer`. */
 static int dosget_fetch(boot_uint32_t source, const char* name, void* buffer,
                         boot_uint32_t size) {
     const char* why = (const char*)0;
-    int got = tftp_fetch(source, name, buffer, size, &why);
+    int got;
+
+    fetch_progress_begin();
+    got = tftp_fetch(source, name, buffer, size, &why);
+    fetch_progress_end();
 
     if (got < 0) {
         print("  ");
@@ -2552,6 +2661,52 @@ static int setup_copy(VOLUME* from, const char* source,
     return 1;
 }
 
+/* A directory and everything under it, for the installer.
+ *
+ * xcopy_tree does this too, but it prints as it goes in a shape that belongs
+ * at a prompt and reports failure by returning to one. The installer has a
+ * screen it owns and a licence to abandon, so it says less per file and stops
+ * the whole install when a copy fails. Sharing one of them would mean the
+ * installer printing a directory listing over its own banner. */
+static int setup_copy_tree(VOLUME* from, const char* source,
+                           VOLUME* to, const char* target) {
+    FAT_DIRECTORY directory;
+    FAT_ENTRY entry;
+
+    if (!fat32_stat(from, source, &entry)) return 1;   /* absent is not a fault */
+    if (!(entry.attributes & FAT_ATTRIBUTE_DIRECTORY)) return 1;
+    if (!fat32_stat(to, target, &entry) &&
+        !fat32_create(to, target, 1, &entry)) {
+        print("    ");
+        print(target);
+        console_set_color(console_theme()->error, console_theme()->background);
+        print_line("  FAILED");
+        console_use_theme();
+        return 0;
+    }
+    if (!fat32_opendir(from, source, &directory)) return 1;
+
+    while (fat32_readdir(&directory, &entry)) {
+        char from_path[PATH_MAX];
+        char to_path[PATH_MAX];
+
+        if (entry.name[0] == '.') continue;
+        from_path[0] = 0;
+        string_join(from_path, sizeof(from_path), "", source);
+        string_join(from_path, sizeof(from_path), "\\", entry.name);
+        to_path[0] = 0;
+        string_join(to_path, sizeof(to_path), "", target);
+        string_join(to_path, sizeof(to_path), "\\", entry.name);
+
+        if (entry.attributes & FAT_ATTRIBUTE_DIRECTORY) {
+            if (!setup_copy_tree(from, from_path, to, to_path)) return 0;
+            continue;
+        }
+        if (!setup_copy(from, from_path, to, to_path)) return 0;
+    }
+    return 1;
+}
+
 /* Find a partition on `device` by its number. */
 static PARTITION* setup_partition(BLOCK_DEVICE* device, boot_uint32_t number) {
     for (boot_uint32_t index = 0; index < partition_count(); index++) {
@@ -3004,6 +3159,28 @@ static void command_setup(void) {
         return;
     }
 
+    /* And the media has to be found again, because it has just moved.
+     *
+     * The source volumes were located before any of this, and remounting
+     * rebuilds the whole volume table: a disk that had no partitions
+     * contributed nothing to it and now contributes two, so every entry after
+     * that point is a different volume than it was. The installer was left
+     * holding a pointer to the medium that referred to the empty partition it
+     * had just created, and the first copy failed with the file "not found" -
+     * on a medium it had read the licence from a moment earlier.
+     *
+     * Found by what they contain rather than remembered, which is what makes
+     * this correct rather than merely fixed: the freshly formatted partitions
+     * hold neither of these files. */
+    loader_source = setup_source_of("\\EFI\\BOOT\\BOOTX64.EFI");
+    system_source = setup_source_of("\\BIN");
+    if (!loader_source || !system_source) {
+        console_set_color(console_theme()->error, console_theme()->background);
+        print_line("  The installation media is no longer readable.");
+        console_use_theme();
+        return;
+    }
+
     print_line("  Copying the loader");
     if (!fat32_create(boot_target, "\\EFI", 1, &(FAT_ENTRY){0}) ||
         !fat32_create(boot_target, "\\EFI\\BOOT", 1, &(FAT_ENTRY){0}) ||
@@ -3041,6 +3218,66 @@ static void command_setup(void) {
         }
     }
     (void)setup_copy(system_source, "\\LICENSE", system_target, "\\LICENSE");
+
+    /* The packages, and the records that say what they are.
+     *
+     * Without this the installed machine had the system and none of the
+     * programs: \BIN went across and \COMMANDER, \MIZU and the rest stayed
+     * on the stick. The obvious fix - "fetch them afterwards" - is the wrong
+     * one, because the machine that most needs them is the one whose network
+     * card we do not drive. What is on the medium has to arrive.
+     *
+     * Which directories to copy is not guessed: every package wrote down where
+     * it put itself when it was installed, so the medium already knows. The
+     * records go across too, so `dosget remove` still works afterwards, and so
+     * does the search path in \BOOT\CONFIG - a package that arrives without
+     * its place on the path is a package that cannot be run. */
+    print_line("  Copying the packages");
+    {
+        FAT_DIRECTORY directory;
+        FAT_ENTRY entry;
+
+        (void)fat32_create(system_target, DOSGET_RECORDS, 1, &(FAT_ENTRY){0});
+        (void)fat32_create(system_target, CONFIG_DIRECTORY, 1, &(FAT_ENTRY){0});
+
+        if (fat32_opendir(system_source, DOSGET_RECORDS, &directory)) {
+            while (fat32_readdir(&directory, &entry)) {
+                char record[PATH_MAX];
+                char text[1024];
+                boot_uint32_t length;
+                FAT_ENTRY found;
+                char where[PATH_MAX];
+
+                if (entry.attributes & FAT_ATTRIBUTE_DIRECTORY) continue;
+                record[0] = 0;
+                string_join(record, sizeof(record), "", DOSGET_RECORDS "\\");
+                string_join(record, sizeof(record), "", entry.name);
+                if (!setup_copy(system_source, record, system_target, record))
+                    return;
+
+                if (!fat32_stat(system_source, record, &found)) continue;
+                length = fat32_read(system_source, &found, 0, text,
+                                    sizeof(text) - 1);
+                text[length] = 0;
+                {
+                    const char* value = manifest_value(text, length, "directory",
+                                                       (boot_uint32_t*)0);
+                    where[0] = 0;
+                    if (value) take_line(value, where, sizeof(where));
+                }
+                if (!where[0] || where[0] != '\\') continue;
+                if (!setup_copy_tree(system_source, where, system_target, where))
+                    return;
+            }
+        }
+
+        (void)setup_copy(system_source, CONFIG_DIRECTORY "\\SYSTEM.CFG",
+                         system_target, CONFIG_DIRECTORY "\\SYSTEM.CFG");
+        (void)setup_copy(system_source, DOSGET_DATABASE,
+                         system_target, DOSGET_DATABASE);
+        (void)setup_copy(system_source, "\\AUTOEXEC.BAT",
+                         system_target, "\\AUTOEXEC.BAT");
+    }
 
     /* The marker last, because it is what makes the installation real: it is
        how the kernel decides which volume is the system one, and until it
@@ -4197,6 +4434,11 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
     syscall_set_location(current_volume, current_path);
     code = program_run(program_volume, path, arguments->tail, &exit_code);
     syscall_close_all();
+    /* The keyboard back to English, for the same reason as the screen and the
+       colours below: a program that asked for Alt+Shift and exited while the
+       other layout was selected would hand the prompt a keyboard typing in
+       Cyrillic, and the prompt is ASCII. */
+    layout_gesture_enable(0);
     /* And take the screen back, whether or not the program gave it up. A
        program that returns while still holding it would otherwise leave the
        shell invisible with no way to ask for it back - which is precisely the
@@ -5361,6 +5603,9 @@ static void execute(const char* input) {
     if (word_is(input, "DATE")) { command_date(); return; }
     if (word_is(input, "TIME")) { command_time(); return; }
     if (word_is(input, "VER")) { command_ver(); return; }
+    if (word_is(input, "CREDITS")) { command_credits(); return; }
+    /* Her name, on its own. */
+    if (word_is(input, "NONCONFORMIE")) { dedication(); return; }
     if (word_is(input, "SET")) { command_set(arguments.tail); return; }
     if (word_is(input, "BEEP")) { command_beep(&arguments); return; }
     if (word_is(input, "SOUND")) { command_sound(&arguments); return; }

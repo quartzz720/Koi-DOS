@@ -1,9 +1,14 @@
 # Koi-DOS — Architecture
 
+**0.9, a pre-release.** This file describes what the system is and, wherever it is worth it, why
+it is that rather than something else. Most of the "why" paragraphs are scars: a decision that
+reads as obvious usually got that way by being wrong first, and the wrong version is the part
+worth writing down.
+
 Koi-DOS is a DOS-like operating system for UEFI machines. "DOS-like" here means the look and
-the character, not binary compatibility: drive letters, FAT32, 8.3 names, a familiar command
-set, a monolith in ring 0 with no memory protection. Programs, however, are native 64-bit ones
-with their own system-call interface — not real `.COM` files from the eighties.
+the character, not binary compatibility: drive letters, FAT32, long names over 8.3, a familiar
+command set, a monolith in ring 0 with no memory protection. Programs, however, are native
+64-bit ones with their own system-call interface — not real `.COM` files from the eighties.
 
 The system volume is **`Z:`**, not `C:`. In MS-DOS, `A:` and `B:` were reserved for floppy
 drives, and the system ended up on `C:` only because that was the first letter left over.
@@ -995,17 +1000,27 @@ Found exactly that way, driving Mizu from QEMU's monitor where the press and rel
 milliseconds apart. The wheel is a running total for the same reason, and because a total can be
 read by any number of callers where a since-you-last-asked figure can only be read by the first.
 
-### Chaining, and why a program cannot call a program
+### Running a program from a program
 
-One program runs at a time, at a fixed address, in one address space. That is the design and it
-is not changing — so a program cannot load another program: the second image would land on top of
-the first, including the stack the kernel is standing on while it does the loading.
+One program used to run at a time, at a fixed address, in one address space — so a program could
+not load another: the second image would land on top of the first, including the stack the kernel
+was standing on while it did the loading. Which meant a graphical shell that could not start
+anything.
 
-Which would mean a graphical shell that cannot start anything.
+There are four slots now, each with its own base address and its own resume point, and `SYS_RUN`
+loads into the next one and comes back when it ends. The caller is stopped inside the call, not
+scheduled alongside it — a smaller claim than multitasking, and the whole of what "run this and
+come back" needs. It is what DOS's EXEC did.
 
-`SYS_CHAIN` asks for a command to be run **after the calling program has exited**. By then it is
-gone, its memory is free, and the requested program loads into the space it was occupying. No
-nesting, no second image, nothing saved and restored. Requests are honoured most-recent-first, so
+The resume point is a saved stack pointer and the callee-saved registers: a `setjmp`/`longjmp`
+pair with no library to borrow one from, because `SYS_EXIT` is reached from inside an interrupt
+handler several frames deep and has to get back out to `program_run` without unwinding through
+any of it. One resume point per slot, for the same reason there is one slot per depth — a single
+point meant the second exit returned to a stack frame that had already been left.
+
+`SYS_CHAIN` is still here, and it is not a leftover. It asks for a command to be run **after the
+calling program has exited**, giving the memory up rather than holding it, which is the right
+answer when the program has finished with itself. Requests are honoured most-recent-first, so
 "run this and then bring me back" is two ordinary calls in the order they read.
 
 The requests are stored in kernel memory rather than the program's, because the program's memory
@@ -1018,9 +1033,32 @@ runs a program and asks to be brought back does that on every launch, all sessio
 were a nested call the kernel stack would grow with every program started and the machine would
 fall over after a long enough evening.
 
-Coming back is a fresh start and not a resume. Mizu hands itself its two paths and its selection
-as a command line; anything else would have to go to a file first. Small DOS shells did precisely
-this, for precisely this reason.
+Coming back that way is a fresh start and not a resume, so anything worth keeping travels back as
+arguments or goes to a file first.
+
+### Stopping a program
+
+Ctrl+C is recorded by the keyboard and acted on by the kernel at the entry to a system call, and
+the two halves are deliberately separate. The keyboard runs in an interrupt handler, with the
+program it is about somewhere in the middle of its own work and kernel state half-changed around
+it; unwinding a stack from there turns a stuck program into a stuck machine. A system call is the
+one moment the program is known to be between two pieces of its own work and standing in the
+kernel on purpose.
+
+The unwind is not new: it is what `SYS_EXIT` already did. Ctrl+C adds the decision, not the
+mechanism.
+
+The check also drains the USB controllers, at most once every twenty milliseconds, and that is
+not an optimisation — it is the feature. The xHCI interrupt is not routed, so a USB keyboard is
+silent until somebody empties its event ring, and the only place that happened was the loop that
+waits for a keystroke. A program that is not waiting for one heard nothing, which is precisely
+the program Ctrl+C exists for: on any machine whose keyboard is USB, the key would never have
+worked at all.
+
+What it cannot catch is a loop that calls nothing, because such a program never enters the kernel
+to be caught. Everything that prints, reads a key, sleeps or touches a file is interruptible,
+which is nearly everything. `programs/spin.c` contains all three cases so the limit is
+demonstrated rather than described.
 
 ### Paging
 
@@ -1173,15 +1211,31 @@ only for programs that happen to sit in this tree.
 
 ### Configuration
 
-`\BOOT\userspace.cfg` is read once at boot and applied before the shell paints anything.
-`key = value` per line, `#` or `;` starts a comment, unknown keys are ignored and a missing file
-is not an error — a configuration file that refused to boot the system it configures would be a
+Settings live in `\BOOT\CONFIG` as a directory of small files, one owner each, read at boot and
+applied before the shell paints anything. `key = value` per line, unknown keys ignored, a missing
+file not an error — a configuration file that refused to boot the system it configures would be a
 poor trade.
 
-The direction is deliberate: **programs write it, the kernel reads it**. `color.exe` changes the
+**One file per owner rather than one shared file**, and that is a scar. Everything used to write
+the same file from what it happened to know, so the second writer destroyed the first one's keys:
+the file manager recorded that it had asked its questions, somebody changed a colour, and the
+machine asked them again. A rule saying "read it, change one line, write it back" would have
+worked and would have had to be remembered by everybody forever. Two programs that never open the
+same file cannot collide at all, which is a property of the arrangement rather than of anybody's
+care. The old single file is still read first, so a machine that has one keeps its colours.
+
+**A comment is a whole line**, decided by its first non-blank character. It used to be any `#` or
+`;` anywhere, which cut the line short there — and `;` is what separates the entries of the
+program search path, so `path = \COMMANDER;\MIZU` was read back as `\COMMANDER` one boot after
+it was written, and everything past the first entry disappeared without a word. Nothing
+complained: a path with one entry is a perfectly good path.
+
+The direction is mostly **programs write it, the kernel reads it**. `color.exe` changes the
 colours through a system call for the current session and writes the file for the next boot.
-Nothing in the kernel knows how a program phrased a setting, and no program reaches into kernel
-state to make a change stick.
+There is one exception and it earns itself: `dosget` installs a package into a directory of its
+own, and a package that is not on the search path is a program that cannot be run, so the kernel
+writes that one key back. It rewrites the file rather than rebuilding it — the language lives in
+the same file, and a writer that keeps only what it knows about is the mistake described above.
 
 The colours themselves live in a `CONSOLE_THEME` rather than as constants in the shell, which is
 what made them changeable at all — they were scattered through `command.c` before.
@@ -1189,19 +1243,126 @@ what made them changeable at all — they were scattered through `command.c` bef
 `SYS_SETTHEME` returns the resulting theme packed into its return value. That is not a
 convenience: a program changing one colour has to write the whole theme back to the file, and
 without the read-back `color /b black` would save a default foreground over whatever was there.
+Passing -1 for every field changes nothing and returns what is set, which is how a program asks
+what colours the machine uses — `dosfetch` draws itself in them instead of in DOS's.
 
 A theme change clears the screen. A text console only paints a cell when it writes a character
 to it, so otherwise the new background would arrive one character at a time and the old one
 would stay everywhere else — which reads as a fault rather than a setting.
 
+### The environment
+
+`PATH`, `PROMPT` and whatever `SET` puts there, in one flat table in `environment.c`.
+
+`PATH` lives here rather than in `config.c`, and that is the point of the module existing. There
+were two possible answers to "where are programs looked for" — a buffer in the configuration
+reader, and whatever `SET PATH=` would have meant — and two answers is how they come to disagree.
+`config.c` seeds it at boot from `SYSTEM.CFG` and writes it back when `dosget` changes it; the
+environment is what the shell actually searches.
+
+The compiled-in default is a **seed**, applied once at boot, and not a value the lookup falls
+back to. Otherwise `set PATH=` would quietly restore two directories nobody asked for, and the
+one command whose whole meaning is "look nowhere else" would not do it.
+
+`%NAME%` is expanded before anything else looks at the line, rather than by each command. A
+command that had to remember to expand its own arguments is a command that will forget, and it is
+what makes `set PATH=%PATH%;\GAMES` mean what it says. An unknown name expands to nothing, as in
+DOS; a lone `%` stays a `%`, because a percent sign is legal in a file name and a shell that
+swallows it cannot open the file.
+
+Programs read it through `SYS_GETENV` and `SYS_ENVAT` and cannot write it. There is one
+environment because one program runs at a time; a program that wrote it would be changing the
+shell's for good. DOS gave each program a copy for exactly that reason, and copies are what this
+gets when programs are isolated — at which point a setter will mean something.
+
 ### Batch files
 
-A `.BAT` file is run a line at a time. `@` suppresses the echo, `rem` and `:` are comments and
-labels — the three pieces of syntax worth having before variables and control flow exist.
-`AUTOEXEC.BAT` at the root of the boot drive runs at startup.
+A `.BAT` file is read into memory whole and run a line at a time. `@` suppresses the echo, `rem`
+and `:` are comments and labels, and `AUTOEXEC.BAT` at the root of the boot drive runs at
+startup.
 
-Nesting is refused rather than supported. A batch file that called itself would recurse on the
-kernel stack with nothing to stop it; DOS needed `CALL` for the same reason.
+Whole into memory is what makes `GOTO` possible: a label is found by walking the lines from the
+start, and a file read a line at a time off the disk could only ever go forwards — which is to
+say, could not loop.
+
+`IF` has DOS's three shapes: `ERRORLEVEL n` meaning n or more, `a==b`, and `EXIST`, each with
+`NOT`. The quotes people write around the operands are not special; they are compared like any
+other character, which is exactly what makes `IF "%1"=="" goto usage` work. `%0..%9` and `SHIFT`
+belong to the file being run rather than to the machine, so they are substituted before `%NAME%`
+is: two batch files running one after the other have different `%1` and the same `PATH`.
+
+`FOR` does its own substitution, and the first attempt not doing so is worth recording. It set
+the loop variable in the environment and let the ordinary `%NAME%` expansion find it — but `%%v`
+is both how a batch file spells the variable and how a line escapes a percent sign, so the
+expander turned `%%v` into `%v` and printed it. The loop ran three times and produced the same
+literal text each time. DOS substituted in `FOR` too.
+
+Nesting is allowed to a depth of four, for `CALL`. It used to be refused outright because a batch
+file that called itself would recurse on the kernel stack with nothing to stop it; a limit is the
+same protection with the feature attached, and a file that calls itself gets told so rather than
+running out of stack.
+
+Ctrl+C stops the file, not only the command inside it. Otherwise the way out of a long
+`AUTOEXEC.BAT` would be to interrupt every line in it one at a time.
+
+### Redirection and pipes
+
+`>`, `>>`, `<` and `|`, split off the line in the shell before any command sees it — for the same
+reason `%NAME%` is expanded there. A command that had to notice its own `>` is a command that
+will not, and there would be forty of them.
+
+The output is caught in `console.c`, at the one function everything printing passes through, and
+that is what makes a program's output redirect exactly as a built-in's does without either
+knowing. `console.c` does not learn what a file is: the sink is a function pointer somebody else
+supplies.
+
+A pipe is a temporary file. DOS did it that way because it had no processes to run side by side,
+which is exactly true here — the left command finishes before the right one starts, and what
+passed between them has to be somewhere in the meantime.
+
+The serial log still records what was redirected. The log is a record of the session, and losing
+half of `chkdsk > log` from it would be worse than the noise — though it is worth knowing about,
+because it makes the log look as though redirection is not working.
+
+### Packages
+
+`dosget` fetches a package over TFTP and unpacks it into a directory of its own. `\BIN` is for
+the system's own utilities; anything from another project gets a directory, because a program
+with data files beside it should not scatter them into a shared place.
+
+A package's directory goes on the program search path, and that is not a nicety. Without it a
+package installs perfectly, every file lands correctly, and typing its name answers "Bad command
+or file name" — the same sentence the machine gives for a package that was never installed at
+all. `path = no` in a manifest opts out, and the two system packages say it.
+
+Installing writes `\BOOT\DOSGET\<NAME>.PKG`: the directory, and one line per file. The database
+beside it records name and version, which is everything `update` needs and nothing `remove` does
+— the only moment anybody knows which files a package put down is while it is putting them down.
+Guessing afterwards means either deleting a directory whole, along with the WAD somebody put in
+it, or deleting nothing.
+
+`remove` deletes the recorded files inside the package's own directory and nothing else. The rule
+is enforced by a property rather than a list of names to protect: the directory has to be its own
+— not the root, not `\BIN`, not `\BOOT` — and the directory itself goes only when it is empty
+afterwards, which the filesystem enforces on its own.
+
+Those records are also what the installer copies. `setup` reads them to know which directories to
+carry onto the installed disk, so a machine installed from the medium comes up with its packages
+already there and already on the path.
+
+### A program's own directory
+
+The current directory is the user's — wherever they were standing when they typed the name — and
+once a package is on the search path that is somewhere else entirely. A program that opens
+`DOOM.WAD` and expects its own copy is asking the wrong directory; one that opens
+`\MIZU\WALLPAPER.BMP` has guessed where it was installed, which is the same mistake spelled
+confidently. Both existed.
+
+`koi_beside()` in the SDK builds the path to a file that ships with the program, from the path
+the kernel loaded it from. Adding a "working directory" to `PATH` would have been the wrong fix
+for the same problem: `PATH` answers where the executable is and the current directory answers
+where the person is, and making the first change the second breaks every program that opens the
+user's files in order to help one that opens its own.
 
 ## Bootloader → kernel ABI
 
@@ -1213,10 +1374,21 @@ pointer, the kernel image range and the kernel stack range.
 ## Build
 
 ```
-make          # BOOTX64.EFI + KERNEL.ELF + build/*.EXE
+make          # BOOTX64.EFI + KERNEL.ELF + build/*.EXE + a refreshed sdk/
 make check    # undefined symbols, relocations, program headers
 ./qemu.sh     # build a FAT32 image and boot it under QEMU
+./release.sh  # build the installation medium
 ```
+
+`make sdk` writes `sdk/koiflags` from the flags in the Makefile, and `koicc` reads them. There
+used to be two copies of those flags — one here, one in `koicc` — and they drifted: the SDK moved
+to position-independent executables and `koicc` did not, so every program built outside this tree
+came out at a fixed address and the loader refused it. The programs were correct, the compiler
+was correct, and the two halves of one decision disagreed. There is one place now.
+
+The same rule reaches the sibling projects: `publish.sh` refreshes each project's copy of the SDK
+before building it, so a program is never shipped built against an interface the kernel no longer
+has.
 
 Programs build with the same compiler as the kernel and their own linker script. Adding one means
 dropping a `.c` file into `programs/` — the Makefile picks it up.
@@ -1227,7 +1399,9 @@ where the kernel expects it.
 
 Kernel flags that matter:
 
-- `-fno-pie -no-pie` — the image is placed at its link address, so no relocation is needed;
+- `-fno-pie -no-pie` — the image is placed at its link address, so no relocation is needed. The
+  opposite is true of programs: they are `-fpie -pie` and land in whichever of four slots is
+  free, so the loader applies their `R_X86_64_RELATIVE` relocations as it loads them;
 - `-mgeneral-regs-only` — no SSE: after `ExitBootServices` nobody has configured its state, and
   GCC would otherwise emit SSE for struct copies;
 - `-mno-red-zone` — the red zone is incompatible with interrupt handlers;
@@ -1251,14 +1425,44 @@ files the machine needs to start, which is the accident worth preventing. The ke
 system volume instead by looking for `\BOOT\KOIDOS.SYS` on the device it booted from, and only on
 that device: a marker on some other disk describes some other installation.
 
+The installer carries the packages too, not only the system: it reads the records `dosget` wrote
+when each was installed, and copies the directories they name along with the search path that
+makes them runnable. Fetching them afterwards would be the wrong answer, because the machine that
+most needs them is the one whose network card this cannot drive.
+
+Finding the media again after formatting is not redundant, and this is the bug that proved it.
+The source volumes are located before anything is written, and remounting rebuilds the whole
+volume table: a disk with no partitions contributes nothing to it and contributes two afterwards,
+so every entry past that point is a different volume than it was. The installer was left holding
+a pointer to the medium that referred to the empty partition it had just created, and the first
+copy failed with the file "not found" — on a medium it had read the licence from a moment
+earlier. They are found again by what they contain.
+
 It was verified the only way that means anything — installing to a blank disk, removing the
 media, and booting the machine from what was written.
 
 ## What comes next
 
-Networking. It is not one project but four: USB plug-and-play first (xHCI interrupt routing,
-hot-plug enumeration, hub support), then a class driver, then a TCP/IP stack, then something that
-uses it. The Wi-Fi half depends on the vendor and may never be worth it.
+**A package server on a host of its own.** Packages are published by a script into a directory
+and fetched over TFTP, which is right on a desk and wrong on a public host: UDP, no
+authentication, no integrity, and `dosget install system` writes a kernel. Whatever proves a
+package is the package — a hash in the index, at least — belongs in the format before the format
+is deployed anywhere.
+
+**Ring 3, and it belongs to Mizu rather than to the shell.** Koi-DOS is a DOS: one program at a
+time, in ring 0, talking to the hardware. That is not an accident to be corrected — it is why a
+program here can ask the processor its own name. In Windows 3.x the protected-mode kernel was not
+part of DOS; it arrived with the graphical system, took the machine and ran DOS underneath it. If
+Mizu goes that way then isolation belongs to Mizu, and a program run from the `Z:\>` prompt keeps
+the flat machine DOS programs are written for. One system, two contracts, each honest about which
+it is offering. The pieces useful either way — a panic path, resource cleanup at exit, Ctrl+C —
+do not need a privilege level and are already here.
+
+**TCP.** Everything above the frames is UDP today, which is enough for DHCP, DNS and TFTP and
+nothing else. HTTP needs TCP; TLS needs HTTP.
+
+**Wi-Fi** depends on the vendor and may never be worth it. It is also the reason the installation
+medium carries every package it can.
 
 Sound has its device and its mixer; what it does not have is music. DOOM's is MUS, which needs a
 synthesiser rather than a mixer.

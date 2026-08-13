@@ -46,6 +46,20 @@ void layout_toggle(void);
  * to the device that noticed it. */
 void layout_gesture(int shift_down, int alt_down);
 
+/* Whether that gesture does anything at all.
+ *
+ * Off at the prompt, and that is the point. The shell is a DOS: its commands,
+ * its paths and its file names are ASCII, and a stray Alt+Shift that silently
+ * makes the next word come out in Cyrillic is a keyboard that has stopped
+ * doing what the fingers said. It was noticed the first honest way - by
+ * somebody typing a command and getting nonsense.
+ *
+ * A program that wants text in another language turns it on and gives it back
+ * when it exits, exactly as it does with the screen. The editor and the
+ * desktop's notepad are the programs that want it; `dir` is not. */
+void layout_gesture_enable(int enabled);
+int layout_gesture_enabled(void);
+
 /* The code point `character` produces in the current layout, or the character
    itself when the layout does not change it. Digits, punctuation and control
    codes pass through: a layout that moved the digits would be a layout nobody

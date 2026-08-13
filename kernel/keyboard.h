@@ -45,6 +45,17 @@ void keyboard_submit(int key);
  * program has entered the kernel deliberately - see syscall.c. */
 int keyboard_break_taken(void);
 
+/* Ctrl+Alt+Del: restart the machine, now.
+ *
+ * Called by whichever driver saw it, with the modifier state that driver had
+ * at the moment - each keyboard knows its own, and a machine can have several.
+ * Returns only when the combination was not the one.
+ *
+ * Immediate, as it was in DOS. It is the way out when something has stopped
+ * answering, and a way out that asks a question is no way out at all - the
+ * program that would have to draw the question is the one that has stopped. */
+void keyboard_attention(int control_down, int alt_down, int key);
+
 /* Forget any press that has not been acted on. Called before a program starts,
    so a Ctrl+C aimed at the last one does not land on the next. */
 void keyboard_break_clear(void);

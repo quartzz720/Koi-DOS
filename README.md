@@ -1,27 +1,100 @@
 # <samp>Koi-DOS 🥂</samp>
 
-A DOS-like operating system for UEFI machines, written in freestanding C with no standard
-library.
+**An operating system you can put on a USB stick, boot on a real machine, and use.**
 
-> **`[NEW]`  The first programs written for Koi-DOS with the official SDK:**
->
-> **[DOSFETCH](https://github.com/quartzz720/DOSFETCH)** — a system summary in the spirit of
-> neofetch. No ASCII logo, on purpose.
->
-> **[Games](https://github.com/quartzz720/Games)** — Snake, Tetris, Pong, Breakout, Reversi and
-> Minesweeper, in one program with a menu.
->
-> **[K-DOOM](https://github.com/quartzz720/K-DOOM)** — id Software's DOOM, on Koi-DOS. Four files
-> replace the Unix layer and the game code is id's, unchanged. Bring your own WAD: the source is
-> GPL, the game data is not.
->
-> All three are built with nothing but [sdk/](sdk/), in their own repositories. That is the point
-> of them: if one stops building, the SDK is broken for everybody rather than only for programs
-> that happen to live in this tree.
+It looks like DOS and behaves like DOS — a `Z:\>` prompt, drive letters, `dir` and `copy`, batch
+files — but underneath it is a 64-bit kernel written from nothing for UEFI machines made this
+decade. No BIOS, no real mode, no emulator required. It boots on hardware from 2026 and gives you
+a machine that fits in your head.
 
-"DOS-like" means the look and the character, not binary compatibility: drive letters, FAT32, a
-familiar command set, a monolith in ring 0 with no memory protection. Programs are native
-64-bit ones with their own system-call interface — real MS-DOS binaries are not a goal.
+<p align="center">
+  <img src="screenshots/dosfetch.png" width="85%" alt="Koi-DOS at the prompt: a logo in block characters above a list of the machine's hardware">
+</p>
+
+---
+
+## Try it
+
+Three steps, about five minutes.
+
+1. **Download** `koi-dos-0.9.img` from
+   [Releases](https://github.com/quartzz720/Koi-DOS/releases).
+2. **Write it to a USB stick** with [Rufus](https://rufus.ie) or
+   [balenaEtcher](https://etcher.balena.io) — pick the image, pick the stick, write. In Rufus,
+   choose **DD image mode** if it offers the choice.
+3. **Boot from the stick** and, at the prompt, type:
+
+   ```
+   SETUP
+   ```
+
+That installs it onto a disk in the machine. Nothing is written anywhere until you have chosen a
+disk, read the licence, and typed the disk's name out in full — and the disk you booted from is
+never offered as a target.
+
+**Just want a look?** Do not type `SETUP`. The stick is a whole working system on its own; poke
+around and pull it out when you are done. Nothing on the machine has been touched.
+
+**No spare machine?** It runs in QEMU:
+
+```
+qemu-system-x86_64 -m 2G -machine q35 -drive format=raw,file=koi-dos-0.9.img \
+  -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd
+```
+
+> **⚠️ It formats real disks.** `SETUP` erases the disk you point it at, completely. It asks
+> several times and it never offers the one it is running from, but it is a real installer and
+> it does what you tell it. On a machine with something on it you care about, use QEMU.
+
+---
+
+## What you get
+
+**A shell that behaves like DOS.** `dir`, `cd`, `copy`, `type`, `del`, `ren`, `md`, `tree`,
+`more`, `attrib`, `find`, `sort`, `xcopy`. Redirection and pipes: `dir > list.txt`,
+`type log.txt | find "error"`. Environment variables and `SET PATH=`. Batch files with `IF`,
+`GOTO`, `FOR`, `CALL` and arguments, so `AUTOEXEC.BAT` can actually decide things.
+
+**A file manager**, in the line Norton started — two panels, a mouse, a viewer and an editor.
+
+<p align="center">
+  <img src="screenshots/commander.png" width="80%" alt="Koi-Commander: two panels listing a directory, with a function-key bar along the bottom">
+</p>
+
+**A desktop with windows**, in the shape Windows 3.0 had: overlapping windows you can drag and
+resize, a menu bar, a taskbar, a control panel, a clock, a notepad and a WAV player. It is a
+package called **Mizu**, not part of the system — install it, remove it, and what is left is the
+same Koi-DOS.
+
+**Games**, a system summary, sound, a network stack that gets an address over DHCP and answers
+pings, and a package manager that fetches programs over the wire.
+
+**And DOOM.** id Software's, with four files replacing the Unix layer and the game code
+untouched. Bring your own WAD.
+
+---
+
+## What it is, and what it is not
+
+**It is a real operating system.** It boots on bare metal, leaves UEFI behind, and drives the
+hardware itself: its own memory manager, interrupt tables and page tables; keyboards over PS/2
+and USB; disks over AHCI, NVMe and USB storage; FAT32 it reads *and writes*; HD Audio; an Intel
+network card and a phone tethered over USB. It has been booted on real laptops and desktops, not
+only in a virtual machine.
+
+**It is not Linux, and not trying to be.** One program runs at a time, in ring 0, with no memory
+protection — the way DOS worked, on purpose. A program here can ask the processor its own name
+because nothing stands between them. That is a trade: it makes the system small enough to
+understand and unable to protect itself from a bad pointer.
+
+**It is not MS-DOS compatible.** "DOS-like" means the look and the character, not binary
+compatibility. Programs are native 64-bit ones with their own system-call interface. Old DOS
+binaries will not run.
+
+**It is 0.9, a pre-release.** Everything described here works and has been tested, but it is
+young. Two things are known and deliberate: `LABEL` and `MODE` report rather than change - the
+volume label needs a filesystem write that does not exist yet, and the screen mode is fixed by
+the loader before UEFI hands over. Both say so when you run them.
 
 Two deliberate departures from DOS:
 
@@ -32,6 +105,43 @@ gone, and handing the system `A:` is not appealing either. Further volumes go `Y
 **Long file names work in full.** The 8.3 limit was a consequence of 1980 hardware, not a design
 goal, and this is what DOS would look like if it turned up on a UEFI machine today. Short names
 still exist underneath every entry, but they are not what you see.
+
+---
+
+## Installing programs
+
+Koi-DOS carries a package manager. On a machine with a network:
+
+```
+Z:\> net start
+Z:\> dosget list
+Z:\> dosget install games
+Z:\> games
+```
+
+Each package installs into a directory of its own and puts itself on the search path, so it runs
+by name from anywhere. `dosget remove` takes it away again, and only ever deletes what it
+installed — never anything in a directory it does not own.
+
+The installation medium already carries Koi-Commander, Mizu, the games and dosfetch, because the
+machine most likely to need them is the one whose wireless card this does not drive yet.
+
+> **`[NEW]`  The first programs written for Koi-DOS with the official SDK:**
+>
+> **[DOSFETCH](https://github.com/quartzz720/DOSFETCH)** — a system summary in the spirit of
+> neofetch.
+>
+> **[Games](https://github.com/quartzz720/Games)** — Snake, Tetris, Pong, Breakout, Reversi and
+> Minesweeper, in one program with a menu.
+>
+> **[K-DOOM](https://github.com/quartzz720/K-DOOM)** — id Software's DOOM, on Koi-DOS. Bring your
+> own WAD: the source is GPL, the game data is not.
+>
+> **[Mizu](https://github.com/quartzz720/Mizu)** — the desktop.
+>
+> All four are built with nothing but [sdk/](sdk/), in their own repositories. That is the point
+> of them: if one stops building, the SDK is broken for everybody rather than only for programs
+> that happen to live in this tree.
 
 ---
 
@@ -110,7 +220,32 @@ make at all, because it used to read 100 ms as 0.
 | `sound` | the sound device, and which output it chose |
 | `log [file]` | the kernel log: on screen, or written to a file |
 | `echo`, `ver`, `cls`, `help` | the usual |
+| `set [name=value]` | environment variables; `PATH` and `PROMPT` live here |
+| `find "text" [file]` | the lines that contain it; `/v` `/c` `/n` `/i` |
+| `sort [file]` | the lines in order; `/r` reverses |
+| `xcopy <dir> <dir>` | a directory and everything under it |
+| `label`, `mode` | what a volume is called, and how the console is set |
+| `dosget <..>` | packages: `list`, `install`, `update`, `remove` |
+| `net <..>` | the network: `start`, `set`, `status` |
+| `pause`, `goto`, `if`, `for`, `call`, `shift` | batch files |
 | `Z:` | change drive |
+
+Redirection and pipes work the way they did in DOS:
+
+```
+Z:\> dir > list.txt              send the output there
+Z:\> echo done >> list.txt       add to it
+Z:\> sort < list.txt             read from there
+Z:\> dir | find "BAT" /i         the right-hand side reads the left's output
+```
+
+A pipe is a temporary file, exactly as it was in DOS, and for the same reason: nothing runs
+alongside anything else, so what passes between two commands has to be somewhere in the meantime.
+
+**Ctrl+C stops a running program** and returns to the prompt, and stops a batch file rather than
+letting it carry on to the next line. It cannot interrupt a loop that calls nothing at all -
+such a program never enters the kernel to be interrupted - but everything that prints, reads a
+key, sleeps or touches a file can be stopped.
 
 The three destructive ones ask before they act, and none of them will touch the device the system
 is running from. `format` and `part` require the partition or disk to be typed back by name —
@@ -225,15 +360,15 @@ program, and exits; the requests are honoured most-recent-first, so the program 
 it was occupying and it comes back afterwards with its two paths and its selection handed to
 itself as arguments.
 
-0.1 does not copy, move, delete or rename, and both panels show the same drive. Those are 0.2.
+1.0 does not copy, move, delete or rename, and both panels show the same drive. Those are next.
 
 **Why the source is in this repository when the program is not part of the system.** It is
-currently the only thing that calls `SYS_MOUSE`, `SYS_CHAIN` and `SYS_SETDRIVE`, and all three
-were added because it needed them. While an interface is still moving, its only consumer has to
-be built by the same `make` — otherwise a break is found by a user rather than by the compiler.
-DOSFETCH, Games and K-DOOM live outside this tree for the opposite reason: they test that a
-*settled* SDK still works. It moves out to its own repository when the interface stops moving,
-and joins them.
+currently the only thing that calls `SYS_MOUSE` and `SYS_SETDRIVE`, and both were added because
+it needed them. While an interface is still moving, its only consumer has to be built by the same
+`make` — otherwise a break is found by a user rather than by the compiler. DOSFETCH, Games,
+K-DOOM and Mizu live outside this tree for the opposite reason: they test that a *settled* SDK
+still works. Mizu made that move when the windowing library settled; the commander joins them
+when the pointer and drive calls do.
 
 Three more proofs live outside this repository on purpose, each built with nothing but the SDK:
 **[DOSFETCH](https://github.com/quartzz720/DOSFETCH)**, a system summary in the spirit of
@@ -369,25 +504,40 @@ program under this project's licence; see the LICENSE.
 
 ### Configuration
 
-`\BOOT\userspace.cfg` is read once at boot and applied before the shell paints anything. One
-`key = value` per line, `#` or `;` starts a comment, unknown keys are ignored and a missing file
-is not an error.
+Settings live in `\BOOT\CONFIG` as a directory of small files, one owner each, read at boot
+before the shell paints anything. One `key = value` per line; a line whose first character is
+`#` or `;` is a comment; unknown keys are ignored and a missing file is not an error.
 
 ```ini
-# Written by color.exe; read by the kernel at boot.
+# \BOOT\CONFIG\CONSOLE.CFG - written by color.exe, read by the kernel at boot.
 foreground = yellow
 background = black
 prompt = brown
 ```
 
-Programs write that file; the kernel reads it. Neither reaches into the other.
+```ini
+# \BOOT\CONFIG\SYSTEM.CFG - the search path, kept up to date by dosget.
+path = \COMMANDER;\MIZU;\GAMES
+language = ru
+```
+
+One file per owner rather than one shared file, and that is a scar: everything used to write the
+same file from what it happened to know, so the second writer destroyed the first one's keys -
+the file manager recorded that it had asked its questions, somebody changed a colour, and the
+machine asked them again. Two programs that never open the same file cannot collide at all, and
+that is a property of the arrangement rather than of everybody remembering a rule.
+
+A comment is a whole line, decided by its first character, and that is a scar too: `;` also
+separates the entries of the search path, so a comment that could begin in the middle of a value
+read `path = \COMMANDER;\MIZU` as `\COMMANDER` and lost everything after the first entry, one
+boot after it was written.
 
 ### System calls
 
 Programs call the kernel with `int 0x40`, in the spirit of DOS's INT 21h. `RAX` holds the
-function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. Forty-two calls cover
-console I/O, files, directory enumeration, the command line, exit codes, what the system knows
-about itself, taking the screen and making a noise; they are listed in
+function number, `RDI`/`RSI`/`RDX`/`RCX` the arguments, `RAX` the result. 68 calls cover
+console I/O, files, directory enumeration, the command line, exit codes, the environment, what
+the system knows about itself, taking the screen, making a noise and running another program; they are listed in
 [include/syscall.h](include/syscall.h), which the kernel and every program include from the same
 copy so the two cannot drift apart. That file also names the keys that have no ASCII value — the
 arrows and the function keys — because a program that reads them has to name them, and two copies
@@ -423,12 +573,16 @@ program that filled it. It belongs to the kernel rather than to a shell for the 
 matters: a clipboard that dies with its program cannot carry anything between two programs, which
 is the only thing anybody wants one for. Windows 1.0 shipped one in 1985 and put it on the box.
 
-`SYS_CHAIN` asks for a command to be run **after the calling program has exited**. One program
-runs at a time, at a fixed address, in one address space — so a program cannot call another
-program, and a graphical shell that cannot start anything is a picture of a shell. Requests run
-most-recent-first, which turns "run this and then bring me back" into two ordinary calls. Coming
-back is a fresh start and not a resume, so anything worth keeping travels back as arguments or
-goes to a file first. Small DOS shells did precisely this, for precisely this reason.
+`SYS_RUN` runs another program and comes back when it ends, with everything the caller had in
+memory still there — four programs can be resident at once, each in its own slot, and only one of
+them is running at any moment. That is a smaller claim than multitasking and it is the whole of
+what "run this and come back" needs; it is what DOS's EXEC did.
+
+`SYS_CHAIN` is the older, cheaper answer, and it is still here because it is sometimes the right
+one: it asks for a command to be run **after the calling program has exited**, giving up the
+memory rather than holding it. Requests run most-recent-first. Coming back is a fresh start and
+not a resume, so anything worth keeping travels back as arguments or goes to a file first. Small
+DOS shells did precisely this, for precisely this reason.
 
 `SYS_SOUND_PLAY` and `SYS_SOUND_TONE` put something into the one stream that is always running.
 There is nothing to open and nothing to wait for: a call hands back a voice, or -1 when every
@@ -509,6 +663,11 @@ of them.
 
 ## Status
 
+**0.9, a pre-release.** Everything in this file works and has been checked, on hardware where it
+could be. What separates it from 1.0 is not features but confidence: it wants to be used on more
+machines than the handful it has seen, and two commands (`LABEL`, `MODE`) still report where they
+should also change.
+
 Working: the boot chain, framebuffer console with an 8×16 CP437 font, exception handling with a
 register dump instead of a silent reboot, physical page allocator, `kmalloc` heap, own page
 tables, AHCI, NVMe, USB, GPT/MBR/whole-device partitioning, FAT32 read **and** write with long
@@ -544,9 +703,12 @@ before `ExitBootServices` and it cannot be changed afterwards, so "graphics mode
 console stops drawing and something else starts. The shell takes the screen back whether or not a
 program remembered to, which is the failure DOS programs were famous for.
 
-**It can install itself.** `setup` writes a GPT with an EFI System Partition for the loader and a
-system partition for everything else, makes both filesystems, copies the system across and marks
-the system volume. The loader's partition gets no drive letter at all — not security, since any
+**It can install itself, packages and all.** `setup` writes a GPT with an EFI System Partition
+for the loader and a system partition for everything else, makes both filesystems, copies the
+system across - including every installed package and the record of what it is made of - and
+marks the system volume. A machine installed from the medium comes up with the file manager, the
+desktop and the games already there and already on the search path, because the machine most
+likely to need them is the one whose network card this cannot drive. The loader's partition gets no drive letter at all — not security, since any
 other operating system sees an ordinary partition, but it does mean a stray `del` cannot reach
 the files the machine needs to start. Verified the only way that means anything: installing to a
 blank disk, removing the media, and booting the machine from what was written.
@@ -661,10 +823,16 @@ Linux setups above.
 ## Build and run
 
 ```bash
-make          # BOOTX64.EFI + KERNEL.ELF + build/*.EXE
+make          # BOOTX64.EFI + KERNEL.ELF + build/*.EXE + a refreshed sdk/
 make check    # undefined symbols, relocations, program headers
 ./qemu.sh     # build a FAT32 image and boot it
+./release.sh  # build koi-dos-0.9.img, the installation medium
 ```
+
+`release.sh` is what produces the file at the top of this page: a GPT with a single EFI System
+Partition holding the loader, the kernel, the utilities and the packages, ready to be written to
+a stick with Rufus or balenaEtcher. It builds everything first, including the sibling projects,
+so the image can never carry a stale copy of a program.
 
 `qemu.sh` does the whole cycle: runs `make`, creates the disk images with `mkfs.vfat`, populates
 them with `mtools`, copies a fresh OVMF variable store to `/tmp/koi-vars.fd`, and launches QEMU.
@@ -827,21 +995,41 @@ kernel/
   partition.c          GPT / MBR / whole device, and drive letters
   fat32.c              FAT32 with long names, read and write
   command.c            the command interpreter
-  config.c             reads \BOOT\userspace.cfg at boot
+  config.c             settings in \BOOT\CONFIG, read at boot and written by dosget
+  environment.c        the environment: PATH, PROMPT and whatever SET puts there
   program.c            loads and runs programs
   syscall.c            system call dispatch
 programs/
   koi.h                the interface programs are written against
   start.c              _start, calls main, turns its return into an exit
-  program.ld           linker script, fixed at 16 MiB
-  hello.c cat.c save.c ls.c color.c demo.c show.c
+  program.ld           linker script, position-independent
+  hello.c cat.c save.c ls.c color.c demo.c show.c edit.c play.c
+  spin.c where.c       two programs that exist to be tested with
   commander.c          the file manager - built here, shipped by dosget
-sdk/                   the four files a program needs, plus koicc
+  window.c dialog.c    the libraries programs are written against, shipped in the SDK
+  settings.c language.c wav.c editcore.c
+sdk/                   everything a program needs, plus koicc and the flags it builds with
 legacy/                the old UEFI Boot Services shell, kept for reference
 linker.ld              kernel layout, fixed at 1 MiB
 qemu.sh                image build + QEMU launch
+release.sh             build the installation medium
 deploy.sh              find the USB stick and copy the build onto it
+screenshots/           the pictures in this file
 ```
+
+Mizu lives in [its own repository](https://github.com/quartzz720/Mizu), as the games, dosfetch
+and DOOM do. It is a package, and the check that it really is one is that this tree builds and
+boots without it.
+
+## Credits
+
+Written by Koi Ayame ([@quartzz720](https://github.com/quartzz720)), in
+freestanding C, with no standard library and nothing borrowed but the font.
+
+The system says the same thing about itself — type `credits` at the prompt.
+
+> Built through intense pain and heartbreak.
+> I miss you so much... Rest in peace, **@nonconformie**.
 
 ## License
 

@@ -133,6 +133,18 @@ static inline long koi_readline(char* buffer, long size) {
     return koi_call(SYS_READLINE, (long)buffer, size, 0);
 }
 
+/* Let Alt+Shift switch to the machine's other keyboard layout while this
+ * program runs. Off at the prompt and off again the moment the program exits -
+ * a shell whose commands are ASCII should not be able to start typing Cyrillic
+ * because somebody's fingers brushed two modifiers.
+ *
+ * For programs that take text in a language: an editor, a notepad. Not for one
+ * that takes a file name. */
+static inline void koi_layout_gesture(int enabled) {
+    (void)koi_call(SYS_LAYOUT_GESTURE, enabled, 0, 0);
+}
+
+
 /* The environment, as the shell has it. Returns the length, or 0 when there is
  * no such variable - so `koi_getenv("PATH", ...)` both fetches it and answers
  * whether it is set.

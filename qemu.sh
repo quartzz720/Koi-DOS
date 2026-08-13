@@ -299,7 +299,10 @@ printf '@echo before\r\n@spin\r\n@echo AFTER - this line must not run\r\n' \
 # file dosget falls back to the address of the cable this is developed on,
 # which nothing in QEMU can reach, so the whole install path was untestable
 # here and only ever tried on real hardware.
-printf 'source = 10.0.2.2\r\n' | mcopy -i "$SYSVOL" - ::/BOOT/dosget.cfg
+# KOI_DOSGET_SOURCE=<address> points the guest at a real server instead, which
+# is how the public one is tested against the client that will actually use it.
+printf 'source = %s\r\n' "${KOI_DOSGET_SOURCE:-10.0.2.2}" \
+  | mcopy -i "$SYSVOL" - ::/BOOT/dosget.cfg
 
 # The stick gets its own files, named so that a `dir` on it cannot be confused
 # with a `dir` on the system volume.
