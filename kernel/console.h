@@ -57,6 +57,10 @@ void console_redraw(void);
 
 void console_set_color(boot_uint8_t foreground, boot_uint8_t background);
 void console_putchar(char character);
+/* Send every character somewhere else instead of the screen, or NULL to put it
+   back. Used by the shell for `>` and `|`; see kernel/command.c. */
+void console_capture(void (*sink)(char));
+
 void console_write(const char* text);
 void console_write_dec(boot_uint64_t value);
 

@@ -249,8 +249,24 @@ static int pending_needed;
 
 static void put_codepoint(boot_uint32_t code);
 
+/* Where characters go when they are not going to the screen.
+ *
+ * Redirection has to be caught here rather than in each command, because
+ * everything that prints comes through this one function - the built-ins, a
+ * program's SYS_PUTS, an error message from three layers down. A shell that
+ * redirected only what it remembered to would be a shell where `dir > list`
+ * works and `chkdsk > log` quietly loses half the report.
+ *
+ * console.c does not know what a file is, and should not: the sink is somebody
+ * else's function and this only decides whether to call it. */
+static void (*capture)(char);
+
+void console_capture(void (*sink)(char)) { capture = sink; }
+
 void console_putchar(char character) {
     unsigned char raw = (unsigned char)character;
+
+    if (capture) { capture(character); return; }
 
     if (pending_length) {
         if ((raw & 0xC0) != 0x80) {

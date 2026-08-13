@@ -543,6 +543,12 @@ static void command_help(void) {
     print_line("vol            show the volume label");
     print_line("mem            memory, devices and volumes");
     print_line("set [n=v]      environment variables; PATH and PROMPT live here");
+    print_line("find sort      filter text; both read a pipe when given no file");
+    print_line("xcopy          a directory and everything under it");
+    print_line("label mode     what a volume is called, and how the console is set");
+    print_line("");
+    print_line("  cmd > file   send the output there      cmd >> file  add to it");
+    print_line("  cmd < file   read from there            a | b        b reads a's output");
     print_line("pci            every function on the PCI bus");
     print_line("disk           disks and partitions, letters or not");
     print_line("chkdsk [d:] [/F]  check a volume, /F to repair what it finds");
@@ -3973,6 +3979,11 @@ static int batch_depth;
 
 static void execute(const char* input);
 
+/* The file a command should read instead of the keyboard, or NULL. Declared
+   with the other shell-wide state because the filters below use it and the
+   parser that sets it comes after them. */
+static const char* command_input_source(void);
+
 /* Page a file a screenful at a time. */
 static void command_more(const ARGUMENTS* arguments) {
     char path[PATH_MAX];
@@ -3986,6 +3997,15 @@ static void command_more(const ARGUMENTS* arguments) {
 
     if (!current_volume) { print_line("No volume."); return; }
     single_operand(arguments, name);
+    /* With no file, whatever arrived through a pipe. `dir | more` is the
+       oldest reason pipes exist and it would be strange for this of all
+       commands not to take one. */
+    if (!name[0]) {
+        const char* piped = command_input_source();
+        boot_uint64_t at = 0;
+        while (piped && piped[at] && at + 1 < PATH_MAX) { name[at] = piped[at]; at++; }
+        name[at] = 0;
+    }
     if (!name[0]) { print_line("Usage: more <file>"); return; }
     if (!resolve_path(name, &volume, path)) { print_line("Invalid drive."); return; }
     if (!fat32_stat(volume, path, &entry)) { print_line("File not found."); return; }
@@ -4293,6 +4313,431 @@ static void command_set(const char* tail) {
         print_line("No room for another variable, or the value is too long.");
         return;
     }
+}
+
+/* ---- Redirection and pipes -----------------------------------------------
+ *
+ * `dir > list.txt`, `type log | more`, `sort < names.txt`. The operators are
+ * DOS's and so is the implementation: a pipe is a temporary file. DOS did it
+ * that way because it had no processes to run side by side, which is exactly
+ * true here - the left-hand command finishes before the right-hand one starts,
+ * and what flowed between them has to be somewhere in the meantime.
+ *
+ * The output is caught in console.c, at the one function everything printing
+ * passes through, so a program's output redirects exactly as a built-in's
+ * does. Input is a file the reading commands are handed instead of the
+ * keyboard.
+ */
+#define PIPE_FILE "\\PIPE.$$$"
+
+static VOLUME* capture_volume;
+static FAT_ENTRY capture_entry;
+static boot_uint32_t capture_position;
+static char capture_buffer[512];
+static boot_uint32_t capture_pending;
+static int capture_failed;
+
+static void capture_flush(void) {
+    if (!capture_pending) return;
+    if (fat32_write(capture_volume, &capture_entry, capture_position,
+                    capture_buffer, capture_pending) != capture_pending)
+        capture_failed = 1;
+    capture_position += capture_pending;
+    capture_pending = 0;
+}
+
+/* Buffered, because a character at a time through the filesystem would mean a
+   directory listing costing one write per letter. */
+static void capture_sink(char character) {
+    capture_buffer[capture_pending++] = character;
+    if (capture_pending >= sizeof(capture_buffer)) capture_flush();
+}
+
+/* Send what a command prints into a file. Returns 0 when the file could not be
+   made, in which case nothing is redirected and the caller says so. */
+static int capture_begin(const char* name, int append) {
+    char path[PATH_MAX];
+
+    capture_failed = 0;
+    capture_pending = 0;
+    capture_position = 0;
+    if (!resolve_path(name, &capture_volume, path)) return 0;
+
+    if (fat32_stat(capture_volume, path, &capture_entry)) {
+        if (capture_entry.attributes & FAT_ATTRIBUTE_DIRECTORY) return 0;
+        if (append) capture_position = capture_entry.size;
+        else {
+            fat32_remove(capture_volume, path);
+            if (!fat32_create(capture_volume, path, 0, &capture_entry)) return 0;
+        }
+    } else if (!fat32_create(capture_volume, path, 0, &capture_entry)) {
+        return 0;
+    }
+
+    console_capture(capture_sink);
+    return 1;
+}
+
+static int capture_end(void) {
+    console_capture((void (*)(char))0);
+    capture_flush();
+    return !capture_failed;
+}
+
+/* The file a command reads instead of the keyboard, for `<` and for the right
+   half of a pipe. Empty when there is none. */
+static char input_source[PATH_MAX];
+
+static const char* command_input_source(void) {
+    return input_source[0] ? input_source : (const char*)0;
+}
+
+static void set_input_source(const char* name) {
+    boot_uint64_t at = 0;
+
+    while (name && name[at] && at + 1 < sizeof(input_source))
+        { input_source[at] = name[at]; at++; }
+    input_source[at] = 0;
+}
+
+/* ---- Text filters --------------------------------------------------------
+ *
+ * FIND and SORT read a file, or whatever arrived through a pipe when no file
+ * is named. That is the whole of what makes `dir | sort` work, and it is why
+ * they are written together: a filter that could only read a file it was told
+ * about would be half a filter.
+ */
+
+/* The text to work on: the named file, or the pipe. Returns a buffer the
+   caller frees, and its length, or NULL when there is nothing to read. */
+static char* read_text(const char* name, boot_uint32_t* length_out) {
+    VOLUME* volume;
+    char path[PATH_MAX];
+    FAT_ENTRY entry;
+    char* contents;
+    boot_uint32_t offset = 0;
+
+    if (!name || !name[0]) name = command_input_source();
+    if (!name) return (char*)0;
+    if (!resolve_path(name, &volume, path)) return (char*)0;
+    if (!fat32_stat(volume, path, &entry)) return (char*)0;
+    if (entry.attributes & FAT_ATTRIBUTE_DIRECTORY) return (char*)0;
+
+    contents = (char*)kmalloc(entry.size + 1);
+    if (!contents) return (char*)0;
+    while (offset < entry.size) {
+        boot_uint32_t got = fat32_read(volume, &entry, offset,
+                                       contents + offset, entry.size - offset);
+        if (!got) break;
+        offset += got;
+    }
+    contents[offset] = 0;
+    *length_out = offset;
+    return contents;
+}
+
+/* Does `line` contain `wanted`? Plain substring, no patterns: DOS's FIND had
+   none either, and a system with no regular expressions anywhere should not
+   grow its first one inside a filter. */
+static int line_holds(const char* line, boot_uint64_t length,
+                      const char* wanted, int fold) {
+    boot_uint64_t needle = strlen(wanted);
+
+    if (!needle) return 1;
+    if (needle > length) return 0;
+    for (boot_uint64_t start = 0; start + needle <= length; start++) {
+        boot_uint64_t at = 0;
+        while (at < needle) {
+            char a = line[start + at];
+            char b = wanted[at];
+            if (fold) { a = upper(a); b = upper(b); }
+            if (a != b) break;
+            at++;
+        }
+        if (at == needle) return 1;
+    }
+    return 0;
+}
+
+/* FIND "text" [file] - the lines that contain it.
+ *
+ *   /V  the lines that do not
+ *   /C  how many, rather than which
+ *   /N  numbered
+ *   /I  ignoring case
+ */
+static void command_find(const ARGUMENTS* arguments) {
+    char wanted[PATH_MAX];
+    char* text;
+    boot_uint32_t length = 0;
+    boot_uint32_t at = 0;
+    boot_uint32_t number = 0;
+    boot_uint32_t matched = 0;
+    int invert = 0, count_only = 0, numbered = 0, fold = 0;
+    const char* file;
+
+    for (int index = 0; index < arguments->switch_count; index++) {
+        char option = upper(arguments->switches[index]);
+        if (option == 'V') invert = 1;
+        else if (option == 'C') count_only = 1;
+        else if (option == 'N') numbered = 1;
+        else if (option == 'I') fold = 1;
+    }
+
+    if (!arguments->operand_count) {
+        print_line("Usage: find \"text\" [file] [/v] [/c] [/n] [/i]");
+        return;
+    }
+    {
+        const char* source = arguments->operand[0];
+        boot_uint64_t out = 0;
+        while (*source && out + 1 < sizeof(wanted)) wanted[out++] = *source++;
+        wanted[out] = 0;
+    }
+    file = arguments->operand_count > 1 ? arguments->operand[1] : "";
+
+    text = read_text(file, &length);
+    if (!text) { print_line("File not found."); return; }
+
+    while (at <= length) {
+        boot_uint32_t start = at;
+        boot_uint32_t end;
+
+        while (at < length && text[at] != '\n') at++;
+        end = at;
+        while (end > start && text[end - 1] == '\r') end--;
+        number++;
+
+        if (line_holds(text + start, end - start, wanted, fold) != !invert) {
+            if (at >= length) break;
+            at++;
+            continue;
+        }
+        matched++;
+        if (!count_only) {
+            if (numbered) { print_dec(number); print("]"); }
+            for (boot_uint32_t index = start; index < end; index++) put(text[index]);
+            print_line("");
+        }
+        if (at >= length) break;
+        at++;
+    }
+
+    if (count_only) { print_dec(matched); print_line(" line(s)"); }
+    kfree(text);
+}
+
+/* SORT [file] - the lines in order.
+ *
+ *   /R  descending
+ *
+ * An insertion sort over an array of offsets. The lines are not moved and
+ * nothing is copied: a file of a few thousand lines is what this is for, and
+ * the alternative is a quicksort nobody can check by reading. */
+#define SORT_MAX 2048
+
+static void command_sort(const ARGUMENTS* arguments) {
+    static boot_uint32_t start[SORT_MAX];
+    static boot_uint32_t end[SORT_MAX];
+    char* text;
+    boot_uint32_t length = 0;
+    boot_uint32_t at = 0;
+    boot_uint32_t count = 0;
+    int descending = 0;
+
+    for (int index = 0; index < arguments->switch_count; index++)
+        if (upper(arguments->switches[index]) == 'R') descending = 1;
+
+    text = read_text(arguments->operand_count ? arguments->operand[0] : "",
+                     &length);
+    if (!text) { print_line("File not found."); return; }
+
+    while (at <= length && count < SORT_MAX) {
+        boot_uint32_t line_end;
+
+        start[count] = at;
+        while (at < length && text[at] != '\n') at++;
+        line_end = at;
+        while (line_end > start[count] && text[line_end - 1] == '\r') line_end--;
+        end[count] = line_end;
+        count++;
+        if (at >= length) break;
+        at++;
+    }
+
+    for (boot_uint32_t index = 1; index < count; index++) {
+        boot_uint32_t s = start[index];
+        boot_uint32_t e = end[index];
+        boot_uint32_t place = index;
+
+        while (place) {
+            const char* left = text + start[place - 1];
+            boot_uint64_t left_length = end[place - 1] - start[place - 1];
+            boot_uint64_t right_length = e - s;
+            boot_uint64_t shortest = left_length < right_length ? left_length
+                                                                : right_length;
+            boot_uint64_t position = 0;
+            int order = 0;
+
+            while (position < shortest && !order) {
+                char a = upper(left[position]);
+                char b = upper(text[s + position]);
+                if (a != b) order = a < b ? -1 : 1;
+                position++;
+            }
+            if (!order && left_length != right_length)
+                order = left_length < right_length ? -1 : 1;
+            if (descending ? order >= 0 : order <= 0) break;
+            start[place] = start[place - 1];
+            end[place] = end[place - 1];
+            place--;
+        }
+        start[place] = s;
+        end[place] = e;
+    }
+
+    for (boot_uint32_t index = 0; index < count; index++) {
+        for (boot_uint32_t position = start[index]; position < end[index]; position++)
+            put(text[position]);
+        print_line("");
+    }
+    kfree(text);
+}
+
+/* XCOPY - a directory and everything under it.
+ *
+ * `copy` takes files; this takes a tree, which is the difference that made it
+ * a separate program in DOS and makes it one here. Directories are created as
+ * they are met rather than in advance, so a failure halfway leaves what was
+ * already copied rather than an empty skeleton.
+ *
+ * Recursion with a depth limit, because a filesystem with a loop in it is a
+ * filesystem this should complain about rather than follow forever. */
+#define XCOPY_DEPTH 8
+
+static int xcopy_tree(VOLUME* from_volume, const char* from,
+                      VOLUME* to_volume, const char* to, int depth,
+                      boot_uint32_t* files) {
+    FAT_DIRECTORY directory;
+    FAT_ENTRY entry;
+
+    if (depth > XCOPY_DEPTH) {
+        print_line("Directories are nested too deeply.");
+        return 0;
+    }
+    if (!fat32_stat(to_volume, to, &entry) &&
+        !fat32_create(to_volume, to, 1, &entry)) {
+        print("Could not make ");
+        print_line(to);
+        return 0;
+    }
+    if (!fat32_opendir(from_volume, from, &directory)) return 0;
+
+    while (fat32_readdir(&directory, &entry)) {
+        char source[PATH_MAX];
+        char target[PATH_MAX];
+        boot_uint32_t copied = 0;
+
+        if (entry.name[0] == '.') continue;      /* . and .. */
+        source[0] = 0;
+        string_join(source, sizeof(source), "", from);
+        string_join(source, sizeof(source), "\\", entry.name);
+        target[0] = 0;
+        string_join(target, sizeof(target), "", to);
+        string_join(target, sizeof(target), "\\", entry.name);
+
+        if (entry.attributes & FAT_ATTRIBUTE_DIRECTORY) {
+            if (!xcopy_tree(from_volume, source, to_volume, target, depth + 1,
+                            files))
+                return 0;
+            continue;
+        }
+        if (!copy_one(from_volume, source, to_volume, target, &copied)) {
+            print("Could not copy ");
+            print_line(source);
+            return 0;
+        }
+        print("  ");
+        print_line(target);
+        (*files)++;
+    }
+    return 1;
+}
+
+static void command_xcopy(const ARGUMENTS* arguments) {
+    VOLUME* from_volume;
+    VOLUME* to_volume;
+    char from[PATH_MAX];
+    char to[PATH_MAX];
+    FAT_ENTRY entry;
+    boot_uint32_t files = 0;
+
+    if (arguments->operand_count < 2) {
+        print_line("Usage: xcopy <directory> <directory>");
+        return;
+    }
+    if (!resolve_path(arguments->operand[0], &from_volume, from) ||
+        !resolve_path(arguments->operand[1], &to_volume, to)) {
+        print_line("Invalid drive.");
+        return;
+    }
+    if (!fat32_stat(from_volume, from, &entry)) {
+        print_line("Directory not found.");
+        return;
+    }
+    if (!(entry.attributes & FAT_ATTRIBUTE_DIRECTORY)) {
+        print_line("That is a file. Use copy.");
+        return;
+    }
+    if (xcopy_tree(from_volume, from, to_volume, to, 0, &files)) {
+        print_dec(files);
+        print_line(" file(s) copied.");
+    }
+}
+
+/* LABEL - what the volume calls itself.
+ *
+ * Reported here and not changed, and the difference is worth stating plainly
+ * rather than pretending: the name lives in a directory entry with the volume
+ * attribute set, and this filesystem has no way to write one yet. Saying so is
+ * the point of the command existing at all - `vol` and `label` both answering
+ * "no idea" would be worse. */
+static void command_label(const ARGUMENTS* arguments) {
+    VOLUME* volume = current_volume;
+
+    if (arguments->operand_count && arguments->operand[0][1] == ':')
+        volume = volume_by_letter(arguments->operand[0][0]);
+    if (!volume) { print_line("Invalid drive."); return; }
+
+    print(" Volume in drive ");
+    if (volume->letter) put(volume->letter);
+    else print("(hidden)");
+    if (volume->label[0]) { print(" is "); print_line(volume->label); }
+    else print_line(" has no label");
+
+    if (arguments->operand_count > (volume == current_volume ? 0 : 1))
+        print_line("Changing a label needs a filesystem write this does not have yet.");
+}
+
+/* MODE - what the console and the serial port are set to.
+ *
+ * DOS's MODE changed them. This reports them, because the one that matters -
+ * the screen - is chosen by the loader before ExitBootServices and cannot be
+ * changed afterwards: the protocol that would do it is gone with the firmware.
+ * A command that told a comfortable lie about that would be worse than one
+ * that says what it is. */
+static void command_mode(void) {
+    print("CON: ");
+    print_dec(console_columns());
+    print(" columns, ");
+    print_dec(console_rows());
+    print_line(" lines");
+    print("     ");
+    print_dec(console_width());
+    put('x');
+    print_dec(console_height());
+    print_line(" pixels, fixed by the loader at boot");
+    print_line("COM1: 115200 baud, 8-N-1, output only");
 }
 
 /* ---- The batch language --------------------------------------------------
@@ -4775,6 +5220,118 @@ static void execute(const char* input) {
     environment_expand(input, expanded, sizeof(expanded));
     input = skip_spaces(expanded);
 
+    /* Pipes and redirection, taken off the line before the command sees it.
+     *
+     * Split here rather than inside each command for the same reason the
+     * output is caught in console.c: a command that had to notice its own `>`
+     * is a command that will not, and there would be forty of them. */
+    {
+        char left[INPUT_MAX];
+        char right[INPUT_MAX];
+        char target[PATH_MAX];
+        const char* bar = 0;
+        const char* arrow = 0;
+        const char* less = 0;
+        int append = 0;
+
+        for (const char* scan = input; *scan; scan++) {
+            if (*scan == '|' && !bar) bar = scan;
+            else if (*scan == '>' && !arrow && !bar) {
+                arrow = scan;
+                append = scan[1] == '>';
+            } else if (*scan == '<' && !less && !bar) less = scan;
+        }
+
+        if (bar) {
+            /* The left side into a file, then the right side out of it. What
+               DOS did, and for the same reason: nothing runs side by side. */
+            boot_uint64_t length = (boot_uint64_t)(bar - input);
+            int ok;
+
+            if (length + 1 >= sizeof(left)) { print_line("Line too long."); return; }
+            memcpy(left, input, length);
+            left[length] = 0;
+            {
+                const char* rest = skip_spaces(bar + 1);
+                boot_uint64_t at = 0;
+                while (rest[at] && at + 1 < sizeof(right)) { right[at] = rest[at]; at++; }
+                right[at] = 0;
+            }
+            if (!right[0]) { print_line("Nothing after the pipe."); return; }
+
+            if (!capture_begin(PIPE_FILE, 0)) {
+                print_line("Could not make the pipe file.");
+                return;
+            }
+            execute(left);
+            ok = capture_end();
+            if (!ok) print_line("The pipe file could not be written.");
+            else {
+                char keep[PATH_MAX];
+                boot_uint64_t at = 0;
+                while (input_source[at]) { keep[at] = input_source[at]; at++; }
+                keep[at] = 0;
+                set_input_source(PIPE_FILE);
+                execute(right);
+                set_input_source(keep);
+            }
+            {
+                VOLUME* volume;
+                char path[PATH_MAX];
+                if (resolve_path(PIPE_FILE, &volume, path))
+                    fat32_remove(volume, path);
+            }
+            return;
+        }
+
+        if (arrow || less) {
+            char command[INPUT_MAX];
+            const char* first = arrow;
+            boot_uint64_t length;
+            boot_uint64_t at = 0;
+
+            if (!first || (less && less < first)) first = less;
+            length = (boot_uint64_t)(first - input);
+            if (length + 1 >= sizeof(command)) { print_line("Line too long."); return; }
+            memcpy(command, input, length);
+            command[length] = 0;
+
+            if (less) {
+                const char* name = skip_spaces(less + 1);
+                at = 0;
+                while (name[at] && !is_space(name[at]) && name[at] != '>' &&
+                       at + 1 < sizeof(target))
+                    { target[at] = name[at]; at++; }
+                target[at] = 0;
+                set_input_source(target);
+            }
+
+            if (arrow) {
+                const char* name = skip_spaces(arrow + (append ? 2 : 1));
+                at = 0;
+                while (name[at] && !is_space(name[at]) && at + 1 < sizeof(target))
+                    { target[at] = name[at]; at++; }
+                target[at] = 0;
+                if (!target[0]) { print_line("Nothing to redirect into."); input_source[0] = 0; return; }
+                if (!capture_begin(target, append)) {
+                    print("Could not write ");
+                    print_line(target);
+                    input_source[0] = 0;
+                    return;
+                }
+                execute(command);
+                if (!capture_end()) {
+                    print("Could not write all of ");
+                    print_line(target);
+                }
+            } else {
+                execute(command);
+            }
+            input_source[0] = 0;
+            return;
+        }
+    }
+
     /* A built-in that has not failed leaves ERRORLEVEL at zero, as DOS did:
        a batch file testing it after `copy` should see the copy's result and
        not what a program left three lines earlier. The ones that can fail set
@@ -4848,6 +5405,11 @@ static void execute(const char* input) {
         return;
     }
     if (word_is(input, "PAUSE")) { command_pause(); return; }
+    if (word_is(input, "FIND")) { command_find(&arguments); return; }
+    if (word_is(input, "SORT")) { command_sort(&arguments); return; }
+    if (word_is(input, "XCOPY")) { command_xcopy(&arguments); return; }
+    if (word_is(input, "LABEL")) { command_label(&arguments); return; }
+    if (word_is(input, "MODE")) { command_mode(); return; }
     if (word_is(input, "GOTO")) { command_goto(&arguments); return; }
     if (word_is(input, "IF")) { command_if(arguments.tail); return; }
     if (word_is(input, "SHIFT")) {
