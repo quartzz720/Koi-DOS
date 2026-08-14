@@ -148,6 +148,20 @@ int window_popup(const WINDOW_ITEM* items, int count, int x, int y);
 int window_confirm(const char* title, const char* message, const char* accept,
                    const char* cancel, int accept_by_default);
 
+/* The same box with one button: something to be told, not agreed to. A notice
+   wearing a Cancel button asks a question it has no answer for. */
+int window_message(const char* title, const char* message, const char* accept);
+
+/* The same box with a line to type in. `buffer` is both what it starts with
+ * and where the answer lands, and it must hold `size` bytes. Returns 1 when
+ * the accepting button was chosen and something was typed, 0 otherwise - so a
+ * caller can act on the answer without also checking whether it is empty.
+ *
+ * The labels are the caller's because this file has no language table and
+ * should not grow one: it knows how to draw a button, not what to call it. */
+int window_prompt(const char* title, const char* message, const char* accept,
+                  const char* cancel, char* buffer, int size);
+
 /* Where a menu opened from the taskbar button belongs. The caller does not
    know how tall the bar is or where the button sits, and should not have to
    ask twice for something this file already decided. */

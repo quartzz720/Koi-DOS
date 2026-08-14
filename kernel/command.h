@@ -9,6 +9,8 @@ __attribute__((noreturn)) void command_run(void);
    finished. This is what SYS_RUN calls: a program asking the shell to do
    something is asking for exactly what a person typing would get, including
    the built-in commands and the search path. */
-void command_execute_line(const char* line);
+/* Run one command line, and give back what it exited with -
+   KOI_EXIT_NOT_FOUND when there was no such command. */
+int command_execute_line(const char* line);
 
 #endif

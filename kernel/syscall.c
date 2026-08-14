@@ -907,14 +907,15 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
     }
 
     case SYS_RUN: {
-        /* The exit code of what was run is not carried back yet: the shell
-           prints it and does not return it. Zero means "it ran"; -1 means the
-           command line was not usable. Saying so is better than inventing a
-           number that looks like a result. */
+        /* The exit code of what was run, and KOI_EXIT_NOT_FOUND when there
+           was no such command; -1 when the line itself was not usable.
+           A graphical caller needs the difference: it takes the screen back
+           the moment this returns, so the shell's own message about an
+           unknown command is on screen for no longer than it takes to
+           redraw the desktop over it. */
         const char* line = (const char*)a;
         if (!line) return -1;
-        command_execute_line(line);
-        return 0;
+        return command_execute_line(line);
     }
     case SYS_SECTOR_SIZE: {
         BLOCK_DEVICE* device = block_device((boot_uint32_t)a);

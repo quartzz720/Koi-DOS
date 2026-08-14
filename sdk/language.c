@@ -55,7 +55,16 @@ static const char* phrases[SAY_COUNT][LANGUAGE_COUNT] = {
     /* SAY_NO_PROGRAMS    */ { "(no packages installed)",
                                "(пакеты не установлены)",
                                "(пакети не встановлено)",
-                               "(δεν υπάρχουν πακέτα)" }
+                               "(δεν υπάρχουν πακέτα)" },
+    /* SAY_RUN            */ { "Run...", "Выполнить...", "Виконати...",
+                               "Εκτέλεση..." },
+    /* SAY_RUN_ASK        */ { "Type a command, and it will be run:",
+                               "Введите команду, и она будет выполнена:",
+                               "Введіть команду, і вона буде виконана:",
+                               "Πληκτρολογήστε μια εντολή για εκτέλεση:" },
+    /* SAY_RUN_FAILED     */ { "There is no such command.",
+                               "Такой команды нет.", "Такої команди немає.",
+                               "Δεν υπάρχει τέτοια εντολή." }
 };
 
 /* The table above is indexed by the enum in language.h, so the two orders have

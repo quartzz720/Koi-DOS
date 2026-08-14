@@ -880,109 +880,154 @@ int window_popup(const WINDOW_ITEM* items, int count, int x, int y) {
     return chosen;
 }
 
-/* A question in the middle of the screen, with everything behind it dimmed.
+/* ---- Modal questions ------------------------------------------------------
  *
- * The dimming is the whole point and not decoration. A box that merely sits
- * on top of the desktop looks like one more window among the windows, and a
- * question that can be mistaken for a window is one people answer without
- * reading - which matters when the question is whether to turn the machine
- * off. Darkening what is behind says, in the one language a screen has, that
+ * A box in the middle of the screen with everything behind it dimmed, and one
+ * or two buttons along the bottom. There are two of them - a question and a
+ * question with something to type - and they share their frame rather than
+ * each drawing its own, because two boxes that are meant to look like the
+ * same box and are drawn by two pieces of code end up looking like two boxes.
+ *
+ * The dimming is the point and not decoration. A box that merely sits on top
+ * of the desktop looks like one more window among the windows, and a question
+ * that can be mistaken for a window is one people answer without reading -
+ * which matters when the question is whether to turn the machine off.
+ * Darkening what is behind says, in the one language a screen has, that
  * nothing else is listening until this is answered.
  *
  * It is done by the kernel (koi_gfx_dim) because it reads the pixels back,
- * and reading a screen's worth of pixels through a system call each is not a
- * thing a program can do. What is dimmed is never repainted underneath: the
- * dialogue owns the screen until it returns, and the desktop is redrawn whole
- * afterwards.
+ * and reading a screen's worth of pixels through a system call each is not
+ * something a program can do. */
+
+typedef struct {
+    int x, y, width, height;
+    int button_w, button_h, buttons_y;
+    int accept_x, cancel_x;
+    int body_y;                  /* under the title, where a field would go */
+} MODAL;
+
+/* `cancel` may be absent, and then the box has one button and is a notice
+   rather than a question - which is the difference between telling somebody
+   something and asking them to agree to it. */
+static void modal_layout(MODAL* box, const char* title, const char* message,
+                         const char* accept, const char* cancel, int body_h) {
+    int widest = text_width(accept);
+
+    if (cancel && text_width(cancel) > widest) widest = text_width(cancel);
+    box->button_w = widest + WINDOW_CHAR_W * 4;
+    if (box->button_w < 90) box->button_w = 90;
+    box->button_h = WINDOW_CHAR_H + 10;
+
+    box->width = text_width(message) + WINDOW_CHAR_W * 4;
+    if (box->width < text_width(title) + WINDOW_CHAR_W * 6)
+        box->width = text_width(title) + WINDOW_CHAR_W * 6;
+    if (cancel) {
+        if (box->width < box->button_w * 2 + WINDOW_CHAR_W * 6)
+            box->width = box->button_w * 2 + WINDOW_CHAR_W * 6;
+    } else if (box->width < box->button_w + WINDOW_CHAR_W * 6) {
+        box->width = box->button_w + WINDOW_CHAR_W * 6;
+    }
+    if (box->width > (int)screen.width - 40) box->width = (int)screen.width - 40;
+
+    box->height = WINDOW_BORDER * 2 + WINDOW_TITLE_H + WINDOW_CHAR_H * 3
+                  + box->button_h + body_h;
+    box->x = ((int)screen.width - box->width) / 2;
+    box->y = ((int)screen.height - box->height) / 2;
+    box->body_y = box->y + WINDOW_BORDER + WINDOW_TITLE_H + WINDOW_CHAR_H * 2 - 2;
+    box->buttons_y = box->y + box->height - WINDOW_BORDER - box->button_h - 8;
+    if (cancel) {
+        box->accept_x = box->x + box->width / 2 - box->button_w - WINDOW_CHAR_W;
+        box->cancel_x = box->x + box->width / 2 + WINDOW_CHAR_W;
+    } else {
+        box->accept_x = box->x + (box->width - box->button_w) / 2;
+        box->cancel_x = -1;
+    }
+}
+
+/* The desktop as it really is, and then dimmed.
  *
- * Returns 1 for the accepting answer and 0 for the other one, and 0 for
- * Escape - the safe answer being the one a dismissed question gives. */
+ * Drawn again first because whatever was on the screen a moment ago - the
+ * menu this was chosen from, most of the time - is otherwise still lying
+ * there, and would be dimmed along with everything else and sit behind the
+ * question looking like part of it. What is darkened has to be the desktop,
+ * not the last thing drawn on top of it.
+ *
+ * A little over a third of the light is left: dark enough that the desktop
+ * has plainly stepped back, light enough to still see what one was doing and
+ * so what the question is about. */
+static void modal_open(void) {
+    draw_everything();
+    cursor_hide();
+    koi_gfx_dim(0, 0, (int)screen.width, (int)screen.height, 96);
+    koi_gfx_present();
+}
+
+static void modal_frame(const MODAL* box, const char* title,
+                        const char* message) {
+    window_raised(box->x, box->y, box->width, box->height);
+    koi_gfx_fill(box->x + WINDOW_BORDER, box->y + WINDOW_BORDER,
+                 box->width - 2 * WINDOW_BORDER, WINDOW_TITLE_H,
+                 window_title_active);
+    window_label(box->x + (box->width - text_width(title)) / 2,
+                 box->y + WINDOW_BORDER + 3, title, window_text);
+    window_label(box->x + (box->width - text_width(message)) / 2,
+                 box->y + WINDOW_BORDER + WINDOW_TITLE_H + WINDOW_CHAR_H - 4,
+                 message, window_text);
+}
+
+/* 1 for the accepting button, 0 for the other, -1 for neither. */
+static int modal_button_at(const MODAL* box, int x, int y) {
+    if (y < box->buttons_y || y >= box->buttons_y + box->button_h) return -1;
+    if (x >= box->accept_x && x < box->accept_x + box->button_w) return 1;
+    if (box->cancel_x >= 0 && x >= box->cancel_x &&
+        x < box->cancel_x + box->button_w) return 0;
+    return -1;
+}
+
+static void modal_buttons(const MODAL* box, const char* accept,
+                          const char* cancel, int over, int held, int answer) {
+    for (int button = cancel ? 0 : 1; button < 2; button++) {
+        int place = button ? box->accept_x : box->cancel_x;
+        const char* label = button ? accept : cancel;
+        int down = held == button && over == button;
+
+        if (down) window_sunken(place, box->buttons_y, box->button_w,
+                                box->button_h);
+        else window_raised(place, box->buttons_y, box->button_w, box->button_h);
+        /* The one the keyboard is on wears a line under its text: the mark a
+           focused button has always worn, and one that needs no second colour
+           to be visible on any theme. */
+        window_label_styled(place + (box->button_w - text_width(label)) / 2 + down,
+                            box->buttons_y + 5 + down, label, window_text,
+                            answer == button ? KOI_TEXT_UNDERLINE : 0);
+    }
+}
+
 int window_confirm(const char* title, const char* message, const char* accept,
                    const char* cancel, int accept_by_default) {
-    int button_w = text_width(accept) > text_width(cancel)
-                   ? text_width(accept) : text_width(cancel);
-    int button_h = WINDOW_CHAR_H + 10;
-    int width;
-    int height;
-    int x, y;
-    int accept_x, cancel_x, buttons_y;
-    int answer = accept_by_default ? 1 : 0;   /* which button has the keyboard */
+    MODAL box;
+    int answer = (accept_by_default || !cancel) ? 1 : 0;   /* which button has the keyboard */
     int held = -1;                            /* the button the press went down on */
     int chosen = -1;
     KOI_POINTER pointer;
     int was_down;
 
-    button_w += WINDOW_CHAR_W * 4;
-    if (button_w < 90) button_w = 90;
-
-    width = text_width(message) + WINDOW_CHAR_W * 4;
-    if (width < text_width(title) + WINDOW_CHAR_W * 6)
-        width = text_width(title) + WINDOW_CHAR_W * 6;
-    if (width < button_w * 2 + WINDOW_CHAR_W * 6)
-        width = button_w * 2 + WINDOW_CHAR_W * 6;
-    if (width > (int)screen.width - 40) width = (int)screen.width - 40;
-    height = WINDOW_BORDER * 2 + WINDOW_TITLE_H + WINDOW_CHAR_H * 3 + button_h;
-
-    x = ((int)screen.width - width) / 2;
-    y = ((int)screen.height - height) / 2;
-    buttons_y = y + height - WINDOW_BORDER - button_h - 8;
-    accept_x = x + width / 2 - button_w - WINDOW_CHAR_W;
-    cancel_x = x + width / 2 + WINDOW_CHAR_W;
-
-    /* The desktop as it really is, before it is dimmed. Whatever was on the
-       screen a moment ago - the menu this question was chosen from, most of
-       the time - is still lying there otherwise, and it would be dimmed along
-       with everything else and sit behind the question looking like part of
-       it. What is darkened has to be the desktop, not the last thing drawn on
-       top of it. */
-    draw_everything();
-    cursor_hide();
-    /* A little over a third of the light left: dark enough that the desktop
-       has plainly stepped back, light enough to still see what one was doing
-       and so what the question is about. */
-    koi_gfx_dim(0, 0, (int)screen.width, (int)screen.height, 96);
-    koi_gfx_present();
+    modal_layout(&box, title, message, accept, cancel, 0);
+    modal_open();
 
     koi_mouse(&pointer);
     was_down = (pointer.buttons & KOI_BUTTON_LEFT) != 0;
 
     for (;;) {
-        int over = -1;
+        int over;
 
         koi_mouse(&pointer);
-        if (pointer.y >= buttons_y && pointer.y < buttons_y + button_h) {
-            if (pointer.x >= accept_x && pointer.x < accept_x + button_w)
-                over = 1;
-            else if (pointer.x >= cancel_x && pointer.x < cancel_x + button_w)
-                over = 0;
-        }
+        over = modal_button_at(&box, pointer.x, pointer.y);
 
         cursor_hide();
-        window_raised(x, y, width, height);
-        koi_gfx_fill(x + WINDOW_BORDER, y + WINDOW_BORDER,
-                     width - 2 * WINDOW_BORDER, WINDOW_TITLE_H,
-                     window_title_active);
-        window_label(x + (width - text_width(title)) / 2,
-                     y + WINDOW_BORDER + 3, title, window_text);
-        window_label(x + (width - text_width(message)) / 2,
-                     y + WINDOW_BORDER + WINDOW_TITLE_H + WINDOW_CHAR_H - 4,
-                     message, window_text);
-
-        for (int button = 0; button < 2; button++) {
-            int place = button ? accept_x : cancel_x;
-            const char* label = button ? accept : cancel;
-            int down = held == button && over == button;
-
-            if (down) window_sunken(place, buttons_y, button_w, button_h);
-            else window_raised(place, buttons_y, button_w, button_h);
-            /* The one the keyboard is on wears a line under its text: the
-               same mark a focused button has always worn, and one that does
-               not need a second colour to be visible on any theme. */
-            window_label_styled(place + (button_w - text_width(label)) / 2 + down,
-                                buttons_y + 5 + down, label, window_text,
-                                answer == button ? KOI_TEXT_UNDERLINE : 0);
-        }
-        koi_gfx_present_rect(x, y, width, height);
+        modal_frame(&box, title, message);
+        modal_buttons(&box, accept, cancel, over, held, answer);
+        koi_gfx_present_rect(box.x, box.y, box.width, box.height);
         cursor_show(pointer.x, pointer.y);
 
         if (pointer.buttons & KOI_BUTTON_LEFT) {
@@ -991,8 +1036,8 @@ int window_confirm(const char* title, const char* message, const char* accept,
         } else if (was_down) {
             was_down = 0;
             /* Chosen only when the release lands on the button the press went
-               down on, which is how a pointer says "no, not that one" after
-               it has already been pressed. */
+               down on, which is how a pointer says "no, not that one" after it
+               has already been pressed. */
             if (held >= 0 && over == held) { chosen = held; break; }
             held = -1;
         }
@@ -1001,7 +1046,8 @@ int window_confirm(const char* title, const char* message, const char* accept,
             int key = koi_getchar();
 
             if (key == 27) { chosen = 0; break; }
-            if (key == KOI_KEY_LEFT || key == KOI_KEY_RIGHT || key == '\t')
+            if (cancel && (key == KOI_KEY_LEFT || key == KOI_KEY_RIGHT ||
+                           key == '\t'))
                 answer = !answer;
             else if (key == '\n' || key == '\r') { chosen = answer; break; }
         }
@@ -1011,6 +1057,134 @@ int window_confirm(const char* title, const char* message, const char* accept,
     cursor_hide();
     dirty = 1;
     return chosen;
+}
+
+int window_message(const char* title, const char* message, const char* accept) {
+    return window_confirm(title, message, accept, (const char*)0, 1);
+}
+
+/* The same box, with a line to type in.
+ *
+ * The field shows the end of what has been typed rather than the beginning,
+ * because the end is where the caret is and a path being typed is a thing
+ * whose last few characters are the ones in question. */
+int window_prompt(const char* title, const char* message, const char* accept,
+                  const char* cancel, char* buffer, int size) {
+    MODAL box;
+    int field_x, field_y, field_w;
+    int field_h = WINDOW_CHAR_H + 8;
+    int answer = 1;
+    int held = -1;
+    int chosen = -1;
+    int length = 0;
+    /* What the field starts with arrives selected, as a field somebody is
+       about to retype always has: the first thing typed replaces it whole.
+       Without this, a caller that remembers the last command - which is the
+       obliging thing for a Run box to do - hands the next one a field that
+       silently appends to it, and `nosuch` followed by `ver` runs `nosuchver`. */
+    int selected;
+    KOI_POINTER pointer;
+    int was_down;
+
+    if (!buffer || size < 2) return 0;
+    while (buffer[length] && length < size - 1) length++;
+    buffer[length] = 0;
+    selected = length > 0;
+
+    modal_layout(&box, title, message, accept, cancel, field_h + 6);
+    /* Wide enough to be worth typing into even when the question is short. */
+    if (box.width < WINDOW_CHAR_W * 44) {
+        box.width = WINDOW_CHAR_W * 44;
+        box.x = ((int)screen.width - box.width) / 2;
+        box.accept_x = box.x + box.width / 2 - box.button_w - WINDOW_CHAR_W;
+        box.cancel_x = box.x + box.width / 2 + WINDOW_CHAR_W;
+    }
+    field_x = box.x + WINDOW_CHAR_W * 2;
+    field_w = box.width - WINDOW_CHAR_W * 4;
+    field_y = box.body_y + 4;
+
+    modal_open();
+    koi_mouse(&pointer);
+    was_down = (pointer.buttons & KOI_BUTTON_LEFT) != 0;
+
+    for (;;) {
+        int over;
+        int columns = (field_w - WINDOW_CHAR_W) / WINDOW_CHAR_W;
+        int from = 0;
+
+        /* Show the tail that fits, counting characters and not bytes - one
+           Russian letter is two bytes and the same one cell. */
+        {
+            int cells = 0;
+            for (int at = 0; at < length; at++)
+                if (((unsigned char)buffer[at] & 0xC0) != 0x80) cells++;
+            while (cells > columns) {
+                from++;
+                while (from < length &&
+                       ((unsigned char)buffer[from] & 0xC0) == 0x80) from++;
+                cells--;
+            }
+        }
+
+        koi_mouse(&pointer);
+        over = modal_button_at(&box, pointer.x, pointer.y);
+
+        cursor_hide();
+        modal_frame(&box, title, message);
+        window_sunken(field_x, field_y, field_w, field_h);
+        if (selected)
+            koi_gfx_fill(field_x + 4, field_y + 4, text_width(buffer + from),
+                         WINDOW_CHAR_H, window_accent);
+        window_label(field_x + 4, field_y + 4, buffer + from,
+                     selected ? window_client_paper : window_text);
+        {
+            int caret = field_x + 4 + text_width(buffer + from);
+            koi_gfx_line(caret, field_y + 3, caret, field_y + field_h - 4,
+                         window_text);
+        }
+        modal_buttons(&box, accept, cancel, over, held, answer);
+        koi_gfx_present_rect(box.x, box.y, box.width, box.height);
+        cursor_show(pointer.x, pointer.y);
+
+        if (pointer.buttons & KOI_BUTTON_LEFT) {
+            if (!was_down) held = over;
+            was_down = 1;
+        } else if (was_down) {
+            was_down = 0;
+            if (held >= 0 && over == held) { chosen = held; break; }
+            held = -1;
+        }
+
+        if (koi_keypressed()) {
+            int key = koi_getchar();
+
+            if (key == 27) { chosen = 0; break; }
+            else if (key == '\n' || key == '\r') { chosen = answer; break; }
+            else if (key == '\t') answer = !answer;
+            else if (key == '\b') {
+                if (selected) { length = 0; buffer[0] = 0; selected = 0; }
+                /* A whole character, not a byte: stepping back one byte at a
+                   time leaves half of a Russian letter in the buffer, which
+                   is not a character at all and draws as rubbish. */
+                while (length > 0 &&
+                       ((unsigned char)buffer[length - 1] & 0xC0) == 0x80)
+                    length--;
+                if (length > 0) length--;
+                buffer[length] = 0;
+            } else if (key >= 0x20 && key < 0x100) {
+                if (selected) { length = 0; buffer[0] = 0; selected = 0; }
+                if (length < size - 1) {
+                    buffer[length++] = (char)key;
+                    buffer[length] = 0;
+                }
+            }
+        }
+        koi_sleep(10);
+    }
+
+    cursor_hide();
+    dirty = 1;
+    return chosen == 1 && buffer[0] ? 1 : 0;
 }
 
 void window_desktop_menu(const WINDOW_MENU* menus, int count) {

@@ -5431,8 +5431,10 @@ static void run_batch(VOLUME* volume, const char* path, const char* arguments) {
     kfree(contents);
 }
 
-void command_execute_line(const char* line) {
-    if (line) execute(line);
+int command_execute_line(const char* line) {
+    if (!line) return -1;
+    execute(line);
+    return last_exit_code;
 }
 
 static void execute(const char* input) {
@@ -5697,6 +5699,7 @@ static void execute(const char* input) {
 
     if (try_program(input, &arguments)) return;
 
+    last_exit_code = KOI_EXIT_NOT_FOUND;
     console_set_color(console_theme()->error, console_theme()->background);
     print("Bad command or file name: ");
     print_line(input);

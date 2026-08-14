@@ -102,6 +102,16 @@ typedef struct {
  * are different things to carry on from. */
 #define KOI_EXIT_INTERRUPTED 130
 
+/* And the one for a command line the shell could not match to anything - no
+ * built-in of that name, no program of that name anywhere on the PATH. 127 is
+ * the unix world's for the same thing, and borrowed for the same reason.
+ *
+ * It is what SYS_RUN gives back, so a caller that hands over a line somebody
+ * typed can tell "that is not a command" from "the command ran and failed",
+ * and say so itself rather than leaving the shell's message to flash past on
+ * a screen the caller is about to take back. */
+#define KOI_EXIT_NOT_FOUND 127
+
 /* Console and process. */
 #define SYS_EXIT 0x00        /* (code) - does not return */
 #define SYS_PUTCHAR 0x01     /* (character) */
