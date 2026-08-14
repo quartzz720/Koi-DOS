@@ -11,6 +11,15 @@
  * between a driver and a project.
  *
  * `width` and `height` bound the pointer; give it the screen's. */
+/* A byte the controller says came from the second port, whichever interrupt
+   happened to find it. The two devices share one data port, so whoever reads
+   a byte has to give it to whoever it belongs to. */
+void mouse_from_controller(boot_uint8_t value);
+
+/* Another attempt at finding a pointer, with the screen size remembered from
+   the first. Returns whether there is one now. */
+int mouse_restart(void);
+
 int mouse_init(boot_uint32_t width, boot_uint32_t height);
 
 int mouse_present(void);

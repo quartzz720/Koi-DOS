@@ -91,6 +91,86 @@ static int map_range(boot_uint64_t start, boot_uint64_t size, boot_uint64_t flag
     return 1;
 }
 
+#define PAGE_USER 0x004ULL
+
+/* Hand a range of memory to ring 3, and nothing else with it.
+ *
+ * The identity map is built out of 2 MiB pages, which is right for a kernel
+ * that maps everything and wrong for this: a program's stack does not begin
+ * on a 2 MiB boundary, and marking the leaf it sits in would hand the
+ * program two megabytes of whatever else is in there. So the leaf is split
+ * into four-kilobyte pages first - 512 entries describing exactly what the
+ * large one described - and only the pages asked for get the user bit.
+ *
+ * Every level has to carry the bit as well: the processor takes the strictest
+ * of them, so a page marked user under a table that is not is not reachable
+ * from ring 3. Marking the tables costs nothing, because a table that is
+ * user-accessible still only leads to leaves that are not.
+ *
+ * There is one address space here, shared by the kernel and whatever runs at
+ * ring 3. That is not the finished arrangement - the plan is a space per
+ * application - but it already buys the thing that matters: ring 3 can reach
+ * what it was given and takes a fault on everything else, including all of
+ * the kernel. */
+static int split_large_page(boot_uint64_t* pd_entry) {
+    boot_uint64_t large = *pd_entry;
+    boot_uint64_t base = large & ~(LARGE_PAGE_SIZE - 1) & 0x000FFFFFFFFFF000ULL;
+    boot_uint64_t flags = large & (PAGE_WRITABLE | PAGE_WRITE_THROUGH |
+                                   PAGE_CACHE_DISABLE);
+    boot_uint64_t* table;
+
+    if (!(large & PAGE_LARGE)) return 1;          /* already four-kilobyte */
+    table = alloc_table();
+    if (!table) return 0;
+    for (boot_uint64_t index = 0; index < ENTRIES; index++)
+        table[index] = (base + index * PAGE_SIZE) | PAGE_PRESENT | flags;
+    *pd_entry = (boot_uint64_t)(unsigned long long)table |
+                PAGE_PRESENT | PAGE_WRITABLE;
+    return 1;
+}
+
+int paging_allow_user(boot_uint64_t base, boot_uint64_t size) {
+    boot_uint64_t address = base & ~(PAGE_SIZE - 1);
+    boot_uint64_t end = base + size;
+
+    if (!pml4 || end < base) return 0;
+    end = (end + PAGE_SIZE - 1) & ~((boot_uint64_t)PAGE_SIZE - 1);
+
+    for (; address < end; address += PAGE_SIZE) {
+        boot_uint64_t pml4_index = (address >> 39) & (ENTRIES - 1);
+        boot_uint64_t pdpt_index = (address >> 30) & (ENTRIES - 1);
+        boot_uint64_t pd_index = (address >> 21) & (ENTRIES - 1);
+        boot_uint64_t pt_index = (address >> 12) & (ENTRIES - 1);
+        boot_uint64_t* pdpt;
+        boot_uint64_t* pd;
+        boot_uint64_t* pt;
+
+        if (!(pml4[pml4_index] & PAGE_PRESENT)) return 0;
+        pml4[pml4_index] |= PAGE_USER;
+        pdpt = (boot_uint64_t*)(unsigned long long)
+               (pml4[pml4_index] & 0x000FFFFFFFFFF000ULL);
+
+        if (!(pdpt[pdpt_index] & PAGE_PRESENT)) return 0;
+        pdpt[pdpt_index] |= PAGE_USER;
+        pd = (boot_uint64_t*)(unsigned long long)
+             (pdpt[pdpt_index] & 0x000FFFFFFFFFF000ULL);
+
+        if (!(pd[pd_index] & PAGE_PRESENT)) return 0;
+        if (!split_large_page(&pd[pd_index])) return 0;
+        pd[pd_index] |= PAGE_USER;
+        pt = (boot_uint64_t*)(unsigned long long)
+             (pd[pd_index] & 0x000FFFFFFFFFF000ULL);
+
+        pt[pt_index] |= PAGE_USER;
+    }
+
+    /* The processor caches translations; one that was made before the bit was
+       set is the one that would still refuse. */
+    __asm__ volatile ("mov %%cr3, %%rax\n mov %%rax, %%cr3\n"
+                      : : : "rax", "memory");
+    return 1;
+}
+
 /* Put a write-combining type into the PAT, if this processor has one to put it
  * in. Every x86-64 part does; the check is here because acting on an absent
  * feature would set an MSR that does not exist and take a #GP doing it.

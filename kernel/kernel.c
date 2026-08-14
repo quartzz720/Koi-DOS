@@ -199,9 +199,10 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
             /* Everything else has to move across in the same breath. An IRQ
                still expecting the 8259 would simply stop arriving, because the
                dispatcher now acknowledges the APIC instead. */
-            /* And the pointer's, which arrives on the same controller by a
-               different line and would otherwise stop the moment the 8259 is
-               left behind. */
+            /* The pointer routes its own line now, when it starts - see
+               mouse.c. A pointer found later than this point used to get no
+               interrupt at all, which looked exactly like a pointer that was
+               working and did not move. */
             if (mouse_present() && apic_route_irq(12, IRQ_BASE + 12))
                 report("MOUSE: MOVED TO THE IO APIC\n");
             if (keyboard_present_ps2() && apic_route_irq(1, IRQ_BASE + 1)) {
@@ -413,6 +414,21 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
             report("BOOT VOLUME: NOT FOUND - no drive assigned\n");
         }
     }
+
+    /* One last look at the keyboard controller before the prompt appears.
+     *
+     * Everything above takes time - disks, USB, the network card - and a
+     * touchpad that the firmware left reporting has been filling the 8042's
+     * one-byte buffer for all of it. Whatever is stuck goes now, and a
+     * pointer that could not be found earlier is looked for again, because
+     * by this point it has been told to be quiet and answers properly.
+     *
+     * Suggested by the person whose laptop this kept happening on, which is
+     * the right way round: the machine that shows the fault is the one that
+     * knows when it happens. */
+    ps2_drain();
+    if (!mouse_present() && mouse_restart())
+        report("MOUSE: FOUND ON THE SECOND ATTEMPT\n");
 
     command_run();
 }

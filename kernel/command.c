@@ -1852,6 +1852,105 @@ static void take_line(const char* from, char* into, boot_uint32_t size) {
 
 
 
+
+/* ---- Files that have not changed ------------------------------------------
+ *
+ * A package's manifest says, for every file, how big it is and what it hashes
+ * to. If the copy already on the disk matches both, it is not fetched.
+ *
+ * This is the difference between an update costing what changed and an update
+ * costing the whole package. Mizu is 2.35 MB, of which 2.2 MB is a wallpaper
+ * that has been the same picture since the day it was drawn - and on a
+ * lock-step protocol at twenty kilobytes a second, sending it again is two
+ * minutes of somebody's evening for nothing.
+ *
+ * CRC-32, the ordinary one - the polynomial ZIP, PNG and Ethernet use, so the
+ * publishing side is one line of zlib and this is thirty lines with no table.
+ * It is not a defence against anybody: a hostile server would simply send a
+ * matching checksum with its file. It answers "is this the same file", and
+ * signing answers the other question, when there is somebody to sign.
+ *
+ * A manifest without these lines - one written by an older publish.sh - has no
+ * `check` for anything, nothing matches, and every file is fetched exactly as
+ * before. */
+static boot_uint32_t crc32_bytes(boot_uint32_t crc, const boot_uint8_t* data,
+                                 boot_uint32_t length) {
+    for (boot_uint32_t index = 0; index < length; index++) {
+        crc ^= data[index];
+        for (int bit = 0; bit < 8; bit++)
+            crc = (crc >> 1) ^ (0xEDB88320U & (boot_uint32_t)(-(int)(crc & 1)));
+    }
+    return crc;
+}
+
+/* The CRC of a file already on the disk, read through `scratch`. Returns 0
+   when it could not be read at all, which no caller can tell from a file whose
+   CRC is genuinely zero - and neither can care, because a file that cannot be
+   read is one to fetch again. */
+static int local_crc(VOLUME* volume, const FAT_ENTRY* entry,
+                     boot_uint8_t* scratch, boot_uint32_t scratch_size,
+                     boot_uint32_t* crc_out) {
+    boot_uint32_t crc = 0xFFFFFFFFU;
+    boot_uint32_t at = 0;
+    FAT_ENTRY copy = *entry;
+
+    while (at < entry->size) {
+        boot_uint32_t got = fat32_read(volume, &copy, at, scratch,
+                                       scratch_size);
+        if (!got) return 0;
+        crc = crc32_bytes(crc, scratch, got);
+        at += got;
+    }
+    *crc_out = crc ^ 0xFFFFFFFFU;
+    return 1;
+}
+
+/* `check = NAME SIZE CRC` for one name, if the manifest has one. */
+static int manifest_check(const char* manifest, boot_uint32_t length,
+                          const char* name, boot_uint32_t* size,
+                          boot_uint32_t* crc) {
+    boot_uint32_t at = 0;
+
+    for (;;) {
+        const char* value = manifest_value(manifest, length, "check", &at);
+        char line[128];
+        boot_uint32_t cursor = 0;
+        boot_uint32_t number = 0;
+
+        if (!value) return 0;
+        take_line(value, line, sizeof(line));
+
+        while (line[cursor] && line[cursor] != ' ') cursor++;
+        {
+            char had = line[cursor];
+            line[cursor] = 0;
+            if (!word_is(line, name)) { line[cursor] = had; continue; }
+            line[cursor] = had;
+        }
+
+        while (line[cursor] == ' ') cursor++;
+        if (line[cursor] < '0' || line[cursor] > '9') return 0;
+        while (line[cursor] >= '0' && line[cursor] <= '9')
+            number = number * 10 + (boot_uint32_t)(line[cursor++] - '0');
+        *size = number;
+
+        while (line[cursor] == ' ') cursor++;
+        number = 0;
+        for (int digit = 0; digit < 8; digit++) {
+            char character = line[cursor + digit];
+            boot_uint32_t nibble;
+
+            if (character >= '0' && character <= '9') nibble = (boot_uint32_t)(character - '0');
+            else if (character >= 'a' && character <= 'f') nibble = (boot_uint32_t)(character - 'a' + 10);
+            else if (character >= 'A' && character <= 'F') nibble = (boot_uint32_t)(character - 'A' + 10);
+            else return 0;
+            number = (number << 4) | nibble;
+        }
+        *crc = number;
+        return 1;
+    }
+}
+
 /* The version recorded for a package, or an empty string. */
 static void dosget_installed(const char* package, char* into,
                              boot_uint32_t size) {
@@ -2122,16 +2221,38 @@ static int dosget_install(boot_uint32_t source, const char* raw_package,
         take_line(value, name, sizeof(name));
         if (!name[0]) continue;
 
+        local[0] = 0;
+        string_join(local, sizeof(local), "", directory);
+        string_join(local, sizeof(local), "\\", name);
+
+        /* Already here, byte for byte? Then it is not worth two minutes of
+           somebody's evening to hear it again. */
+        {
+            boot_uint32_t wanted_size = 0;
+            boot_uint32_t wanted_crc = 0;
+            boot_uint32_t have_crc = 0;
+
+            if (manifest_check(manifest, manifest_length, name, &wanted_size,
+                               &wanted_crc) &&
+                fat32_stat(volume, local, &entry) &&
+                entry.size == wanted_size &&
+                local_crc(volume, &entry, buffer, DOSGET_BUFFER, &have_crc) &&
+                have_crc == wanted_crc) {
+                print("  ");
+                if (volume != current_volume) print("(loader) ");
+                print(local);
+                print_line("  unchanged");
+                files++;
+                continue;
+            }
+        }
+
         remote[0] = 0;
         string_join(remote, sizeof(remote), "packages/", package);
         string_join(remote, sizeof(remote), "/", name);
 
         got = dosget_fetch(source, remote, buffer, DOSGET_BUFFER);
         if (got < 0) return 0;
-
-        local[0] = 0;
-        string_join(local, sizeof(local), "", directory);
-        string_join(local, sizeof(local), "\\", name);
 
         /* The old copy is kept, not deleted, when it is part of the system.
            A kernel that does not start is otherwise a machine that needs the
@@ -3838,6 +3959,27 @@ static void command_cd(const ARGUMENTS* arguments) {
     memcpy(current_path, path, strlen(path) + 1);
 }
 
+/* Has somebody pressed Ctrl+C at a command that is taking too long?
+ *
+ * Programs are asked this at every system call, which is where a program can
+ * be stopped safely. A built-in command runs inside the shell and reaches no
+ * system call, so until now Ctrl+C did nothing at all to one - and `type` on
+ * an eleven-megabyte file is exactly the case somebody wants it for. The
+ * commands that can run long ask here, between one piece of work and the
+ * next, which is a place where stopping costs nothing half-done. */
+static int command_interrupted(void) {
+    /* Ask the keyboard first, and that is not a formality: a USB keyboard
+       says nothing until somebody drains the controller's event ring, and
+       during a built-in nobody does. Ctrl+C on a USB keyboard therefore never
+       arrived at all - the flag this reads was never set - which is why
+       stopping `type` did not work even after `type` learned to look. */
+    (void)keyboard_pending();
+    if (!keyboard_break_taken()) return 0;
+    console_use_theme();
+    print_line("^C");
+    return 1;
+}
+
 static void command_type(const ARGUMENTS* arguments) {
     char path[PATH_MAX];
     char name[PATH_MAX];
@@ -3869,6 +4011,7 @@ static void command_type(const ARGUMENTS* arguments) {
     while (offset < entry.size) {
         boot_uint32_t got = fat32_read(volume, &entry, offset, buffer, 512);
         if (!got) break;
+        if (command_interrupted()) break;
         for (boot_uint32_t index = 0; index < got; index++) {
             char character = buffer[index];
             /* Files arrive with CRLF; the console supplies its own carriage
@@ -4291,6 +4434,7 @@ static void tree_walk(VOLUME* volume, const char* path, int depth) {
     if (!fat32_opendir(volume, path, &listing)) return;
 
     while (fat32_readdir(&listing, &entry)) {
+        if (command_interrupted()) return;
         if (!(entry.attributes & FAT_ATTRIBUTE_DIRECTORY)) continue;
         if (entry.name[0] == '.' && !entry.name[1]) continue;
         if (entry.name[0] == '.' && entry.name[1] == '.' && !entry.name[2]) continue;
@@ -4439,6 +4583,9 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
        other layout was selected would hand the prompt a keyboard typing in
        Cyrillic, and the prompt is ASCII. */
     layout_gesture_enable(0);
+    /* And Ctrl+C stops programs again, whatever the one that just ended
+       thought about it. */
+    keyboard_break_enable(1);
     /* And take the screen back, whether or not the program gave it up. A
        program that returns while still holding it would otherwise leave the
        shell invisible with no way to ask for it back - which is precisely the
@@ -4968,6 +5115,64 @@ static void command_label(const ARGUMENTS* arguments) {
  * changed afterwards: the protocol that would do it is gone with the firmware.
  * A command that told a comfortable lie about that would be worse than one
  * that says what it is. */
+/* Look for a pointer again.
+ *
+ * Because a touchpad that was being touched while the firmware ran is a
+ * touchpad this did not find at boot, and rebooting to get a cursor is a poor
+ * answer when asking again takes a few milliseconds. Graphics programs ask on
+ * their own account when they take the screen; this is for the prompt. */
+/* Run a program at ring 3, where the processor can stop it.
+ *
+ * A command rather than a setting, because this is a bench and not a policy
+ * yet: the DOS contract is ring 0 and a flat machine, and that is not going
+ * to change for programs typed at a prompt. What is being built here is the
+ * ground Mizu's applications will stand on, and the honest way to build it is
+ * to be able to try it on any program, one at a time, and see what breaks.
+ *
+ * A well-behaved program does not notice. It touches its own image and its
+ * own stack and asks the kernel for everything else, and all three of those
+ * still work. One that reads the framebuffer directly, or wanders off the end
+ * of an array into the kernel, now stops instead of taking the machine. */
+static void command_ring3(const ARGUMENTS* arguments) {
+    if (!arguments->operand[0][0]) {
+        print_line("Usage: ring3 <program>");
+        print_line("Runs it in ring 3, where a fault stops the program.");
+        return;
+    }
+    program_run_next_at_ring3();
+    {
+        ARGUMENTS inner;
+        char line[INPUT_MAX];
+        boot_uint32_t at = 0;
+
+        line[0] = 0;
+        string_join(line, sizeof(line), "", arguments->operand[0]);
+        if (arguments->operand[1][0]) {
+            string_join(line, sizeof(line), " ", arguments->operand[1]);
+        }
+        while (line[at]) at++;
+        parse_arguments(line, &inner);
+        if (!try_program(line, &inner))
+            print_line("Bad command or file name.");
+    }
+}
+
+static void command_mouse(void) {
+    if (mouse_present()) {
+        /* How many reports have actually arrived, because "present" only
+           means the handshake worked. A pointer whose line is not delivered
+           looks exactly like a working one from every other angle, and this
+           is the number that tells the two apart: move a finger and run it
+           again. */
+        print("The pointer is working. Reports so far: ");
+        print_dec((boot_uint64_t)mouse_movements());
+        print_line("");
+        return;
+    }
+    if (mouse_restart()) print_line("Pointer found.");
+    else print_line("No pointer. There may not be one, or it is not PS/2.");
+}
+
 static void command_mode(void) {
     print("CON: ");
     print_dec(console_columns());
@@ -5437,6 +5642,43 @@ int command_execute_line(const char* line) {
     return last_exit_code;
 }
 
+/* \CON\CON.
+ *
+ * On Windows 95 and 98, naming this crashed the machine outright, and the
+ * reason was real rather than a joke: CON was a device name the file system
+ * honoured in every directory, and asking it to open the console inside the
+ * console was a path the code had no answer for. It cost Microsoft a patch and
+ * a great deal of laughter, and a generation of people typed it into other
+ * people's computers.
+ *
+ * Here it is deliberate, and it is the only way to see the halt screen without
+ * waiting for a bug to show it to you. That is worth being able to do on
+ * purpose: a machine whose failure screen has never been looked at is a
+ * machine whose failure screen is untested.
+ *
+ * `ud2` rather than a call to panic(): an instruction the processor refuses is
+ * a genuine exception through the genuine handler, with a real vector and real
+ * registers. A pretty picture printed by a function that decided to print it
+ * would prove nothing about what happens when something actually goes wrong.
+ *
+ * Only the shell knows this name, unlike the original, where any program that
+ * opened the path fell over. There is one place here that turns a typed line
+ * into an action, and this is it. */
+static int is_con_con(const char* input) {
+    const char* at = input;
+
+    if (at[0] && at[1] == ':') at += 2;          /* a drive letter, as DOS wrote it */
+    while (*at == '\\') at++;
+    if (!prefix_matches(at, "CON")) return 0;
+    at += 3;
+    if (*at != '\\') return 0;
+    at++;
+    if (!prefix_matches(at, "CON")) return 0;
+    at += 3;
+    while (*at == ' ' || *at == '\t' || *at == '\r') at++;
+    return *at == 0;
+}
+
 static void execute(const char* input) {
     char expanded[INPUT_MAX];
     ARGUMENTS arguments;
@@ -5657,6 +5899,8 @@ static void execute(const char* input) {
     if (word_is(input, "XCOPY")) { command_xcopy(&arguments); return; }
     if (word_is(input, "LABEL")) { command_label(&arguments); return; }
     if (word_is(input, "MODE")) { command_mode(); return; }
+    if (word_is(input, "MOUSE")) { command_mouse(); return; }
+    if (word_is(input, "RING3")) { command_ring3(&arguments); return; }
     if (word_is(input, "GOTO")) { command_goto(&arguments); return; }
     if (word_is(input, "IF")) { command_if(arguments.tail); return; }
     if (word_is(input, "SHIFT")) {
@@ -5696,6 +5940,11 @@ static void execute(const char* input) {
     if (word_is(input, "MORE")) { command_more(&arguments); return; }
     if (word_is(input, "TREE")) { command_tree(&arguments); return; }
     if (word_is(input, "ATTRIB")) { command_attrib(&arguments); return; }
+
+    if (is_con_con(input)) {
+        console_write("\n");
+        __asm__ volatile ("ud2");
+    }
 
     if (try_program(input, &arguments)) return;
 

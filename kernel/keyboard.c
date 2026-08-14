@@ -1,4 +1,5 @@
 #include "keyboard.h"
+#include "mouse.h"
 #include "layout.h"
 #include "serial.h"
 #include "acpi.h"
@@ -18,6 +19,10 @@
 
 #define STATUS_OUTPUT_FULL 0x01U
 #define STATUS_INPUT_FULL 0x02U
+/* Set when the byte waiting came from the second port - the mouse. The two
+   devices share one data port and one output buffer, so every read has to ask
+   whose byte this is. */
+#define STATUS_FROM_AUX 0x20U
 
 #define COMMAND_READ_CONFIG 0x20U
 #define COMMAND_WRITE_CONFIG 0x60U
@@ -146,12 +151,26 @@ static void controller_write_data(boot_uint8_t value) {
     outb(PS2_DATA, value);
 }
 
+/* Wait for a byte from the keyboard's side of the controller.
+ *
+ * A byte from the mouse is read and given to the mouse driver rather than
+ * returned as an answer. A touchpad that the firmware has already set
+ * streaming - which is what touching one before the system starts does - fills
+ * this buffer with movement, and reading the first byte that appears as the
+ * keyboard's reply means the reply is a coordinate. Every handshake below then
+ * fails, and the machine starts with no keyboard on a laptop whose keyboard is
+ * fine. */
 static int controller_read_data(boot_uint8_t* value) {
     for (int spin = 0; spin < 100000; spin++) {
-        if (inb(PS2_STATUS) & STATUS_OUTPUT_FULL) {
-            *value = inb(PS2_DATA);
-            return 1;
+        boot_uint8_t status = inb(PS2_STATUS);
+
+        if (!(status & STATUS_OUTPUT_FULL)) continue;
+        if (status & STATUS_FROM_AUX) {
+            mouse_from_controller(inb(PS2_DATA));
+            continue;
         }
+        *value = inb(PS2_DATA);
+        return 1;
     }
     return 0;
 }
@@ -280,12 +299,56 @@ static void handle_scancode(boot_uint8_t code) {
     keyboard_submit((int)(unsigned char)character);
 }
 
+/* A byte the controller says came from the first port, read by somebody else.
+   The pointer's interrupt hands keystrokes over this way, for the same reason
+   this one hands it movement: one buffer, two devices, and whoever reads a
+   byte owes it to its owner. */
+void keyboard_from_controller(boot_uint8_t value) {
+    handle_scancode(value);
+}
+
+/* Take whatever the controller is holding, whoever it belongs to.
+ *
+ * The 8042 has one byte of output buffer and will not deliver another - or
+ * raise another interrupt - until that byte is read. So a handler that finds
+ * the other device's byte and declines it does not merely skip a keystroke:
+ * it stops the controller. Both devices then go quiet, having each delivered
+ * a handful of events first, which is exactly what a touchpad and a keyboard
+ * both dying a moment after startup looks like.
+ *
+ * Called from both interrupts and from the keyboard's own polling, so a byte
+ * that arrives when no interrupt does - which is what a lost interrupt is -
+ * costs a few milliseconds rather than the machine's input. */
+void ps2_drain(void) {
+    /* Nothing before the controller has been set up: reading port 0x60 on a
+       machine that has no 8042 gives 0xFF for ever, and feeding that to the
+       scancode decoder would invent keystrokes on exactly the machines that
+       have no keyboard to press. */
+    if (!keyboard_present) return;
+
+    for (int spin = 0; spin < 64; spin++) {
+        boot_uint8_t status = inb(PS2_STATUS);
+
+        if (!(status & STATUS_OUTPUT_FULL)) return;
+        if (status & STATUS_FROM_AUX) mouse_from_controller(inb(PS2_DATA));
+        else handle_scancode(inb(PS2_DATA));
+    }
+}
+
 static void keyboard_interrupt(INTERRUPT_FRAME* frame) {
     (void)frame;
     /* Drain: one interrupt can cover several bytes, and a byte left in the
-       output buffer stops the controller raising IRQ1 again. */
-    while (inb(PS2_STATUS) & STATUS_OUTPUT_FULL)
-        handle_scancode(inb(PS2_DATA));
+       output buffer stops the controller raising IRQ1 again.
+     *
+     * Whose byte it is has to be asked every time. This loop used to take
+     * whatever was there and read it as a scancode, and with a touchpad
+     * streaming that meant the mouse's packets arriving here instead: the
+     * pointer stopped moving, because its bytes were being eaten, and the
+     * keyboard filled with keys nobody pressed - a movement byte with bit 7
+     * set reads as a release, and one that happens to be 0x1D reads as
+     * Control going down and staying there. Both devices dead, from one
+     * missing test. */
+    ps2_drain();
 }
 
 /* Read bytes until one of them is `wanted`, or patience runs out.
@@ -351,7 +414,9 @@ int keyboard_init(void) {
     controller_command(COMMAND_DISABLE_PORT1);
     controller_command(COMMAND_DISABLE_PORT2);
 
-    /* Discard anything the firmware left in the output buffer. */
+    /* Discard anything the firmware left in the output buffer - from either
+       device, since both ports are disabled above and nothing more is coming
+       from either until they are enabled again. */
     while (inb(PS2_STATUS) & STATUS_OUTPUT_FULL) (void)inb(PS2_DATA);
 
     controller_command(COMMAND_SELF_TEST);
@@ -400,6 +465,13 @@ int keyboard_init(void) {
  * stuck machine. So the flag waits for a moment the kernel chooses. */
 static int break_requested;
 
+/* Whether Ctrl+C stops the running program. On by default and put back on by
+   the kernel when a program exits - see command.c, which does the same for
+   the keyboard layout and for the screen. */
+static int break_enabled = 1;
+
+void keyboard_break_enable(int enabled) { break_enabled = enabled != 0; }
+
 int keyboard_break_taken(void) {
     int asked = break_requested;
     break_requested = 0;
@@ -431,8 +503,16 @@ void keyboard_submit(int key) {
     /* ETX, which is what Ctrl+C has produced since teletypes. It is not put
        into the buffer as well: a program that is being stopped has no use for
        the character, and one that is not being stopped never sees a Ctrl+C
-       that meant anything else. */
-    if (key == 3) {
+       that meant anything else.
+     *
+     * Unless the program has said it would rather not be stopped. A desktop
+     * is a program by every measure this kernel uses, so Ctrl+C killed Mizu -
+     * and losing your session to a keystroke that means "stop this command" is
+     * not a thing anybody expects from a desktop. A program that asks keeps
+     * the keystroke as an ordinary character and decides for itself; the
+     * kernel puts the rule back the moment it exits, so asking is not a way
+     * to leave the machine unstoppable. */
+    if (key == 3 && break_enabled) {
         break_requested = 1;
         return;
     }
@@ -473,6 +553,11 @@ int keyboard_poll(void) {
 
 int keyboard_pending(void) {
     if (usb_present()) xhci_poll();
+    /* And anything the 8042 is holding that no interrupt arrived for. On a
+       machine where the two devices interleave heavily this is the difference
+       between input that stops for good and input that stutters for a
+       millisecond. */
+    if (keyboard_present) ps2_drain();
     return buffer_tail != buffer_head;
 }
 

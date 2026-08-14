@@ -112,6 +112,16 @@ typedef struct {
  * a screen the caller is about to take back. */
 #define KOI_EXIT_NOT_FOUND 127
 
+/* And the one for a program the processor stopped: it read memory that is not
+ * its own, or executed something that is not an instruction. 139 is what unix
+ * reports for the same thing - 128 plus the signal a segmentation fault
+ * raises - and is borrowed for the same reason as the two above.
+ *
+ * A program can only be given this if it is running somewhere the processor
+ * can catch it, which is ring 3. At ring 0 the same mistake is a halted
+ * machine, and that is the difference the ring buys. */
+#define KOI_EXIT_FAULT 139
+
 /* Console and process. */
 #define SYS_EXIT 0x00        /* (code) - does not return */
 #define SYS_PUTCHAR 0x01     /* (character) */
@@ -422,6 +432,14 @@ typedef struct {
    back, which is why it is a call and not a loop in the caller: a program
    doing it itself would need two calls per pixel. */
 #define SYS_GFX_DIM 0x3E           /* (point, size, keep) */
+/* (point, size, pixels, stride in pixels). A rectangle of ready-made pixels,
+ * copied in one call.
+ *
+ * The kernel has had this since there was a framebuffer and no program could
+ * reach it, so anything with an image drew it a pixel at a time - two hundred
+ * thousand system calls for one photograph, which is not slow, it is stopped.
+ * An image viewer is the first program to need it and the reason it is here. */
+#define SYS_GFX_BLIT 0x3F          /* (point, size, pixels, stride) */
 
 #define KOI_TEXT_BOLD 1
 #define KOI_TEXT_ITALIC 2
@@ -597,6 +615,74 @@ typedef struct {
  * turns it off again when the program exits, so forgetting to is not a way to
  * leave the machine odd. */
 #define SYS_LAYOUT_GESTURE 0x5C  /* (enabled) -> 0 */
+
+/* ---- Loadable code -------------------------------------------------------
+ *
+ * Load a program image into memory, fix up its addresses, and hand back where
+ * its entry point landed - without entering it. That last clause is the whole
+ * of what is new here: everything else already existed for SYS_RUN.
+ *
+ * It is what lets a program have applications rather than merely run other
+ * programs. The caller loads a module, calls its entry like any other
+ * function, and gets back a pointer to whatever the module wants to offer -
+ * so the two are in memory at the same time, sharing a screen, and the caller
+ * decides when each of them runs. That is what Windows 3.0 was, and what a
+ * VxD's service table was; it is not multitasking and does not pretend to be.
+ *
+ * The image is an ordinary Koi-DOS program file: position-independent, with
+ * the same header, checked against the same interface version. What differs
+ * is only that its entry point takes and returns whatever the loading program
+ * says it does - the kernel neither knows nor cares, which is why one call
+ * covers every such arrangement.
+ *
+ * There is no memory protection here and a module is not a process: it runs on
+ * the caller's stack, in ring 0, and can do anything the caller can. This is
+ * the same bargain DOS made with a TSR and Windows made with a DLL.
+ *
+ * SYS_LOAD fills a KOI_MODULE and returns 0, or returns -1 with the reason
+ * printed. SYS_UNLOAD takes the `base` it was given and frees the memory; a
+ * base this did not hand out is refused rather than freed. */
+/* Run a command line and collect what it printed, instead of letting it print.
+ *
+ * SYS_RUN hands the screen to whatever it starts. This does not: the console's
+ * output is diverted into the caller's buffer for the length of the command,
+ * so a program holding the framebuffer - a desktop, say - can run `dir` and
+ * put the answer in a window without the screen flickering out from under it.
+ *
+ * The mechanism already existed for `>` and `|`, which are the same question
+ * asked by the shell instead of by a program. What is new is a program being
+ * allowed to ask it.
+ *
+ * Returns the number of bytes collected, and terminates them with a zero. The
+ * caller is stopped for as long as the command takes: a command that waits for
+ * a key waits forever here, because the keyboard is not being read. Console
+ * output only - a program that draws will find the screen already taken and
+ * should be started with SYS_RUN instead. */
+#define SYS_CAPTURE 0x5F     /* (line, buffer, size) -> bytes, or -1 */
+
+/* Whether Ctrl+C stops this program.
+ *
+ * On for everything, which is right for a command: Ctrl+C is how a person
+ * stops one that is taking too long, and a program that ignored it would be a
+ * program somebody has to reboot the machine to get rid of.
+ *
+ * A program that draws is the exception. A desktop is a program by every
+ * measure this kernel has, so Ctrl+C ended the session, closed every window
+ * and dropped somebody back at the prompt - a keystroke that means "stop this
+ * command" is not what anybody expects to lose their desktop to. Asking for 0
+ * turns the keystroke back into an ordinary character, which the program can
+ * read and act on however it likes. The kernel turns it back on when the
+ * program exits, so this cannot leave a machine that will not stop. */
+#define SYS_BREAK 0x60       /* (enabled) -> 0 */
+
+#define SYS_LOAD 0x5D        /* (path, KOI_MODULE*) -> 0, or -1 */
+#define SYS_UNLOAD 0x5E      /* (base) -> 0, or -1 */
+
+typedef struct {
+    unsigned long long base;   /* where it was put */
+    unsigned long long size;   /* how much memory it was given */
+    unsigned long long entry;  /* its entry point, ready to be called */
+} KOI_MODULE;
 
 #define SYS_GETENV 0x5A      /* (name, buffer, size) -> length, or 0 */
 #define SYS_ENVAT 0x5B       /* (index, name, size) -> length, or 0 */

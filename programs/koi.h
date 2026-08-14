@@ -408,6 +408,15 @@ static inline void koi_gfx_fill(int x, int y, int width, int height,
                    (long)color);
 }
 
+/* A rectangle of pixels you already have, copied in one call. `stride` is how
+   many pixels one row of the source is, which is not always its width - a crop
+   out of a larger image is the usual case. */
+static inline void koi_gfx_blit(int x, int y, int width, int height,
+                                const koi_uint32* pixels, int stride) {
+    (void)koi_call4(SYS_GFX_BLIT, KOI_POINT(x, y), KOI_POINT(width, height),
+                    (long)pixels, (long)stride);
+}
+
 /* Darken what is already drawn in this rectangle. `keep` is how much of the
    light survives out of 256, so 128 halves it and 0 goes to black. This is
    what puts a modal dialogue in front of a screen rather than merely on top
@@ -459,6 +468,52 @@ static inline void koi_gfx_reset_scissor(void) {
  * its window torn down to do it. */
 static inline int koi_run(const char* command) {
     return (int)koi_call(SYS_RUN, (long)command, 0, 0);
+}
+
+/* Whether Ctrl+C stops this program. On for everything by default; a program
+   that draws - a desktop, a game - turns it off and reads the character
+   itself. The kernel turns it back on when the program exits. */
+static inline void koi_break(int enabled) {
+    (void)koi_call(SYS_BREAK, enabled, 0, 0);
+}
+
+/* Run a command line and collect what it printed instead of letting it print.
+ *
+ * For a program that is holding the screen and wants an answer rather than a
+ * flicker: a desktop running `dir` and putting the result in a window. The
+ * caller is stopped until the command finishes, and a command that waits for
+ * a key waits forever - nothing is reading the keyboard for it. Returns the
+ * number of bytes, with a zero after them. */
+static inline long koi_capture(const char* line, char* buffer, long size) {
+    return koi_call(SYS_CAPTURE, (long)line, (long)buffer, size);
+}
+
+/* Load a module and get its entry point back, without entering it.
+ *
+ * The image is an ordinary program file built with `koicc -m`; what its entry
+ * takes and returns is between the caller and the module, and the kernel has
+ * no opinion. See SYS_LOAD in syscall.h. Returns 0, or -1 with the reason
+ * already printed.
+ *
+ * The usual shape:
+ *
+ *     KOI_MODULE module;
+ *     if (koi_load(path, &module) == 0) {
+ *         MY_APP* (*entry)(const MY_API*) = (MY_APP* (*)(const MY_API*))
+ *                                           (unsigned long)module.entry;
+ *         app = entry(&api);
+ *     }
+ *
+ * The cast is unavoidable and is the price of one call covering every kind of
+ * module rather than one call per kind. */
+static inline int koi_load(const char* path, KOI_MODULE* module) {
+    return (int)koi_call(SYS_LOAD, (long)path, (long)module, 0);
+}
+
+/* Give a module's memory back. `base` is the one koi_load filled in - an
+   address it did not hand out is refused rather than freed. */
+static inline int koi_unload(unsigned long long base) {
+    return (int)koi_call(SYS_UNLOAD, (long)base, 0, 0);
 }
 
 /* ---- Running something else ----------------------------------------------

@@ -7,7 +7,28 @@
    gate, so the GDT has to be installed before the IDT. */
 #define KERNEL_CODE_SELECTOR 0x08
 #define KERNEL_DATA_SELECTOR 0x10
-#define TSS_SELECTOR 0x18
+/* Ring 3's own segments. The requested privilege level is part of the
+   selector, which is why these end in 3 - a selector for ring 3 is not the
+   same number as the entry it points at. */
+#define USER_CODE_SELECTOR 0x1B      /* entry 3, RPL 3 */
+#define USER_DATA_SELECTOR 0x23      /* entry 4, RPL 3 */
+#define TSS_SELECTOR 0x28            /* entries 5 and 6 */
+
+/* The stack interrupts arrive on when they arrive from ring 3. Nothing may be
+   trusted about the stack an application was using, so the processor is given
+   one of the kernel's own to switch to - that is what TSS.RSP0 is for, and it
+   is the whole reason the TSS still exists in long mode. */
+#define KERNEL_INTERRUPT_STACK_PAGES 4
+
+/* Leave ring 0 and run `entry` at ring 3 with `stack` as its stack. Does not
+   return: the only ways back are a system call, a fault, or the program
+   exiting - all of which arrive as interrupts. */
+__attribute__((noreturn)) void cpu_enter_user(boot_uint64_t entry,
+                                              boot_uint64_t stack);
+
+/* Where interrupts from ring 3 will find a kernel stack. Set before anything
+   is entered at ring 3, and again whenever that stack changes. */
+void cpu_set_kernel_stack(boot_uint64_t top);
 
 /* Interrupt stack table slot used for the double-fault handler. */
 #define IST_DOUBLE_FAULT 1

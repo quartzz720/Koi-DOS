@@ -54,6 +54,17 @@ int keyboard_break_taken(void);
  * Immediate, as it was in DOS. It is the way out when something has stopped
  * answering, and a way out that asks a question is no way out at all - the
  * program that would have to draw the question is the one that has stopped. */
+/* Whether Ctrl+C stops the running program, for a program that would rather
+   be told about it than killed by it - a desktop, a game, an editor with
+   unsaved work. Backs SYS_BREAK. The kernel turns it back on when the program
+   exits. */
+void keyboard_break_enable(int enabled);
+
+/* A byte the controller says came from the first port, read by somebody else,
+   and the shared drain both drivers use. See keyboard.c. */
+void keyboard_from_controller(boot_uint8_t value);
+void ps2_drain(void);
+
 void keyboard_attention(int control_down, int alt_down, int key);
 
 /* Forget any press that has not been acted on. Called before a program starts,

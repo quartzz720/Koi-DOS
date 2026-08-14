@@ -64,7 +64,20 @@ static const char* phrases[SAY_COUNT][LANGUAGE_COUNT] = {
                                "Πληκτρολογήστε μια εντολή για εκτέλεση:" },
     /* SAY_RUN_FAILED     */ { "There is no such command.",
                                "Такой команды нет.", "Такої команди немає.",
-                               "Δεν υπάρχει τέτοια εντολή." }
+                               "Δεν υπάρχει τέτοια εντολή." },
+    /* SAY_NO_APPLICATION */ { "That application could not be loaded.",
+                               "Не удалось загрузить приложение.",
+                               "Не вдалося завантажити застосунок.",
+                               "Δεν φορτώθηκε αυτή η εφαρμογή." },
+    /* SAY_FILES          */ { "Files", "Файлы", "Файли", "Αρχεία" },
+    /* SAY_LANGUAGE       */ { "Language", "Язык", "Мова", "Γλώσσα" },
+    /* SAY_SOUND          */ { "Sound", "Звук", "Звук", "Ήχος" },
+    /* SAY_CONSOLE_COLOURS*/ { "Console colours", "Цвета консоли",
+                               "Кольори консолі", "Χρώματα κονσόλας" },
+    /* SAY_KEPT_AT_ONCE   */ { "Every change is kept the moment it is made.",
+                               "Каждое изменение сохраняется сразу.",
+                               "Кожна зміна зберігається одразу.",
+                               "Κάθε αλλαγή αποθηκεύεται αμέσως." }
 };
 
 /* The table above is indexed by the enum in language.h, so the two orders have

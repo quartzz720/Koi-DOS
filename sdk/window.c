@@ -1307,18 +1307,72 @@ static int take_menu_click(int x, int y) {
     return 0;
 }
 
-int window_next(WINDOW_EVENT* event) {
-    static KOI_POINTER pointer;
-    static unsigned int last_press;
-    static int started;
-    static koi_uint64 last_tick;
-    static koi_uint64 last_click_at;
-    static int last_click_x = -100;
-    static int last_click_y = -100;
+/* ---- One pass of the loop -------------------------------------------------
+ *
+ * window_next used to be the loop itself. It is now a loop around this, which
+ * does one pass and says whether anything came of it, because a second caller
+ * needs the same pass: window_yield. An application in the middle of a long
+ * piece of work calls that, and the desktop underneath keeps its clock
+ * ticking and its windows draggable while the work goes on.
+ *
+ * Cooperative, and that word is the whole of the bargain: nothing takes the
+ * processor away from an application. One that never yields freezes
+ * everything, and that is the trade until there is memory protection to make
+ * preemption safe. Windows 3.0 made it for the same reason and lived on it
+ * for five years.
+ *
+ * An event this pass produces for the desktop - a menu choice, a close box -
+ * cannot be returned to a yielding application, which is not the code that
+ * knows what to do with it. It goes in a queue and window_next takes it from
+ * there. That queue is the message queue the plan asked for; it earned its
+ * place by being needed rather than by being on a list. */
+static KOI_POINTER pointer;
+static unsigned int last_press;
+static int started;
+static koi_uint64 last_click_at;
+static int last_click_x = -100;
+static int last_click_y = -100;
+/* How deep the loop is running inside itself.
+ *
+ * Yielding happens from inside a handler - a menu choice that starts a long
+ * piece of work is the whole case this exists for - so a pass inside a pass is
+ * the normal thing and cannot be forbidden. What must not happen is a window
+ * being handed input while it is already inside one of its own handlers, and
+ * `busy` on the window is what stops that. This only stops the nesting running
+ * away: four deep is more than anything sane does, and past that a yield does
+ * nothing rather than eating the stack. */
+static int pump_depth;
+#define PUMP_DEPTH_MAX 4
 
-    event->type = WINDOW_EVENT_NONE;
-    event->window = (WINDOW*)0;
-    event->id = 0;
+#define PENDING_MAX 8
+static WINDOW_EVENT pending[PENDING_MAX];
+static int pending_count;
+
+static void remember_event(const WINDOW_EVENT* event) {
+    if (pending_count >= PENDING_MAX) return;   /* dropped, and better than lost order */
+    pending[pending_count++] = *event;
+}
+
+/* Call one of a window's handlers with it marked busy.
+ *
+ * A handler that yields runs the loop again, and the loop would happily hand
+ * the same window another keystroke - so it would be inside two of its own
+ * handlers at once, with one buffer and two ideas of where the caret is. This
+ * is where Windows 3.x let programs hurt themselves; input for a window
+ * already in a handler is dropped instead. */
+static int busy_enter(WINDOW* window) {
+    if (!window || window->busy) return 0;
+    window->busy = 1;
+    return 1;
+}
+
+static void busy_leave(WINDOW* window) {
+    if (window) window->busy = 0;
+}
+
+static int pump(WINDOW_EVENT* event) {
+    int previous_x = pointer.x;
+    int previous_y = pointer.y;
 
     if (!started) {
         koi_mouse(&pointer);
@@ -1326,30 +1380,31 @@ int window_next(WINDOW_EVENT* event) {
         started = 1;
     }
 
-    while (running) {
-        int previous_x = pointer.x;
-        int previous_y = pointer.y;
-
+    {
         if (dirty) { draw_everything(); cursor_show(pointer.x, pointer.y); }
 
         koi_sleep(10);
 
-        /* Anything that changes on its own gets its repaint here. The shortest
-           interval any open window asked for wins, and a desktop where nothing
-           asked for one never wakes up at all. */
+        /* Anything that changes on its own gets its turn here, each window on
+           its own clock rather than all of them on the shortest one. `tick`
+           is what makes this a timer rather than a repaint: a window that has
+           something to advance does it here, whether or not it is in front,
+           and whether or not anybody is touching the machine. */
         {
             koi_uint64 now = koi_uptime();
-            int soonest = 0;
 
             for (int index = 0; index < order_count; index++) {
-                int wanted = order[index]->repaint_ms;
-                if (order[index]->minimised || wanted <= 0) continue;
-                if (!soonest || wanted < soonest) soonest = wanted;
-            }
-            if (soonest && now - last_tick >= (koi_uint64)soonest) {
-                last_tick = now;
+                WINDOW* window = order[index];
+
+                if (window->minimised || window->repaint_ms <= 0) continue;
+                if (now - window->ticked < (koi_uint64)window->repaint_ms)
+                    continue;
+                window->ticked = now;
+                if (window->tick && busy_enter(window)) {
+                    window->tick(window);
+                    busy_leave(window);
+                }
                 dirty = 1;
-                continue;
             }
         }
 
@@ -1361,7 +1416,7 @@ int window_next(WINDOW_EVENT* event) {
                 menu_open = -1;
                 menu_owner = (WINDOW*)0;
                 dirty = 1;
-                continue;
+                return 0;
             }
             /* Ctrl+Escape reaches the taskbar button wherever the keyboard
                was pointing, and is not offered to the window in front - which
@@ -1369,13 +1424,19 @@ int window_next(WINDOW_EVENT* event) {
                that only a pointer can reach is one somebody cannot use when
                the pointer is the thing that has stopped. */
             if (key == KOI_KEY_MENU) {
-                if (!launcher_label[0]) continue;
+                if (!launcher_label[0]) return 0;
                 event->type = WINDOW_EVENT_LAUNCHER;
                 event->window = (WINDOW*)0;
                 event->id = 0;
                 return 1;
             }
-            if (top && top->key) { top->key(top, key); continue; }
+            if (top && top->key) {
+                if (busy_enter(top)) {
+                    top->key(top, key);
+                    busy_leave(top);
+                }
+                return 0;
+            }
             event->type = WINDOW_EVENT_KEY;
             event->window = top;
             event->id = key;
@@ -1402,7 +1463,7 @@ int window_next(WINDOW_EVENT* event) {
                     }
                     dirty = 1;
                 }
-                continue;
+                return 0;
             }
             dragging = 0;
             sizing = 0;
@@ -1452,7 +1513,7 @@ int window_next(WINDOW_EVENT* event) {
                 event->id = taken & 0xFFFF;
                 return 1;
             }
-            if (taken) continue;
+            if (taken) return 0;
 
             {
                 int slot = taskbar_hit(x, y);
@@ -1465,12 +1526,12 @@ int window_next(WINDOW_EVENT* event) {
                     window->minimised = 0;
                     window_raise(window);
                     dirty = 1;
-                    continue;
+                    return 0;
                 }
             }
 
             hit = window_at(x, y);
-            if (!hit) continue;
+            if (!hit) return 0;
             window_raise(hit);
 
             /* The title bar: its buttons, then dragging with what is left. */
@@ -1479,7 +1540,7 @@ int window_next(WINDOW_EVENT* event) {
                 if (x < hit->x + WINDOW_BORDER + 22) {
                     hit->minimised = 1;
                     dirty = 1;
-                    continue;
+                    return 0;
                 }
                 if (x >= hit->x + hit->width - WINDOW_BORDER - 20) {
                     event->type = WINDOW_EVENT_CLOSE;
@@ -1496,12 +1557,12 @@ int window_next(WINDOW_EVENT* event) {
                         order[index] = order[index - 1];
                     order[0] = hit;
                     dirty = 1;
-                    continue;
+                    return 0;
                 }
                 dragging = 1;
                 drag_x = x - hit->x;
                 drag_y = y - hit->y;
-                continue;
+                return 0;
             }
 
             /* The corner, before the contents: a click there is a grab and
@@ -1511,23 +1572,70 @@ int window_next(WINDOW_EVENT* event) {
                 sizing = 1;
                 drag_x = hit->x + hit->width - x;
                 drag_y = hit->y + hit->height - y;
-                continue;
+                return 0;
             }
 
             {
                 int client_x, client_y, client_w, client_h;
                 window_client(hit, &client_x, &client_y, &client_w, &client_h);
                 if (hit->click && x >= client_x && x < client_x + client_w &&
-                    y >= client_y && y < client_y + client_h)
+                    y >= client_y && y < client_y + client_h &&
+                    busy_enter(hit)) {
                     hit->click(hit, x - client_x, y - client_y, (int)clicks);
+                    busy_leave(hit);
+                }
             }
-            continue;
+            return 0;
         }
 
         if (pointer.x != previous_x || pointer.y != previous_y) {
             cursor_hide();
             cursor_show(pointer.x, pointer.y);
         }
+    }
+    return 0;
+}
+
+/* Let the desktop breathe in the middle of something long.
+ *
+ * One pass, and anything meant for the desktop is put by for window_next.
+ * Nested calls do nothing at all: a handler reached from a pass has already
+ * been given its turn, and a pass inside a pass is where the reentrancy bugs
+ * that made cooperative multitasking notorious come from. */
+void window_yield(void) {
+    WINDOW_EVENT event;
+
+    if (!running || pump_depth >= PUMP_DEPTH_MAX) return;
+    pump_depth++;
+    event.type = WINDOW_EVENT_NONE;
+    event.window = (WINDOW*)0;
+    event.id = 0;
+    if (pump(&event) && event.type != WINDOW_EVENT_NONE) remember_event(&event);
+    pump_depth--;
+}
+
+int window_next(WINDOW_EVENT* event) {
+    event->type = WINDOW_EVENT_NONE;
+    event->window = (WINDOW*)0;
+    event->id = 0;
+
+    while (running) {
+        /* Whatever happened while somebody was yielding, in the order it
+           happened, before anything new. */
+        if (pending_count) {
+            *event = pending[0];
+            for (int index = 1; index < pending_count; index++)
+                pending[index - 1] = pending[index];
+            pending_count--;
+            return 1;
+        }
+        pump_depth++;
+        if (pump(event)) {
+            pump_depth--;
+            if (event->type != WINDOW_EVENT_NONE) return 1;
+            continue;
+        }
+        pump_depth--;
     }
 
     event->type = WINDOW_EVENT_QUIT;

@@ -2,6 +2,8 @@
 #include "keyboard.h"
 #include "fat32.h"
 #include "memory.h"
+#include "paging.h"
+#include "cpu.h"
 #include "string.h"
 #include "heap.h"
 #include "../include/elf.h"
@@ -188,7 +190,7 @@ static boot_uint8_t* read_program(VOLUME* volume, const char* path,
  * A program with no such table has no relocations at all, which is why the
  * first one tried came out empty and looked as though this had not worked. */
 static int relocate(const boot_uint8_t* contents, boot_uint32_t length,
-                    boot_uint64_t base) {
+                    boot_uint64_t base, boot_uint64_t limit) {
     const ELF64_HEADER* header = (const ELF64_HEADER*)contents;
     const ELF64_PROGRAM_HEADER* segments =
         (const ELF64_PROGRAM_HEADER*)(contents + header->e_phoff);
@@ -229,7 +231,7 @@ static int relocate(const boot_uint8_t* contents, boot_uint32_t length,
         /* The same bounds the segments were checked against. A relocation is a
            write to an address a file chose, and there is no memory protection
            behind this. */
-        if (where < base || where + 8 > base + PROGRAM_SLOT_SIZE) return 0;
+        if (where < base || where + 8 > base + limit) return 0;
         *(boot_uint64_t*)(unsigned long long)where =
             base + (boot_uint64_t)item->r_addend;
     }
@@ -243,8 +245,8 @@ static int relocate(const boot_uint8_t* contents, boot_uint32_t length,
  * whose flags had drifted, and a text file somebody typed the name of. Four
  * different mornings, one sentence. */
 static int load_segments(const boot_uint8_t* contents, boot_uint32_t length,
-                         boot_uint64_t base, boot_uint64_t* entry_point,
-                         const char** reason) {
+                         boot_uint64_t base, boot_uint64_t limit,
+                         boot_uint64_t* entry_point, const char** reason) {
     const ELF64_HEADER* header = (const ELF64_HEADER*)contents;
     const ELF64_PROGRAM_HEADER* segments;
 
@@ -294,8 +296,7 @@ static int load_segments(const boot_uint8_t* contents, boot_uint32_t length,
         /* Refusing anything outside the program window is what keeps a
            malformed or hostile file from writing over the kernel: there is no
            memory protection to fall back on. */
-        if (segment->p_vaddr + segment->p_memsz >
-            PROGRAM_SLOT_SIZE - PROGRAM_STACK_SIZE) {
+        if (segment->p_vaddr + segment->p_memsz > limit) {
             *reason = "too large for the memory a program is given";
             return 0;
         }
@@ -313,8 +314,8 @@ static int load_segments(const boot_uint8_t* contents, boot_uint32_t length,
                    contents + segment->p_offset, (boot_uint64_t)segment->p_filesz);
     }
 
-    if (header->e_entry >= PROGRAM_SLOT_SIZE) return 0;
-    if (!relocate(contents, length, base)) {
+    if (header->e_entry >= limit) return 0;
+    if (!relocate(contents, length, base, limit)) {
         *reason = "it needs a kind of relocation this loader does not do";
         return 0;
     }
@@ -374,6 +375,136 @@ __attribute__((noreturn)) static void enter_program(boot_uint64_t entry_point,
     __builtin_unreachable();
 }
 
+/* ---- Modules -------------------------------------------------------------
+ *
+ * The same loader, stopping one step short: segments copied, relocations
+ * applied, interface checked - and then the entry point handed back instead
+ * of jumped to. Everything above already did all of that; what is new is not
+ * finishing.
+ *
+ * A module is not given a program slot. Slots are for programs that are
+ * running, and the loading program is itself in one - so a module in the next
+ * slot would be overwritten by the first thing that program ran, which is
+ * exactly what a desktop does all day. Pages are asked for instead, sized to
+ * the image, which a position-independent file does not mind in the least.
+ *
+ * They are recorded so that unloading can refuse a pointer this never handed
+ * out. Freeing an address a program invented would hand the page allocator
+ * memory belonging to somebody else, and nothing would notice until it was
+ * handed out twice. */
+#define MODULE_MAX 8
+
+typedef struct {
+    boot_uint64_t base;
+    boot_uint64_t pages;
+} MODULE;
+
+static MODULE modules[MODULE_MAX];
+
+/* How much memory an image needs: the highest address any segment reaches,
+   rounded up to whole pages. .bss is included - p_memsz, not p_filesz - which
+   is the one thing a loader that reads only the file's own size gets wrong,
+   and gets wrong silently. */
+static boot_uint64_t image_span(const boot_uint8_t* contents,
+                                boot_uint32_t length) {
+    const ELF64_HEADER* header = (const ELF64_HEADER*)contents;
+    const ELF64_PROGRAM_HEADER* segments;
+    boot_uint64_t span = 0;
+
+    if (length < sizeof(ELF64_HEADER)) return 0;
+    if (header->e_phoff > length ||
+        (boot_uint64_t)header->e_phnum * sizeof(ELF64_PROGRAM_HEADER) >
+            length - header->e_phoff) return 0;
+    segments = (const ELF64_PROGRAM_HEADER*)(contents + header->e_phoff);
+    for (elf_uint16_t index = 0; index < header->e_phnum; index++) {
+        const ELF64_PROGRAM_HEADER* segment = &segments[index];
+        boot_uint64_t end;
+
+        if (segment->p_type != PT_LOAD || !segment->p_memsz) continue;
+        end = segment->p_vaddr + segment->p_memsz;
+        if (end > span) span = end;
+    }
+    return span;
+}
+
+int program_load(VOLUME* volume, const char* path, boot_uint64_t* base_out,
+                 boot_uint64_t* size_out, boot_uint64_t* entry_out) {
+    boot_uint8_t* contents;
+    boot_uint32_t length = 0;
+    boot_uint64_t span, pages, base, entry_point = 0;
+    const char* reason = "the file is damaged";
+    int slot;
+
+    for (slot = 0; slot < MODULE_MAX; slot++) if (!modules[slot].base) break;
+    if (slot == MODULE_MAX) {
+        console_write("Too many modules loaded at once.\n");
+        return PROGRAM_REFUSED;
+    }
+
+    contents = read_program(volume, path, &length);
+    if (!contents) return PROGRAM_NOT_LOADABLE;
+
+    span = image_span(contents, length);
+    if (!span) { kfree(contents); return PROGRAM_REFUSED; }
+    pages = (span + PAGE_SIZE - 1) / PAGE_SIZE;
+    base = (boot_uint64_t)(unsigned long long)alloc_pages(pages);
+    if (!base) {
+        kfree(contents);
+        console_write("Not enough memory to load this module.\n");
+        return PROGRAM_REFUSED;
+    }
+
+    if (!load_segments(contents, length, base, pages * PAGE_SIZE,
+                       &entry_point, &reason) ||
+        !abi_is_acceptable(base, &reason)) {
+        kfree(contents);
+        free_pages((void*)(unsigned long long)base, pages);
+        console_write("Cannot load this module: ");
+        console_write(reason);
+        console_write(".\n");
+        serial_write("MODULE: refused - ");
+        serial_write(reason);
+        serial_write("\n");
+        return PROGRAM_REFUSED;
+    }
+    kfree(contents);
+
+    modules[slot].base = base;
+    modules[slot].pages = pages;
+    if (base_out) *base_out = base;
+    if (size_out) *size_out = pages * PAGE_SIZE;
+    if (entry_out) *entry_out = entry_point;
+    return PROGRAM_OK;
+}
+
+int program_unload(boot_uint64_t base) {
+    for (int slot = 0; slot < MODULE_MAX; slot++) {
+        if (modules[slot].base != base || !base) continue;
+        free_pages((void*)(unsigned long long)modules[slot].base,
+                   modules[slot].pages);
+        modules[slot].base = 0;
+        modules[slot].pages = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* The top of a program's stack: below the command line, aligned. */
+static boot_uint64_t program_stack_top(int slot) {
+    return (PROGRAM_SLOT_TOP(slot) - PROGRAM_ARGUMENTS_MAX) & ~15ULL;
+}
+
+/* Whether the program now starting runs at ring 3.
+ *
+ * One flag rather than a parameter threaded through everything, because the
+ * thing that needs to know is enter_program at the very bottom and the thing
+ * that decides is the shell at the very top. It is set for one program and
+ * cleared as soon as that program is entered, so it cannot leak into whatever
+ * that program runs next. */
+static int enter_at_ring3;
+
+void program_run_next_at_ring3(void) { enter_at_ring3 = 1; }
+
 int program_run(VOLUME* volume, const char* path, const char* arguments,
                 int* exit_code_out) {
     boot_uint8_t* contents;
@@ -395,7 +526,9 @@ int program_run(VOLUME* volume, const char* path, const char* arguments,
     if (!contents) return PROGRAM_NOT_LOADABLE;
     {
         const char* reason = "the file is damaged";
-        if (!load_segments(contents, length, base, &entry_point, &reason)) {
+        if (!load_segments(contents, length, base,
+                           PROGRAM_SLOT_SIZE - PROGRAM_STACK_SIZE,
+                           &entry_point, &reason)) {
             kfree(contents);
             /* Said here, where the reason is known, rather than by a caller
                that only sees a number. */
@@ -427,7 +560,31 @@ int program_run(VOLUME* volume, const char* path, const char* arguments,
     }
 
     slots[slot].base = base;
-    slots[slot].arguments = arguments ? arguments : "";
+    /* The command line goes into the program's own memory, at the top of its
+     * slot, and the pointer it is given points there.
+     *
+     * It used to point into the shell's buffer - kernel memory - and every
+     * program read it happily, because at ring 0 there is nothing to stop
+     * one. The first program run at ring 3 printed its greeting and then took
+     * a page fault on its own arguments, which is the ABI being caught
+     * handing out an address the program has no right to. DOS put the command
+     * line in the PSP, inside the program's own memory, for the same reason
+     * it needed to be somewhere the program could reach.
+     *
+     * The stack starts below it, so the two cannot meet. */
+    {
+        char* into = (char*)(unsigned long long)
+                     (PROGRAM_SLOT_TOP(slot) - PROGRAM_ARGUMENTS_MAX);
+        const char* from = arguments ? arguments : "";
+        boot_uint64_t index = 0;
+
+        while (from[index] && index < PROGRAM_ARGUMENTS_MAX - 1) {
+            into[index] = from[index];
+            index++;
+        }
+        into[index] = 0;
+        slots[slot].arguments = into;
+    }
     /* Copied rather than pointed at: the caller's buffer is a local in the
        command parser and is reused for the next line the moment this one
        finishes. */
@@ -453,5 +610,20 @@ int program_run(VOLUME* volume, const char* path, const char* arguments,
         return PROGRAM_OK;
     }
     depth = slot + 1;
-    enter_program(entry_point, PROGRAM_SLOT_TOP(slot));
+
+    if (enter_at_ring3) {
+        enter_at_ring3 = 0;
+        /* The program's own window, and nothing else in the machine. Its
+           image and its stack are both inside the slot, so one range covers
+           what it is allowed to touch; everything else - the kernel, the
+           other slots, the framebuffer - faults. */
+        if (!paging_allow_user(base, PROGRAM_SLOT_SIZE)) {
+            console_write("Cannot give this program its own memory.\n");
+            depth = slot;
+            return PROGRAM_REFUSED;
+        }
+        serial_write("PROGRAM: entering at ring 3\n");
+        cpu_enter_user(entry_point, program_stack_top(slot));
+    }
+    enter_program(entry_point, program_stack_top(slot));
 }

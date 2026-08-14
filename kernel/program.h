@@ -44,6 +44,11 @@
  * Programs are position-independent now, so a slot is only an address: the
  * loader adds the slot's base to everything the linker left relative. Four of
  * them, four megabytes each, the top 256 KiB of every one being its stack. */
+/* Room at the top of a slot for the command line the program is given. In its
+   own memory, because a program must be able to read it - which at ring 3 is
+   a rule the processor enforces. DOS called this part of the PSP. */
+#define PROGRAM_ARGUMENTS_MAX 256
+
 #define PROGRAM_SLOTS 4
 #define PROGRAM_SLOT_SIZE ((PROGRAM_LIMIT - PROGRAM_BASE) / PROGRAM_SLOTS)
 #define PROGRAM_SLOT_BASE(n) (PROGRAM_BASE + (boot_uint64_t)(n) * PROGRAM_SLOT_SIZE)
@@ -60,6 +65,32 @@ int program_depth(void);
 
 int program_run(VOLUME* volume, const char* path, const char* arguments,
                 int* exit_code);
+
+/* Run the next program at ring 3, in its own window of memory.
+ *
+ * The DOS contract is ring 0 and a flat machine, and that stays: a program
+ * typed at the prompt can read the processor's name and write to the screen,
+ * which is what programs written for this expect. This is the other contract,
+ * for code that should not be able to take the machine with it - and the test
+ * bench for the isolation Mizu's applications are going to live in. */
+void program_run_next_at_ring3(void);
+
+/* Load an image and stop there: segments copied, relocations applied, the
+ * interface version checked, and the entry point handed back rather than
+ * jumped to. Backs SYS_LOAD.
+ *
+ * The memory comes from the page allocator rather than from a program slot,
+ * because the program doing the loading is in a slot itself and the next one
+ * belongs to whatever it runs next. Returns PROGRAM_OK, PROGRAM_NOT_LOADABLE
+ * or PROGRAM_REFUSED - and, as with program_run, REFUSED means the reason has
+ * already been said out loud. */
+int program_load(VOLUME* volume, const char* path, boot_uint64_t* base,
+                 boot_uint64_t* size, boot_uint64_t* entry);
+
+/* Give a loaded module's memory back. Returns 0 for a base that was never
+   handed out, which is a refusal and not a failure: freeing an address a
+   program invented would put somebody else's pages back in the allocator. */
+int program_unload(boot_uint64_t base);
 
 /* The command line the running program was given. Backs SYS_ARGS. */
 const char* program_arguments(void);

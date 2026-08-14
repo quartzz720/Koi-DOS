@@ -1,4 +1,5 @@
 #include "timer.h"
+#include "keyboard.h"
 #include "io.h"
 
 #define PIT_FREQUENCY 1193182U
@@ -43,6 +44,24 @@ int timer_is_interrupt_driven(void) {
 
 void timer_tick(void) {
     elapsed_ticks++;
+
+    /* And a look at the keyboard controller, every tick.
+     *
+     * The 8042 hands over one byte and then waits to be asked again: until
+     * that byte is read it delivers nothing and raises no interrupt. So one
+     * interrupt that never arrives - or arrives while the buffer already
+     * holds the other device's byte - stops both the keyboard and the
+     * pointer, permanently, and nothing else in the machine will notice.
+     *
+     * A hundred times a second, whatever is stuck is taken and given to
+     * whoever it belongs to. This is not how input is meant to arrive and it
+     * is not what makes it fast; it is what makes a lost interrupt cost ten
+     * milliseconds instead of the machine. It runs during the long parts of
+     * startup as well, which is where the trouble actually starts: nothing
+     * polls the keyboard while disks and USB are being enumerated, and a
+     * touchpad that the firmware left streaming is filling the buffer the
+     * whole time. */
+    ps2_drain();
 }
 
 void timer_poll(void) {

@@ -62,6 +62,15 @@ int audio_set_params(int voice, int volume, int pan);
 
 void audio_stop(int voice);
 void audio_stop_all(void);
+
+/* Whose voices these are. A voice reads its samples out of the memory of the
+   program that started it, so the two have to end together - and a voice
+   belonging to somebody still running must not be stopped because somebody
+   else exited. `audio_set_owner` marks anything newly started; the kernel
+   calls it around a program, and `audio_stop_deeper_than` ends the voices of
+   programs that have gone. */
+void audio_set_owner(int owner);
+void audio_stop_deeper_than(int depth);
 int audio_active(int voice);
 /* Where a voice has got to and how long it is, both in source frames, and a
    way to move the first. A player with a bar needs all three and the mixer

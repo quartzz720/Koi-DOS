@@ -35,8 +35,22 @@
  * actually hold: 1500 less 20 for IP and 8 for UDP, less TFTP's own 4. */
 #define TFTP_BLOCK_TEXT "1428"
 #define TFTP_BLOCK_MAX 1468
-#define TFTP_WINDOW_TEXT "1"
-#define TFTP_WINDOW_MAX 1
+/* Eight blocks may be in flight before one has to be acknowledged.
+ *
+ * The measurement, on the day this changed: 332208 bytes from the package
+ * server, ping 61 ms. One block at a time, 15.0 s - 21.6 KiB/s. Four, 4.7 s.
+ * Eight, 2.5 s - 131 KiB/s, six times faster over the same line, because the
+ * line was never what was slow. A window of one spends its whole life waiting
+ * for the far end to say "yes, go on".
+ *
+ * A window was tried once before and made things worse, and the difference is
+ * the server: it now leaves two milliseconds between the packets of a window
+ * instead of firing them off as fast as it can. The window bounds what is
+ * unacknowledged, the pacing bounds how fast it arrives, and it is the second
+ * one that stops a burst overrunning something narrow on the way. See
+ * koi-tftpd.py, where the same measurement is written down. */
+#define TFTP_WINDOW_TEXT "8"
+#define TFTP_WINDOW_MAX 8
 
 #define OPCODE_READ 1
 #define OPCODE_DATA 3
@@ -112,6 +126,14 @@ int tftp_fetch(boot_uint32_t server, const char* name, void* buffer,
     boot_uint32_t promised = 0;         /* the size the server said, or none */
     int asked_options = 1;
     int speak = 1;                              /* is it our turn to send? */
+    /* Whether the server has already been told where to resume from.
+     *
+     * With a window in flight, one lost block is followed by every block
+     * behind it, and each of those is "not the one expected". Answering each
+     * with an acknowledgement tells the server to restart the window that
+     * many times, and the duplicates multiply until the transfer is doing
+     * nothing else. Ask once, then let the rest of the window go past. */
+    int asked_resend = 0;
     int attempts = 0;
 
     if (why) *why = (const char*)0;
@@ -143,14 +165,9 @@ int tftp_fetch(boot_uint32_t server, const char* name, void* buffer,
      *   windowsize how many blocks may fly before an acknowledgement
      *                                                              (RFC 7440)
      *
-     * The window is asked for as one, which is to say not asked for. Sixteen
-     * was measured and was *slower* - 12 KiB/s against 22 - because the server
-     * sends a window back to back with no pacing, and a burst that large is
-     * dropped somewhere on the way; TFTP then resends from the lost block and
-     * the round trips come back with interest. On a phone tether the burst is
-     * most of the link, and it knocked the connection over at the other end.
-     * Pacing it properly is a congestion controller, which is most of what TCP
-     * is for. The block size below is where the gain actually was.
+     * The window is what makes the difference, once the server paces what it
+     * sends - see the note above TFTP_WINDOW_TEXT for the numbers and for the
+     * time this was tried without pacing and was slower than not trying.
      *
      * All three are optional in both directions: a server that ignores them
      * gets the old behaviour and this still works, just slowly. */
@@ -280,13 +297,19 @@ int tftp_fetch(boot_uint32_t server, const char* name, void* buffer,
 
         if (get_be16(packet + 2) != expected) {
             /* Not the block we are waiting for: either one already taken, or
-               the one after a gap. Both are answered the same way - name the
-               last block that did arrive and let the server resume from there,
-               which is what a window costs when a packet is lost. */
-            speak = 1;
-            since_ack = 0;
+               one from beyond a gap. Name the last block that did arrive and
+               let the server resume from there - but only once, however many
+               blocks of the window are still arriving behind it. */
+            if (!asked_resend) {
+                asked_resend = 1;
+                speak = 1;
+                since_ack = 0;
+            } else {
+                speak = 0;
+            }
             continue;
         }
+        asked_resend = 0;
 
         {
             boot_uint32_t payload = (boot_uint32_t)got - 4;

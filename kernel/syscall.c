@@ -69,6 +69,7 @@ static const char* cpu_brand_name(void) {
 typedef struct {
     int used;
     int writable;
+    int owner;              /* how many programs were resident when it opened */
     VOLUME* volume;
     FAT_ENTRY entry;
     boot_uint32_t position;
@@ -82,6 +83,7 @@ static OPEN_FILE handles[HANDLE_MAX];
 
 typedef struct {
     int used;
+    int owner;
     VOLUME* volume;
     FAT_DIRECTORY directory;
     char pattern[FAT_NAME_MAX];
@@ -138,6 +140,50 @@ static void resolve_working(const char* name, char* result) {
     result[length] = 0;
 }
 
+/* Where a command's output goes when a program asked to collect it rather
+   than let it print. One at a time, because one program runs at a time and a
+   command inside a command is the shell's business rather than a program's. */
+static char* capture_into;
+static boot_uint32_t capture_room;
+static boot_uint32_t capture_used;
+
+static void capture_for_program(char character) {
+    /* Room for the terminating zero is kept back: a caller that reads the
+       buffer as a string should not have to know how full it got. */
+    if (capture_into && capture_used + 1 < capture_room)
+        capture_into[capture_used++] = character;
+}
+
+/* Which drive a program meant, and the path with the letter taken off.
+ *
+ * "Z:\\GAMES" names a place regardless of where the shell is standing, and a
+ * program had no way to say that: everything here resolved against the one
+ * working volume, so a drive letter went through as though it were part of a
+ * file name and found nothing. The file browser asking for the root of a
+ * volume that was not the current one is what found this - and it is the same
+ * hole the shell had, where `CALL Z:\\SUB.BAT` could not be run.
+ *
+ * There is one working directory rather than one per drive. DOS kept one
+ * each, and the reason was a machine where the floppy was where you left it;
+ * with no floppy and one shell, "X:NAME" reads as the root of X. Anything
+ * else would be a rule people have to learn to predict a path. */
+static VOLUME* resolve_place(const char* name, char* result) {
+    if (name && name[0] && name[1] == ':') {
+        VOLUME* volume = volume_by_letter(name[0]);
+        const char* rest = name + 2;
+        boot_uint64_t length = 0;
+
+        if (!volume) return (VOLUME*)0;
+        if (*rest != '\\') result[length++] = '\\';
+        while (*rest && length + 1 < WORKING_PATH_MAX) result[length++] = *rest++;
+        if (!length) result[length++] = '\\';
+        result[length] = 0;
+        return volume;
+    }
+    resolve_working(name, result);
+    return working_volume;
+}
+
 /* Memory a program asked for.
  *
  * Tracked rather than handed out and forgotten, because nothing here reclaims
@@ -150,6 +196,7 @@ static void resolve_working(const char* name, char* result) {
 typedef struct {
     void* address;
     boot_uint64_t pages;
+    int owner;
 } PROGRAM_BLOCK;
 
 static PROGRAM_BLOCK blocks[BLOCK_MAX];
@@ -175,6 +222,7 @@ static long do_alloc(long bytes) {
 
     blocks[slot].address = address;
     blocks[slot].pages = pages;
+    blocks[slot].owner = program_depth();
     return (long)(unsigned long long)address;
 }
 
@@ -192,23 +240,43 @@ static long do_free(long address) {
     return SYSCALL_ERROR;
 }
 
+/* Everything the program that has just exited was holding - and nothing that
+ * belongs to the one underneath it.
+ *
+ * This used to close every handle and free every block there was, which was
+ * correct while a program could only be started from the prompt: there was
+ * never anybody underneath. A desktop that runs a program is somebody
+ * underneath. Mizu ran DOOM from its Start menu, DOOM exited, and this freed
+ * Mizu's wallpaper - two and a quarter megabytes handed back to the page
+ * allocator while Mizu was still drawing from it. The desktop came back as
+ * static, which is what somebody else's memory looks like.
+ *
+ * `owner` on each of these is how many programs were resident when it was
+ * made, so what to release is everything deeper than what is left. Files and
+ * searches went the same way for the same reason - a desktop with a file open
+ * had it closed under it by anything it ran.
+ *
+ * Sound is not tidiness: a voice reads its samples out of the program's own
+ * memory from the timer interrupt, and one left playing past the program that
+ * started it reads an address that now belongs to something else - which is
+ * not a wrong noise, it is a wrong noise a thousand times a second forever.
+ * It is the same rule and now it has the same owner. */
 void syscall_close_all(void) {
-    memset(handles, 0, sizeof(handles));
-    memset(searches, 0, sizeof(searches));
-    /* Sound first, and this one is not tidiness.
-     *
-     * A voice holds a pointer into the program's own memory and the mixer
-     * reads it from the timer interrupt. Leave one playing past the program
-     * that started it and the mixer keeps reading an address that now belongs
-     * to something else - which is not a wrong noise, it is a wrong noise
-     * arriving a thousand times a second forever. */
-    audio_stop_all();
-    /* Anything the program still held goes back, whether or not it asked. */
+    int depth = program_depth();
+
+    audio_stop_deeper_than(depth);
+    for (int slot = 0; slot < HANDLE_MAX; slot++)
+        if (handles[slot].used && handles[slot].owner > depth)
+            memset(&handles[slot], 0, sizeof(handles[slot]));
+    for (int slot = 0; slot < SEARCH_MAX; slot++)
+        if (searches[slot].used && searches[slot].owner > depth)
+            memset(&searches[slot], 0, sizeof(searches[slot]));
     for (int slot = 0; slot < BLOCK_MAX; slot++) {
-        if (!blocks[slot].address) continue;
+        if (!blocks[slot].address || blocks[slot].owner <= depth) continue;
         free_pages(blocks[slot].address, blocks[slot].pages);
         blocks[slot].address = (void*)0;
         blocks[slot].pages = 0;
+        blocks[slot].owner = 0;
     }
 }
 
@@ -255,16 +323,21 @@ static long find_first(const char* pattern, KOI_FIND_DATA* data) {
     if (slot == SEARCH_MAX) return SYSCALL_ERROR;
 
     memset(&searches[slot], 0, sizeof(searches[slot]));
-    resolve_working(pattern, absolute);
-    split_search(absolute, directory, searches[slot].pattern);
-    if (!searches[slot].pattern[0]) {
-        searches[slot].pattern[0] = '*';
-        searches[slot].pattern[1] = 0;
+    {
+        VOLUME* volume = resolve_place(pattern, absolute);
+
+        if (!volume) return SYSCALL_ERROR;
+        split_search(absolute, directory, searches[slot].pattern);
+        if (!searches[slot].pattern[0]) {
+            searches[slot].pattern[0] = '*';
+            searches[slot].pattern[1] = 0;
+        }
+        if (!fat32_opendir(volume, directory, &searches[slot].directory))
+            return SYSCALL_ERROR;
+        searches[slot].volume = volume;
     }
-    if (!fat32_opendir(working_volume, directory, &searches[slot].directory))
-        return SYSCALL_ERROR;
-    searches[slot].volume = working_volume;
     searches[slot].used = 1;
+    searches[slot].owner = program_depth();
 
     if (find_next(slot, data) != 0) {
         searches[slot].used = 0;
@@ -300,17 +373,18 @@ static long do_open(const char* path, long mode) {
     if (slot == HANDLE_MAX) return SYSCALL_ERROR;
 
     memset(&handles[slot], 0, sizeof(handles[slot]));
-    handles[slot].volume = working_volume;
-    resolve_working(path, absolute);
+    handles[slot].volume = resolve_place(path, absolute);
+    if (!handles[slot].volume) return SYSCALL_ERROR;
 
     if (mode == OPEN_WRITE) {
         /* Truncate by removing and recreating: the alternative is walking the
            cluster chain to release the tail, and this is one program-visible
            operation either way. */
         FAT_ENTRY existing;
-        if (fat32_stat(working_volume, absolute, &existing))
-            (void)fat32_remove(working_volume, absolute);
-        if (!fat32_create(working_volume, absolute, 0, &handles[slot].entry))
+        if (fat32_stat(handles[slot].volume, absolute, &existing))
+            (void)fat32_remove(handles[slot].volume, absolute);
+        if (!fat32_create(handles[slot].volume, absolute, 0,
+                          &handles[slot].entry))
             return SYSCALL_ERROR;
         handles[slot].writable = 1;
     } else {
@@ -320,6 +394,7 @@ static long do_open(const char* path, long mode) {
             return SYSCALL_ERROR;
     }
     handles[slot].used = 1;
+    handles[slot].owner = program_depth();
     return slot;
 }
 
@@ -676,35 +751,44 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
 
     case SYS_REMOVE: {
         char absolute[WORKING_PATH_MAX];
+        VOLUME* volume;
         if (!a || !working_volume) return SYSCALL_ERROR;
-        resolve_working((const char*)a, absolute);
-        return fat32_remove(working_volume, absolute) ? 0 : SYSCALL_ERROR;
+        volume = resolve_place((const char*)a, absolute);
+        return (volume && fat32_remove(volume, absolute)) ? 0 : SYSCALL_ERROR;
     }
 
     case SYS_RENAME: {
         char from[WORKING_PATH_MAX];
         char to[WORKING_PATH_MAX];
+        VOLUME* volume;
+        VOLUME* target;
         if (!a || !b || !working_volume) return SYSCALL_ERROR;
-        resolve_working((const char*)a, from);
-        resolve_working((const char*)b, to);
-        return fat32_rename(working_volume, from, to) ? 0 : SYSCALL_ERROR;
+        volume = resolve_place((const char*)a, from);
+        target = resolve_place((const char*)b, to);
+        /* Renaming is not moving, and across two drives it would have to be a
+           copy and a delete - which is a different operation with different
+           ways to fail halfway. */
+        if (!volume || volume != target) return SYSCALL_ERROR;
+        return fat32_rename(volume, from, to) ? 0 : SYSCALL_ERROR;
     }
 
     case SYS_MKDIR: {
         char absolute[WORKING_PATH_MAX];
         FAT_ENTRY entry;
+        VOLUME* volume;
         if (!a || !working_volume) return SYSCALL_ERROR;
-        resolve_working((const char*)a, absolute);
-        return fat32_create(working_volume, absolute, 1, &entry)
+        volume = resolve_place((const char*)a, absolute);
+        return (volume && fat32_create(volume, absolute, 1, &entry))
                ? 0 : SYSCALL_ERROR;
     }
 
     case SYS_EXISTS: {
         char absolute[WORKING_PATH_MAX];
         FAT_ENTRY entry;
+        VOLUME* volume;
         if (!a || !working_volume) return SYSCALL_ERROR;
-        resolve_working((const char*)a, absolute);
-        return fat32_stat(working_volume, absolute, &entry) ? 1 : 0;
+        volume = resolve_place((const char*)a, absolute);
+        return (volume && fat32_stat(volume, absolute, &entry)) ? 1 : 0;
     }
 
     case SYS_SIZE: {
@@ -748,6 +832,11 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
        getting a stream of errors it has no way to act on, when the honest
        answer is that nothing was drawn. */
     case SYS_GFX_ENTER: {
+        /* A program that is about to draw is the moment a missing pointer
+           starts to matter, and one more handshake is cheap. A touchpad the
+           firmware left talking is not found at boot; by now it has been told
+           to be quiet and answers properly. */
+        if (!mouse_present()) (void)mouse_restart();
         GRAPHICS_SCREEN screen;
         KOI_SCREEN* out = (KOI_SCREEN*)a;
 
@@ -766,19 +855,31 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
 
     case SYS_SOUND_PLAY: {
         const KOI_SOUND* sound = (const KOI_SOUND*)(unsigned long long)a;
+        long voice;
+
         if (!sound) return SYSCALL_ERROR;
-        return audio_play(sound->samples, sound->frames, sound->rate,
-                          sound->bits, sound->channels, sound->volume,
-                          sound->pan, (int)sound->loop);
+        voice = audio_play(sound->samples, sound->frames, sound->rate,
+                           sound->bits, sound->channels, sound->volume,
+                           sound->pan, (int)sound->loop);
+        /* Whose it is, so that it ends when this program does and not when
+           some other program does. */
+        audio_set_owner(program_depth());
+        return voice;
     }
 
-    case SYS_SOUND_TONE:
-        return audio_tone((boot_uint32_t)a, (boot_uint32_t)b, (int)c);
+    case SYS_SOUND_TONE: {
+        long voice = audio_tone((boot_uint32_t)a, (boot_uint32_t)b, (int)c);
+
+        audio_set_owner(program_depth());
+        return voice;
+    }
 
     case SYS_SOUND_STOP:
         /* -1 means all of them, which is what a program wants when it is
-           shutting down and does not want to have kept a list. */
-        if (a < 0) audio_stop_all();
+           shutting down and does not want to have kept a list. Its own, and
+           anything started by something it ran - not the desktop's music
+           underneath it. */
+        if (a < 0) audio_stop_deeper_than(program_depth() - 1);
         else audio_stop((int)a);
         return 0;
 
@@ -850,6 +951,11 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
     case SYS_GFX_SCISSOR_RESET:
         graphics_reset_scissor();
         return 0;
+    case SYS_GFX_BLIT:
+        graphics_blit((const void*)c, KOI_POINT_X(a), KOI_POINT_Y(a),
+                      KOI_POINT_X(b), KOI_POINT_Y(b), (boot_uint32_t)d);
+        return 0;
+
     case SYS_GFX_DIM:
         graphics_dim(KOI_POINT_X(a), KOI_POINT_Y(a),
                      KOI_POINT_X(b), KOI_POINT_Y(b), (int)c);
@@ -905,6 +1011,49 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
             return SYSCALL_ERROR;
         return (long)device->sector_size;
     }
+
+    case SYS_CAPTURE: {
+        const char* line = (const char*)a;
+        long size = c;
+
+        if (!line || !b || size < 2) return SYSCALL_ERROR;
+        capture_into = (char*)b;
+        capture_room = (boot_uint32_t)size;
+        capture_used = 0;
+        console_capture(capture_for_program);
+        (void)command_execute_line(line);
+        console_capture((void (*)(char))0);
+        capture_into[capture_used] = 0;
+        return (long)capture_used;
+    }
+
+    case SYS_LOAD: {
+        /* Loaded from where the caller is standing, exactly as opening a file
+           is - a desktop that keeps its applications beside itself says
+           "NOTEEDIT.EXE" and means the one next to it. */
+        KOI_MODULE* out = (KOI_MODULE*)b;
+        char absolute[WORKING_PATH_MAX];
+        boot_uint64_t base = 0, size = 0, entry = 0;
+
+        VOLUME* volume;
+
+        if (!a || !out || !working_volume) return SYSCALL_ERROR;
+        volume = resolve_place((const char*)a, absolute);
+        if (!volume) return SYSCALL_ERROR;
+        if (program_load(volume, absolute, &base, &size, &entry)
+            != PROGRAM_OK) return SYSCALL_ERROR;
+        out->base = base;
+        out->size = size;
+        out->entry = entry;
+        return 0;
+    }
+
+    case SYS_BREAK:
+        keyboard_break_enable((int)a);
+        return 0;
+
+    case SYS_UNLOAD:
+        return program_unload((boot_uint64_t)a) ? 0 : SYSCALL_ERROR;
 
     case SYS_RUN: {
         /* The exit code of what was run, and KOI_EXIT_NOT_FOUND when there

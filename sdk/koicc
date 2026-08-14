@@ -2,6 +2,7 @@
 # Build a Koi-DOS program.
 #
 #   ./koicc hello.c                  -> HELLO.EXE
+#   ./koicc -m noteedit.c            -> NOTEEDIT.APP  (a loadable module)
 #   ./koicc hello.c mytool           -> MYTOOL.EXE
 #   ./koicc main.c board.c ai.c      -> MAIN.EXE
 #   ./koicc main.c board.c -o games  -> GAMES.EXE
@@ -19,9 +20,18 @@ cd "$(dirname "$0")"
 
 SOURCES=()
 NAME=""
+# A module is the same image with a different entry point: it returns to
+# whoever loaded it instead of exiting, because that caller is still running.
+# See koimod.c. The extension differs so that a module is not something anybody
+# types at a prompt - running one would call its entry with whatever happened
+# to be in a register.
+MODULE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        -m|--module)
+            MODULE=1
+            ;;
         -o)
             shift
             [ $# -gt 0 ] || { echo "koicc: -o needs a name" >&2; exit 1; }
@@ -45,7 +55,13 @@ if [ ${#SOURCES[@]} -eq 0 ]; then
 fi
 
 [ -n "$NAME" ] || NAME=$(basename "${SOURCES[0]}" .c)
-OUTPUT=$(echo "$NAME" | tr 'a-z' 'A-Z').EXE
+if [ "$MODULE" = "1" ]; then
+    OUTPUT=$(echo "$NAME" | tr 'a-z' 'A-Z').APP
+    ENTRY=koimod.c
+else
+    OUTPUT=$(echo "$NAME" | tr 'a-z' 'A-Z').EXE
+    ENTRY=start.c
+fi
 
 CC=${CC:-gcc}
 
@@ -73,7 +89,7 @@ fi
 . ./koiflags
 
 "$CC" $KOI_CFLAGS $KOI_LDFLAGS \
-    -o "$OUTPUT" "${SOURCES[@]}" start.c koilib.c
+    -o "$OUTPUT" "${SOURCES[@]}" "$ENTRY" koilib.c
 
 ABI=$(sed -n 's/^#define KOI_ABI_VERSION \([0-9]*\).*/\1/p' syscall.h)
 ALPHA=$(sed -n 's/^#define KOI_ABI_IS_ALPHA \([0-9]*\).*/\1/p' syscall.h)
@@ -86,6 +102,12 @@ if [ "${ALPHA:-0}" = "1" ]; then
     echo "      this binary rather than misinterpret it. Rebuild after updating."
 fi
 echo
+if [ "$MODULE" = "1" ]; then
+    echo "This is a module: it is loaded by a program, not typed at a prompt."
+    echo "Put it beside the program that loads it."
+    exit 0
+fi
+
 echo "Copy it to the root of a Koi-DOS drive and type its name at the prompt."
 echo "With mtools, and the disk image at esp.img:"
 echo

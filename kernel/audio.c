@@ -45,6 +45,12 @@ typedef struct {
     boot_uint8_t volume;
     volatile boot_uint8_t active;   /* written last, so a half-built voice is
                                        never seen by the interrupt */
+    /* How many programs were resident when this was started. A voice reads
+       the samples where they lie in the program's own memory, so it must stop
+       when that program's memory goes back - and only then. Stopping every
+       voice instead silenced the desktop's music whenever anything was run
+       from it. */
+    boot_uint8_t owner;
 } VOICE;
 
 static VOICE voices[AUDIO_VOICES];
@@ -283,6 +289,24 @@ void audio_stop_all(void) {
     boot_uint64_t flags = cpu_hold_interrupts();
     int index;
     for (index = 0; index < AUDIO_VOICES; index++) voices[index].active = 0;
+    cpu_release_interrupts(flags);
+}
+
+void audio_set_owner(int owner) {
+    boot_uint64_t flags = cpu_hold_interrupts();
+    for (int index = 0; index < AUDIO_VOICES; index++)
+        if (voices[index].active && !voices[index].owner)
+            voices[index].owner = (boot_uint8_t)owner;
+    cpu_release_interrupts(flags);
+}
+
+void audio_stop_deeper_than(int depth) {
+    boot_uint64_t flags = cpu_hold_interrupts();
+    for (int index = 0; index < AUDIO_VOICES; index++)
+        if (voices[index].owner > (boot_uint8_t)depth) {
+            voices[index].active = 0;
+            voices[index].owner = 0;
+        }
     cpu_release_interrupts(flags);
 }
 

@@ -67,18 +67,39 @@ static boot_uint32_t dns_pending_id;
 static boot_uint32_t dns_result;
 static int dns_answered;
 
-/* One datagram, kept for whoever asked to listen on the port it arrived at.
+/* Datagrams kept for whoever asked to listen on the port they arrived at.
  *
- * A single slot rather than a queue, because the things that use it - a file
- * transfer, a name lookup - send one request and wait for one reply before
- * sending the next. A second datagram arriving before the first is collected
- * would mean two conversations at once, which nothing here does. */
+ * This was one slot, and the reasoning was that everything here sends a
+ * request and waits for a reply before sending the next. That stopped being
+ * true the day the file transfer asked for a window: eight blocks arrive
+ * before anything is acknowledged, and with one slot the first was kept and
+ * the other seven were thrown away by the line below that tested `inbox_full`.
+ *
+ * The transfer then behaved exactly as though every window but its first
+ * block had been lost on the wire - it asked the server to resume, seven
+ * times per window - and the whole point of the window was gone. Measured
+ * from inside the machine: 19 KiB/s with a window of eight negotiated and
+ * working perfectly at both ends. The same fetch from this host, with a
+ * client that keeps what arrives, was 131 KiB/s.
+ *
+ * Sixteen slots because the window is eight and the ring in the card is
+ * sixteen; a queue shorter than what one burst can deliver is the same bug
+ * with a bigger number. */
+#define INBOX_SLOTS 16
+
+typedef struct {
+    boot_uint8_t data[1472];
+    boot_uint32_t length;
+    boot_uint32_t address;
+    boot_uint16_t port;
+} DATAGRAM;
+
 static boot_uint16_t listen_port;
-static boot_uint8_t inbox[1472];
-static boot_uint32_t inbox_length;
-static boot_uint32_t inbox_address;
-static boot_uint16_t inbox_port;
-static int inbox_full;
+static DATAGRAM inbox[INBOX_SLOTS];
+static boot_uint32_t inbox_head;      /* next to be taken */
+static boot_uint32_t inbox_tail;      /* next to be filled */
+
+static boot_uint32_t inbox_count(void) { return inbox_tail - inbox_head; }
 
 static int dhcp_offer_seen;
 static int dhcp_ack_seen;
@@ -580,8 +601,8 @@ int net_send_from(boot_uint16_t source_port, boot_uint32_t address,
    slot: a reply to a conversation that is over is not wanted by the next. */
 void net_listen(boot_uint16_t port) {
     listen_port = port;
-    inbox_full = 0;
-    inbox_length = 0;
+    inbox_head = 0;
+    inbox_tail = 0;
 }
 
 int net_receive_from(void* data, boot_uint32_t size, boot_uint32_t timeout_ms,
@@ -589,17 +610,20 @@ int net_receive_from(void* data, boot_uint32_t size, boot_uint32_t timeout_ms,
     boot_uint64_t start = timer_ticks();
 
     while (!timer_expired(start, timeout_ms)) {
-        net_poll();
-        if (inbox_full) {
-            boot_uint32_t length = inbox_length;
+        /* Anything already queued first, and only then the wire: a burst that
+           has arrived is worth more than one that might. */
+        if (inbox_count()) {
+            DATAGRAM* held = &inbox[inbox_head % INBOX_SLOTS];
+            boot_uint32_t length = held->length;
 
             if (length > size) length = size;
-            memcpy(data, inbox, length);
-            if (address) *address = inbox_address;
-            if (port) *port = inbox_port;
-            inbox_full = 0;
+            memcpy(data, held->data, length);
+            if (address) *address = held->address;
+            if (port) *port = held->port;
+            inbox_head++;
             return (int)length;
         }
+        net_poll();
     }
     return -1;
 }
@@ -767,15 +791,17 @@ static void handle_udp(const boot_uint8_t* udp, boot_uint32_t length,
     if (destination == DHCP_CLIENT_PORT) { handle_dhcp(udp + 8, length - 8); return; }
     if (get_be16(udp + 0) == 53) { handle_dns(udp + 8, length - 8); return; }
 
-    if (listen_port && destination == listen_port && !inbox_full) {
+    if (listen_port && destination == listen_port &&
+        inbox_count() < INBOX_SLOTS) {
+        DATAGRAM* into = &inbox[inbox_tail % INBOX_SLOTS];
         boot_uint32_t payload = length - 8;
 
-        if (payload > sizeof(inbox)) payload = sizeof(inbox);
-        memcpy(inbox, udp + 8, payload);
-        inbox_length = payload;
-        inbox_port = get_be16(udp + 0);
-        inbox_address = source_address;
-        inbox_full = 1;
+        if (payload > sizeof(into->data)) payload = sizeof(into->data);
+        memcpy(into->data, udp + 8, payload);
+        into->length = payload;
+        into->port = get_be16(udp + 0);
+        into->address = source_address;
+        inbox_tail++;
     }
 }
 

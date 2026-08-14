@@ -68,7 +68,8 @@ PROGRAM_SOURCES = $(wildcard programs/*.c)
 PROGRAM_SHARED = programs/editcore.c programs/dialog.c programs/settings.c programs/window.c programs/language.c programs/wav.c
 
 PROGRAMS = $(patsubst programs/%.c,build/%.EXE,\
-             $(filter-out programs/start.c programs/koilib.c $(PROGRAM_SHARED),\
+             $(filter-out programs/start.c programs/koimod.c programs/koilib.c \
+                          $(PROGRAM_SHARED),\
                $(PROGRAM_SOURCES)))
 
 # Which programs are built from more than their own file.
@@ -147,7 +148,7 @@ check: $(KERNEL_ELF)
 # So the flags are written out of this Makefile and koicc reads them. There is
 # one place they can be wrong now, and it is the place they are used.
 sdk:
-	cp programs/koi.h programs/start.c programs/koilib.c programs/program.ld sdk/
+	cp programs/koi.h programs/start.c programs/koimod.c programs/koilib.c programs/program.ld sdk/
 	cp include/syscall.h sdk/syscall.h
 	@# The libraries programs are written against, not only the ones the
 	@# system's own programs are. Windows, dialogues, settings, language and

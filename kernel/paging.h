@@ -34,6 +34,15 @@ boot_uint64_t paging_table_bytes(void);
  * The mapping is cache-disabled, because device registers are not memory and
  * a cached read of a status register returns whatever it said last time.
  * Returns 0 if the tables could not be extended. */
+/* Let ring 3 reach [base, base + size), and only that. Splits the 2 MiB
+   leaves it needs into 4 KiB pages so that a program is not handed whatever
+   else shares its neighbourhood. Returns 0 if the tables could not be grown.
+ *
+ * There is no way back yet, and it is honest to say so: the bit is set and
+ * stays set until the tables are rebuilt. When there is a space per
+ * application - which is the plan - this becomes "map it there" instead. */
+int paging_allow_user(boot_uint64_t base, boot_uint64_t size);
+
 int paging_map_device(boot_uint64_t base, boot_uint64_t size);
 
 /* Whether the framebuffer ended up write-combining rather than write-through.

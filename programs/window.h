@@ -85,7 +85,20 @@ struct WINDOW {
      * first kind: nothing happens to them at all, and they were both correct
      * and both frozen until this existed. */
     int repaint_ms;
+    /* Called when that interval has passed, before the repaint, whether or
+     * not this window is in front. `repaint_ms` alone only ever redrew what
+     * was already there; a window with something to *advance* on a timer - a
+     * track playing, a transfer, an animation - had nowhere to do it and got
+     * its turn only when somebody happened to touch the machine. */
+    void (*tick)(WINDOW* window);
     void* data;
+
+    /* The library's own. Do not set these: `ticked` is when this window last
+       had its turn, and `busy` says one of its handlers is running - which is
+       how a handler that yields does not get handed a second keystroke while
+       it is still inside the first. */
+    koi_uint64 ticked;
+    int busy;
 };
 
 #define WINDOW_EVENT_NONE 0
@@ -186,6 +199,22 @@ void window_client(const WINDOW* window, int* x, int* y, int* width,
    finished - which is the loop's condition, so the caller never has to test
    for quit twice. */
 int window_next(WINDOW_EVENT* event);
+
+/* Run one pass of the desktop's loop and come back.
+ *
+ * For an application in the middle of something long: the clock goes on
+ * ticking, windows go on being draggable, and anything meant for the desktop
+ * is put by for the next window_next rather than lost.
+ *
+ * Cooperative, and the word is the whole bargain: nothing takes the processor
+ * away from anybody. An application that never yields freezes the desktop, and
+ * that is the trade until there is memory protection to make preemption safe.
+ *
+ * Meant to be called from inside a handler - a menu choice that starts a long
+ * piece of work is the case it exists for. A window already inside one of its
+ * own handlers is not handed anything new while it is there, so an editor
+ * cannot find itself in two of its own keystrokes at once. */
+void window_yield(void);
 
 /* End the loop. The next window_next returns 0. */
 void window_quit(void);

@@ -1,6 +1,9 @@
 #include "mouse.h"
+#include "keyboard.h"
 #include "io.h"
 #include "idt.h"
+#include "apic.h"
+#include "pic.h"
 #include "serial.h"
 
 /* The pointer, from whichever device is providing one.
@@ -36,6 +39,8 @@
 #define CONFIG_PORT2_INTERRUPT 0x02U
 #define CONFIG_PORT2_CLOCK 0x20U
 
+#define COMMAND_DISABLE_PORT2 0xA7U
+#define MOUSE_DISABLE 0xF5U     /* stop reporting, and stop it now */
 #define MOUSE_RESET 0xFFU
 #define MOUSE_DEFAULTS 0xF6U
 #define MOUSE_ENABLE 0xF4U
@@ -103,11 +108,6 @@ static void wait_input_clear(void) {
         if (!(inb(PS2_STATUS) & STATUS_INPUT_FULL)) return;
 }
 
-static void wait_output_full(void) {
-    for (int spin = 0; spin < 100000; spin++)
-        if (inb(PS2_STATUS) & STATUS_OUTPUT_FULL) return;
-}
-
 static void command(boot_uint8_t value) {
     wait_input_clear();
     outb(PS2_COMMAND, value);
@@ -118,14 +118,39 @@ static void write_data(boot_uint8_t value) {
     outb(PS2_DATA, value);
 }
 
+/* Wait for the device on the second port to answer, and take whatever comes.
+ *
+ * Not "whatever comes with the second-port bit set", which is what this asked
+ * for briefly and should not have. The bit is reliable for a byte the
+ * controller delivers by itself, and it is not reliable for the reply to a
+ * command sent through it: some controllers set it, some do not, and on the
+ * one this was tried on the mouse's own acknowledgements arrived without it.
+ * Every handshake then failed, the driver decided there was no pointer, and
+ * the cursor sat in the corner where a pointer that does not exist is drawn.
+ *
+ * So: the old behaviour, which works everywhere, with its known and small
+ * cost - a key pressed in the exact moment of the handshake can be mistaken
+ * for an acknowledgement. The window is a few hundred microseconds once, at
+ * startup. The routing that matters is in the interrupt handlers, where the
+ * bit does what it says. */
 static boot_uint8_t read_data(void) {
-    wait_output_full();
-    return inb(PS2_DATA);
+    for (int spin = 0; spin < 200000; spin++)
+        if (inb(PS2_STATUS) & STATUS_OUTPUT_FULL) return inb(PS2_DATA);
+    return 0xFF;
 }
 
 /* Say something to the device on the second port rather than to the
    controller itself, which is what the prefix is for. Returns whether it
    acknowledged. */
+/* Empty the output buffer. Whatever is in it belongs to a conversation that
+   is over - or to a device that was talking before anybody asked it to. */
+static void drain(void) {
+    for (int spin = 0; spin < 4096; spin++) {
+        if (!(inb(PS2_STATUS) & STATUS_OUTPUT_FULL)) return;
+        (void)inb(PS2_DATA);
+    }
+}
+
 static int tell_mouse(boot_uint8_t value) {
     command(COMMAND_TO_PORT2);
     write_data(value);
@@ -250,32 +275,56 @@ static void handle_packet(void) {
     moves++;
 }
 
-static void mouse_interrupt(INTERRUPT_FRAME* frame) {
-    boot_uint8_t status = inb(PS2_STATUS);
+/* One byte from the second port, wherever it was read.
+ *
+ * Both interrupts share one data port, and either handler can find the other
+ * device's byte waiting when it looks. The keyboard's handler hands anything
+ * marked as coming from the mouse to this, rather than reading it as a
+ * scancode - which is what it used to do, and is why a touchpad that was
+ * already streaming when the system started left the machine with no pointer
+ * and a keyboard full of modifiers nobody had pressed. */
+void mouse_from_controller(boot_uint8_t value) {
+    /* Nothing before the driver is up. Bytes arriving during the handshake
+       are answers to it, and the packet decoder must not eat them - which is
+       the other half of the regression above: the keyboard's handler was
+       feeding the mouse's acknowledgements into a state machine that was not
+       running yet, and they never reached the code waiting for them. */
+    if (!present) return;
 
-    (void)frame;
-    /* Only bytes from the second port. The keyboard shares this controller
-       and its interrupt is somebody else's; taking its bytes here would be
-       both a lost keystroke and a corrupted packet. */
-    if (!(status & STATUS_OUTPUT_FULL) || !(status & STATUS_FROM_AUX)) return;
+    /* Back into step. A stream with no framing needs one bit that is always
+       true of a first byte, and this protocol has exactly one. */
+    if (packet_at == 0 && !(value & PACKET_ALWAYS)) return;
 
-    {
-        boot_uint8_t value = inb(PS2_DATA);
-
-        /* Back into step. A stream with no framing needs one bit that is
-           always true of a first byte, and this protocol has exactly one. */
-        if (packet_at == 0 && !(value & PACKET_ALWAYS)) return;
-
-        packet[packet_at++] = value;
-        if (packet_at == packet_bytes) {
-            packet_at = 0;
-            handle_packet();
-        }
+    packet[packet_at++] = value;
+    if (packet_at == packet_bytes) {
+        packet_at = 0;
+        handle_packet();
     }
 }
 
+static void mouse_interrupt(INTERRUPT_FRAME* frame) {
+    (void)frame;
+    /* Everything waiting, not only what is ours.
+     *
+     * This used to read one byte and only if it was marked as the mouse's,
+     * leaving a keystroke sitting in the buffer for somebody else - and the
+     * 8042 delivers nothing further, and raises no further interrupt, until
+     * that byte is read. Declining it stopped the controller: the pointer
+     * managed eight reports and the keyboard nine keystrokes, and then both
+     * went silent. The drain routes each byte to whoever it belongs to. */
+    ps2_drain();
+}
+
+/* What the screen was, so that a second attempt does not need to be told
+   again. */
+static boot_uint32_t known_width;
+static boot_uint32_t known_height;
+
 int mouse_init(boot_uint32_t width, boot_uint32_t height) {
     boot_uint8_t config;
+
+    known_width = width;
+    known_height = height;
 
     /* Where it may go, and where it starts: the middle, because a pointer
        that begins in a corner looks like one that is not working. */
@@ -283,6 +332,23 @@ int mouse_init(boot_uint32_t width, boot_uint32_t height) {
     limit_y = (int)height - 1;
     pointer_x = limit_x / 2;
     pointer_y = limit_y / 2;
+
+    /* Silence first, and this is the whole of the touchpad bug.
+     *
+     * A finger on the touchpad before the system starts leaves the firmware's
+     * pointer already reporting, and a reporting device fills the output
+     * buffer with movement. Every read below then returns a coordinate: the
+     * port test read one and decided there was no second port, said so, and
+     * gave up - on a laptop whose touchpad works perfectly. Which is exactly
+     * the shape of the report: touch it during the firmware and there is no
+     * pointer afterwards; do not touch it and everything is fine.
+     *
+     * Disabling the port stops its clock, so nothing more can arrive while
+     * the buffer is emptied; the device itself is told to stop reporting once
+     * it can be talked to, so that the handshakes below are answers rather
+     * than movement. */
+    command(COMMAND_DISABLE_PORT2);
+    drain();
 
     /* Does the controller have a second port at all? A machine with no
        touchpad and no PS/2 mouse fails this and says so rather than waiting
@@ -305,9 +371,22 @@ int mouse_init(boot_uint32_t width, boot_uint32_t height) {
     command(COMMAND_WRITE_CONFIG);
     write_data(config);
 
+    /* Told to be quiet before it is asked anything. A device that was left
+       streaming answers the first question with a packet, and the answer to
+       the second question is then the rest of the first packet. Not every
+       device acknowledges this while it is in that state, so the reply is not
+       insisted on - what matters is that the line is empty afterwards. */
+    (void)tell_mouse(MOUSE_DISABLE);
+    drain();
+
     if (!tell_mouse(MOUSE_RESET)) {
-        serial_write("MOUSE: nothing on the second port\n");
-        return 0;
+        /* Once more, in case that acknowledgement was the tail of a packet
+           that was already on its way. */
+        drain();
+        if (!tell_mouse(MOUSE_RESET)) {
+            serial_write("MOUSE: nothing on the second port\n");
+            return 0;
+        }
     }
     /* A reset is answered with an acknowledgement, then a self-test result,
        then the device identity. Read and discarded: what matters is that
@@ -334,6 +413,25 @@ int mouse_init(boot_uint32_t width, boot_uint32_t height) {
 
     packet_at = 0;
     irq_register(MOUSE_IRQ, mouse_interrupt);
+
+    /* And make sure the line can actually arrive.
+     *
+     * This used to be done once, at startup, by the code that moves
+     * everything from the 8259 to the IO APIC - and only for a pointer that
+     * already existed at that moment. A pointer found later got a handler, a
+     * `present` flag and no interrupt at all: `mouse` said the pointer was
+     * working, and it never moved, because nothing was ever delivered. That
+     * is a worse answer than saying there is none.
+     *
+     * Asked for here instead, by the driver that needs it, whenever it starts
+     * - which is the same reason the routing lives with the device rather
+     * than with the boot sequence. */
+    if (apic_available()) {
+        if (!apic_route_irq(MOUSE_IRQ, IRQ_BASE + MOUSE_IRQ))
+            serial_write("MOUSE: the IO APIC would not take its line\n");
+    } else {
+        pic_unmask_irq(MOUSE_IRQ);
+    }
     present = 1;
     if (identity == IDENTITY_PLAIN)
         serial_write("MOUSE: PS/2 pointer ready, no wheel\n");
@@ -345,6 +443,19 @@ int mouse_init(boot_uint32_t width, boot_uint32_t height) {
 }
 
 int mouse_present(void) { return present; }
+
+/* Try again, for a pointer that was not there when the machine started.
+ *
+ * Asked for by the shell (`mouse`) and by the moment a program takes the
+ * screen: a desktop with no pointer is the place where somebody notices, and
+ * one more handshake costs a few milliseconds. It is also the honest answer to
+ * "can we not just start it later" - the initialisation is not expensive and
+ * nothing says it may happen only once. */
+int mouse_restart(void) {
+    if (present) return 1;
+    if (!known_width || !known_height) return 0;
+    return mouse_init(known_width, known_height);
+}
 int mouse_x(void) { return pointer_x; }
 int mouse_y(void) { return pointer_y; }
 int mouse_buttons(void) { return buttons; }

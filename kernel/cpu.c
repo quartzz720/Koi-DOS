@@ -6,8 +6,9 @@
    and data segments are ignored. What matters is that the descriptors exist,
    are ours, and that the code descriptor has the L bit set. */
 
-/* null, code, data, and two slots for the 16-byte TSS descriptor. */
-#define GDT_ENTRIES 5
+/* null, kernel code, kernel data, user code, user data, and two slots for the
+   16-byte TSS descriptor. */
+#define GDT_ENTRIES 7
 
 #define DOUBLE_FAULT_STACK_PAGES 4
 
@@ -69,6 +70,12 @@ void gdt_init(void) {
     gdt[0] = (GDT_ENTRY){ 0, 0, 0, 0, 0, 0 };
     set_entry(1, 0x9A, 0x0A); /* granularity + long mode */
     set_entry(2, 0x92, 0x0C); /* granularity + 32-bit default size */
+    /* The same two again at DPL 3. In long mode a segment carries almost
+       nothing but its privilege level, and that is exactly what these are
+       for: the processor refuses to run code at ring 3 through a descriptor
+       that does not say ring 3. */
+    set_entry(3, 0xFA, 0x0A); /* user code: present, DPL 3, executable, L=1 */
+    set_entry(4, 0xF2, 0x0C); /* user data: present, DPL 3, writable */
 
     pointer.limit = (boot_uint16_t)(sizeof(gdt) - 1);
     pointer.base = (boot_uint64_t)(unsigned long long)&gdt[0];
@@ -111,7 +118,7 @@ void tss_init(void) {
             DOUBLE_FAULT_STACK_PAGES * PAGE_SIZE;
     }
 
-    descriptor = (TSS_DESCRIPTOR*)&gdt[3];
+    descriptor = (TSS_DESCRIPTOR*)&gdt[5];
     memset(descriptor, 0, sizeof(*descriptor));
     descriptor->limit_low = (boot_uint16_t)(sizeof(tss) - 1);
     descriptor->base_low = (boot_uint16_t)base;
@@ -120,7 +127,54 @@ void tss_init(void) {
     descriptor->base_high = (boot_uint8_t)(base >> 24);
     descriptor->base_upper = (boot_uint32_t)(base >> 32);
 
+    /* And a stack for interrupts that arrive from ring 3. Without it the
+       processor would keep using whatever stack the application had, which is
+       memory the application chose and may have made unusable - the fault
+       handler would then fault, and that is a machine that reboots rather
+       than a program that stops. */
+    {
+        void* interrupt_stack = alloc_pages(KERNEL_INTERRUPT_STACK_PAGES);
+
+        if (interrupt_stack)
+            tss.rsp[0] = (boot_uint64_t)(unsigned long long)interrupt_stack +
+                         KERNEL_INTERRUPT_STACK_PAGES * PAGE_SIZE;
+    }
+
     __asm__ volatile ("ltr %w0" : : "r"((boot_uint16_t)TSS_SELECTOR) : "memory");
+}
+
+void cpu_set_kernel_stack(boot_uint64_t top) {
+    tss.rsp[0] = top;
+}
+
+/* Into ring 3, by pretending to return from an interrupt that never happened.
+ *
+ * iretq pops RIP, CS, RFLAGS, RSP and SS in one go, and it is the only
+ * instruction that will load a code segment of a lower privilege level. So the
+ * way down is to build the frame the processor would have pushed on the way up
+ * and then return from it. Interrupts are enabled in the flags it pops rather
+ * than beforehand, because between here and there the stack belongs to nobody
+ * in particular. */
+__attribute__((noreturn)) void cpu_enter_user(boot_uint64_t entry,
+                                              boot_uint64_t stack) {
+    __asm__ volatile (
+        "mov %w2, %%ds\n"
+        "mov %w2, %%es\n"
+        "mov %w2, %%fs\n"
+        "mov %w2, %%gs\n"
+        "pushq %3\n"           /* SS  */
+        "pushq %1\n"           /* RSP */
+        "pushq $0x202\n"       /* RFLAGS: reserved bit, interrupts enabled */
+        "pushq %4\n"           /* CS  */
+        "pushq %0\n"           /* RIP */
+        "iretq\n"
+        :
+        : "r"(entry), "r"(stack),
+          "r"((boot_uint16_t)USER_DATA_SELECTOR),
+          "i"((boot_uint64_t)USER_DATA_SELECTOR),
+          "i"((boot_uint64_t)USER_CODE_SELECTOR)
+        : "memory");
+    __builtin_unreachable();
 }
 
 /* The cache line size, from CPUID leaf 1. Sixty-four everywhere that matters,

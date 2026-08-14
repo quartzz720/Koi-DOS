@@ -3,6 +3,7 @@
 #include "pic.h"
 #include "apic.h"
 #include "console.h"
+#include "program.h"
 #include "serial.h"
 #include "string.h"
 #include "../include/syscall.h"
@@ -13,6 +14,7 @@
    back into the shell, and an interrupt gate would have left interrupts off
    with nothing to turn them back on. */
 #define GATE_TRAP 0x8F
+#define GATE_TRAP_USER 0xEF   /* the same, callable from ring 3 */
 
 typedef struct __attribute__((packed)) {
     boot_uint16_t offset_low;
@@ -146,6 +148,41 @@ void interrupt_dispatch(INTERRUPT_FRAME* frame);
 
 void interrupt_dispatch(INTERRUPT_FRAME* frame) {
     if (frame->vector < IRQ_BASE) {
+        /* A fault at ring 3 is a program's mistake, not the machine's.
+         *
+         * This is the whole prize of the ring, and the point where "a program
+         * crashed" stops meaning "the machine crashed". The frame says where
+         * it came from: the low two bits of the code segment are the
+         * privilege level it was running at, and 3 means the program. It is
+         * ended the way any program ends - the kernel is untouched, the shell
+         * comes back, and nothing here has to be unwound, because the stack
+         * that faulted was the program's own and is about to be forgotten. */
+        if ((frame->cs & 3) == 3 && program_depth()) {
+            console_set_color(console_theme()->error,
+                              console_theme()->background);
+            console_write("\n");
+            console_write(exception_name(frame->vector));
+            console_write(" in this program. It has been stopped.\n");
+            console_use_theme();
+            serial_write("PROGRAM: fault at ring 3 - ");
+            serial_write(exception_name(frame->vector));
+            serial_write(", RIP ");
+            serial_write_hex(frame->rip);
+            serial_write("\n");
+            /* Interrupts back on before leaving.
+             *
+             * An exception arrives through an interrupt gate, and the
+             * processor clears the interrupt flag on the way in - the handler
+             * normally returns with iretq, which puts back the flags the
+             * frame carries. This does not return: it unwinds to the shell
+             * and abandons the frame, so the flag it would have restored is
+             * abandoned with it. The machine then runs on with interrupts off
+             * for good, which looks exactly like a keyboard that has died -
+             * the prompt is drawn, the shell is waiting, and IRQ1 will never
+             * arrive again. */
+            __asm__ volatile ("sti");
+            program_exit(KOI_EXIT_FAULT);
+        }
         panic_with_frame(exception_name(frame->vector), frame);
     }
     if (frame->vector < IRQ_BASE + IRQ_COUNT) {
@@ -174,7 +211,12 @@ void idt_init(void) {
     /* Vector 8 gets a stack of its own, so a double fault caused by a broken
        kernel stack can still be reported instead of triple-faulting. */
     set_gate(8, isr_stub_table[8], IST_DOUBLE_FAULT);
-    set_gate_typed(SYSCALL_VECTOR, (void*)syscall_stub, 0, GATE_TRAP);
+    /* The one gate ring 3 is allowed to walk through. DPL 3 on a gate is not
+       a permission on the handler - it is who may call it - and a system call
+       nobody outside the kernel can make is not a system call. Everything
+       else stays at DPL 0, so an application cannot invoke a fault handler by
+       hand and hand the kernel a frame it invented. */
+    set_gate_typed(SYSCALL_VECTOR, (void*)syscall_stub, 0, GATE_TRAP_USER);
 
     pointer.limit = (boot_uint16_t)(sizeof(idt) - 1);
     pointer.base = (boot_uint64_t)(unsigned long long)&idt[0];
