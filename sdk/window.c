@@ -26,6 +26,20 @@ static WINDOW_MENU desktop_menus[WINDOW_MENU_MAX];
 static int desktop_menu_count;
 
 static char desktop_title[WINDOW_TITLE_MAX];
+
+/* One button at the left of the taskbar, if somebody asks for one.
+ *
+ * Deliberately not "the Start button". A windowing library that knew about
+ * Start menus would be a library with a shell's opinions in it, and every
+ * program that opens a desktop for two windows would inherit them. What lives
+ * here is the mechanism - a button on a bar this file owns, drawn pressed
+ * while its menu is open, and a popup that has to appear above every window
+ * because only this file knows the drawing order and the pointer.
+ *
+ * What the button is called, what is in its menu and what choosing an entry
+ * does are the caller's, and Mizu is the caller that makes it a Start menu. */
+static char launcher_label[24];
+static int launcher_pressed;
 static int running;
 static int dirty = 1;
 
@@ -510,11 +524,37 @@ static void paint_window(WINDOW* window, int active) {
     }
 }
 
+/* The Start button, and where the rest of the bar begins after it.
+ *
+ * Its width is measured from its text rather than fixed, so a translation does
+ * not overflow it and an icon can be given room later without anything else
+ * moving: the space in front of the label is where one goes, and it is zero
+ * wide until there is something to put in it. */
+#define LAUNCHER_ICON_W 0
+
+static int launcher_width(void) {
+    if (!launcher_label[0]) return 0;
+    return text_width(launcher_label) + LAUNCHER_ICON_W + WINDOW_CHAR_W * 2;
+}
+
+static void paint_launcher(int y) {
+    int width = launcher_width();
+
+    if (!width) return;
+    /* Pressed in while its menu is open, which is the only cue that the menu
+       belongs to this button rather than floating above the bar. */
+    if (launcher_pressed) window_sunken(2, y + 3, width, WINDOW_TASKBAR_H - 6);
+    else window_raised(2, y + 3, width, WINDOW_TASKBAR_H - 6);
+    window_label_styled(2 + WINDOW_CHAR_W + LAUNCHER_ICON_W, y + 6,
+                        launcher_label, window_text, KOI_TEXT_BOLD);
+}
+
 static void paint_taskbar(void) {
     int y = (int)screen.height - WINDOW_TASKBAR_H;
-    int place = 4;
+    int place = launcher_width() ? launcher_width() + 8 : 4;
 
     window_raised(0, y, (int)screen.width, WINDOW_TASKBAR_H);
+    paint_launcher(y);
     for (int index = 0; index < order_count; index++) {
         WINDOW* window = order[index];
         int width = text_width(window->title) + WINDOW_CHAR_W * 2;
@@ -668,8 +708,13 @@ static WINDOW* window_at(int x, int y) {
     return (WINDOW*)0;
 }
 
+static int launcher_hit(int x, int y) {
+    return launcher_width() && y >= (int)screen.height - WINDOW_TASKBAR_H &&
+           x >= 2 && x < 2 + launcher_width();
+}
+
 static int taskbar_hit(int x, int y) {
-    int place = 4;
+    int place = launcher_width() ? launcher_width() + 8 : 4;
 
     if (y < (int)screen.height - WINDOW_TASKBAR_H) return -1;
     for (int index = 0; index < order_count; index++) {
@@ -679,6 +724,293 @@ static int taskbar_hit(int x, int y) {
         place += width + 4;
     }
     return -1;
+}
+
+void window_launcher(const char* label) {
+    int at = 0;
+
+    while (label && label[at] && at + 1 < (int)sizeof(launcher_label)) {
+        launcher_label[at] = label[at];
+        at++;
+    }
+    launcher_label[at] = 0;
+    dirty = 1;
+}
+
+void window_launcher_anchor(int* x, int* y) {
+    if (x) *x = 2;
+    if (y) *y = (int)screen.height - WINDOW_TASKBAR_H;
+}
+
+void window_launcher_pressed(int pressed) {
+    launcher_pressed = pressed != 0;
+    dirty = 1;
+}
+
+int window_popup(const WINDOW_ITEM* items, int count, int x, int y) {
+    int width = 140;
+    int height;
+    int rows = 0;
+    int chosen = -1;
+    int keyed = -1;              /* the row the keyboard is on, or none */
+    KOI_POINTER pointer;
+    int was_down = 0;
+    int opening;
+
+    if (count > WINDOW_ITEM_MAX) count = WINDOW_ITEM_MAX;
+    for (int index = 0; index < count; index++) {
+        int item = text_width(items[index].label ? items[index].label : "") +
+                   WINDOW_CHAR_W * 4;
+        if (item > width) width = item;
+        rows++;
+    }
+    if (!rows) return -1;
+    height = rows * (WINDOW_CHAR_H + 4) + 6;
+
+    /* Upwards from the point given, and kept on the screen. The thing that
+       opens one of these is on the taskbar at the bottom. */
+    y -= height;
+    if (y < 0) y = 0;
+    if (x + width > (int)screen.width) x = (int)screen.width - width;
+    if (x < 0) x = 0;
+
+    /* The press that opened this menu is usually still down, and it is not an
+       ordinary press.
+     *
+     * Two ways of working a menu have to come out of that one press, because
+     * both are in people's hands already: hold the button, slide onto an
+     * entry and let go - and click once, let go over nothing, and have the
+     * menu stand there until a second click chooses. Counting the opening
+     * press as any other press left only the first of them working: the
+     * release that ends a plain click lands on nothing and was read as "the
+     * pointer was put down outside the menu", which dismisses it. The menu
+     * could be opened and could not be used without dragging.
+     *
+     * So it is remembered as the opening press. Letting it go over an entry
+     * chooses that entry; letting it go anywhere else leaves the menu open
+     * and everything after it behaves normally. */
+    koi_mouse(&pointer);
+    opening = (pointer.buttons & KOI_BUTTON_LEFT) != 0;
+
+    for (;;) {
+        int highlight = -1;
+
+        koi_mouse(&pointer);
+        if (pointer.x >= x && pointer.x < x + width &&
+            pointer.y >= y && pointer.y < y + height) {
+            int row = (pointer.y - y - 3) / (WINDOW_CHAR_H + 4);
+            if (row >= 0 && row < rows) { highlight = row; keyed = -1; }
+        }
+        /* The keyboard's row when the pointer is not over the menu, so the two
+           never both claim to be pointing at something. */
+        if (highlight < 0) highlight = keyed;
+
+        cursor_hide();
+        window_raised(x, y, width, height);
+        for (int index = 0; index < rows; index++) {
+            int row = y + 3 + index * (WINDOW_CHAR_H + 4);
+            if (!items[index].label) {
+                koi_gfx_line(x + 4, row + WINDOW_CHAR_H / 2,
+                             x + width - 5, row + WINDOW_CHAR_H / 2,
+                             window_shadow);
+                continue;
+            }
+            if (index == highlight) {
+                koi_gfx_fill(x + 2, row, width - 4, WINDOW_CHAR_H + 4,
+                             window_accent);
+                window_label(x + WINDOW_CHAR_W, row + 2, items[index].label,
+                             window_client_paper);
+            } else {
+                window_label(x + WINDOW_CHAR_W, row + 2, items[index].label,
+                             window_text);
+            }
+        }
+        koi_gfx_present_rect(x, y, width, height);
+        cursor_show(pointer.x, pointer.y);
+
+        if (pointer.buttons & KOI_BUTTON_LEFT) {
+            if (!opening) was_down = 1;
+        } else if (opening) {
+            /* The click that opened the menu has ended. Over an entry that
+               was a press-and-drag choice; anywhere else the menu stays. */
+            opening = 0;
+            if (highlight >= 0 && items[highlight].label) {
+                chosen = items[highlight].id;
+                break;
+            }
+        } else if (was_down) {
+            /* Released. On an item it chooses; anywhere else it dismisses. A
+               separator is not an item and swallows the click rather than
+               closing, which is what every menu does. */
+            if (highlight >= 0 && items[highlight].label)
+                chosen = items[highlight].id;
+            else if (highlight >= 0) { was_down = 0; continue; }
+            break;
+        }
+
+        /* The keyboard reaches it too. A menu that only a pointer can open is
+           a menu somebody without a working pointer cannot use at all, and
+           this one has the machine's power switch in it. */
+        if (koi_keypressed()) {
+            int key = koi_getchar();
+
+            if (key == 27) break;
+            if (key == KOI_KEY_UP || key == KOI_KEY_DOWN) {
+                int step = key == KOI_KEY_DOWN ? 1 : -1;
+                int at = keyed < 0 ? (step > 0 ? -1 : rows) : keyed;
+
+                /* Past a separator rather than onto it, and round the ends. */
+                for (int tried = 0; tried < rows; tried++) {
+                    at += step;
+                    if (at < 0) at = rows - 1;
+                    if (at >= rows) at = 0;
+                    if (items[at].label) break;
+                }
+                keyed = at;
+            } else if (key == '\n' || key == '\r') {
+                if (keyed >= 0 && items[keyed].label) chosen = items[keyed].id;
+                break;
+            }
+        }
+        koi_sleep(10);
+    }
+
+    cursor_hide();
+    dirty = 1;
+    return chosen;
+}
+
+/* A question in the middle of the screen, with everything behind it dimmed.
+ *
+ * The dimming is the whole point and not decoration. A box that merely sits
+ * on top of the desktop looks like one more window among the windows, and a
+ * question that can be mistaken for a window is one people answer without
+ * reading - which matters when the question is whether to turn the machine
+ * off. Darkening what is behind says, in the one language a screen has, that
+ * nothing else is listening until this is answered.
+ *
+ * It is done by the kernel (koi_gfx_dim) because it reads the pixels back,
+ * and reading a screen's worth of pixels through a system call each is not a
+ * thing a program can do. What is dimmed is never repainted underneath: the
+ * dialogue owns the screen until it returns, and the desktop is redrawn whole
+ * afterwards.
+ *
+ * Returns 1 for the accepting answer and 0 for the other one, and 0 for
+ * Escape - the safe answer being the one a dismissed question gives. */
+int window_confirm(const char* title, const char* message, const char* accept,
+                   const char* cancel, int accept_by_default) {
+    int button_w = text_width(accept) > text_width(cancel)
+                   ? text_width(accept) : text_width(cancel);
+    int button_h = WINDOW_CHAR_H + 10;
+    int width;
+    int height;
+    int x, y;
+    int accept_x, cancel_x, buttons_y;
+    int answer = accept_by_default ? 1 : 0;   /* which button has the keyboard */
+    int held = -1;                            /* the button the press went down on */
+    int chosen = -1;
+    KOI_POINTER pointer;
+    int was_down;
+
+    button_w += WINDOW_CHAR_W * 4;
+    if (button_w < 90) button_w = 90;
+
+    width = text_width(message) + WINDOW_CHAR_W * 4;
+    if (width < text_width(title) + WINDOW_CHAR_W * 6)
+        width = text_width(title) + WINDOW_CHAR_W * 6;
+    if (width < button_w * 2 + WINDOW_CHAR_W * 6)
+        width = button_w * 2 + WINDOW_CHAR_W * 6;
+    if (width > (int)screen.width - 40) width = (int)screen.width - 40;
+    height = WINDOW_BORDER * 2 + WINDOW_TITLE_H + WINDOW_CHAR_H * 3 + button_h;
+
+    x = ((int)screen.width - width) / 2;
+    y = ((int)screen.height - height) / 2;
+    buttons_y = y + height - WINDOW_BORDER - button_h - 8;
+    accept_x = x + width / 2 - button_w - WINDOW_CHAR_W;
+    cancel_x = x + width / 2 + WINDOW_CHAR_W;
+
+    /* The desktop as it really is, before it is dimmed. Whatever was on the
+       screen a moment ago - the menu this question was chosen from, most of
+       the time - is still lying there otherwise, and it would be dimmed along
+       with everything else and sit behind the question looking like part of
+       it. What is darkened has to be the desktop, not the last thing drawn on
+       top of it. */
+    draw_everything();
+    cursor_hide();
+    /* A little over a third of the light left: dark enough that the desktop
+       has plainly stepped back, light enough to still see what one was doing
+       and so what the question is about. */
+    koi_gfx_dim(0, 0, (int)screen.width, (int)screen.height, 96);
+    koi_gfx_present();
+
+    koi_mouse(&pointer);
+    was_down = (pointer.buttons & KOI_BUTTON_LEFT) != 0;
+
+    for (;;) {
+        int over = -1;
+
+        koi_mouse(&pointer);
+        if (pointer.y >= buttons_y && pointer.y < buttons_y + button_h) {
+            if (pointer.x >= accept_x && pointer.x < accept_x + button_w)
+                over = 1;
+            else if (pointer.x >= cancel_x && pointer.x < cancel_x + button_w)
+                over = 0;
+        }
+
+        cursor_hide();
+        window_raised(x, y, width, height);
+        koi_gfx_fill(x + WINDOW_BORDER, y + WINDOW_BORDER,
+                     width - 2 * WINDOW_BORDER, WINDOW_TITLE_H,
+                     window_title_active);
+        window_label(x + (width - text_width(title)) / 2,
+                     y + WINDOW_BORDER + 3, title, window_text);
+        window_label(x + (width - text_width(message)) / 2,
+                     y + WINDOW_BORDER + WINDOW_TITLE_H + WINDOW_CHAR_H - 4,
+                     message, window_text);
+
+        for (int button = 0; button < 2; button++) {
+            int place = button ? accept_x : cancel_x;
+            const char* label = button ? accept : cancel;
+            int down = held == button && over == button;
+
+            if (down) window_sunken(place, buttons_y, button_w, button_h);
+            else window_raised(place, buttons_y, button_w, button_h);
+            /* The one the keyboard is on wears a line under its text: the
+               same mark a focused button has always worn, and one that does
+               not need a second colour to be visible on any theme. */
+            window_label_styled(place + (button_w - text_width(label)) / 2 + down,
+                                buttons_y + 5 + down, label, window_text,
+                                answer == button ? KOI_TEXT_UNDERLINE : 0);
+        }
+        koi_gfx_present_rect(x, y, width, height);
+        cursor_show(pointer.x, pointer.y);
+
+        if (pointer.buttons & KOI_BUTTON_LEFT) {
+            if (!was_down) held = over;
+            was_down = 1;
+        } else if (was_down) {
+            was_down = 0;
+            /* Chosen only when the release lands on the button the press went
+               down on, which is how a pointer says "no, not that one" after
+               it has already been pressed. */
+            if (held >= 0 && over == held) { chosen = held; break; }
+            held = -1;
+        }
+
+        if (koi_keypressed()) {
+            int key = koi_getchar();
+
+            if (key == 27) { chosen = 0; break; }
+            if (key == KOI_KEY_LEFT || key == KOI_KEY_RIGHT || key == '\t')
+                answer = !answer;
+            else if (key == '\n' || key == '\r') { chosen = answer; break; }
+        }
+        koi_sleep(10);
+    }
+
+    cursor_hide();
+    dirty = 1;
+    return chosen;
 }
 
 void window_desktop_menu(const WINDOW_MENU* menus, int count) {
@@ -857,6 +1189,18 @@ int window_next(WINDOW_EVENT* event) {
                 dirty = 1;
                 continue;
             }
+            /* Ctrl+Escape reaches the taskbar button wherever the keyboard
+               was pointing, and is not offered to the window in front - which
+               is the point of it. A menu holding the machine's power switch
+               that only a pointer can reach is one somebody cannot use when
+               the pointer is the thing that has stopped. */
+            if (key == KOI_KEY_MENU) {
+                if (!launcher_label[0]) continue;
+                event->type = WINDOW_EVENT_LAUNCHER;
+                event->window = (WINDOW*)0;
+                event->id = 0;
+                return 1;
+            }
             if (top && top->key) { top->key(top, key); continue; }
             event->type = WINDOW_EVENT_KEY;
             event->window = top;
@@ -917,6 +1261,15 @@ int window_next(WINDOW_EVENT* event) {
             int taken;
 
             last_press = pointer.presses[0];
+
+            /* The taskbar button before anything else on the bar: it sits at
+               the left where a window's own entry would otherwise be tested. */
+            if (launcher_hit(x, y)) {
+                event->type = WINDOW_EVENT_LAUNCHER;
+                event->window = (WINDOW*)0;
+                event->id = 0;
+                return 1;
+            }
 
             taken = take_menu_click(x, y);
             if (taken & 0x10000) {

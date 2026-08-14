@@ -65,6 +65,11 @@ void graphics_line(int x0, int y0, int x1, int y1, boot_uint32_t color);
 void graphics_rect(int x, int y, int width, int height, boot_uint32_t color);
 void graphics_fill(int x, int y, int width, int height, boot_uint32_t color);
 
+/* Darken what is already drawn there. `keep` is how much light survives out
+   of 256, so 128 halves it. Reads the buffer back, which is why it lives in
+   the kernel rather than in whoever wants a dimmed screen. */
+void graphics_dim(int x, int y, int width, int height, int keep);
+
 /* Copy a block of pixels in. `stride` is the source's bytes per row, which is
    not always its width - image formats pad. */
 void graphics_blit(const void* pixels, int x, int y, int width, int height,

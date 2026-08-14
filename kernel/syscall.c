@@ -850,6 +850,10 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
     case SYS_GFX_SCISSOR_RESET:
         graphics_reset_scissor();
         return 0;
+    case SYS_GFX_DIM:
+        graphics_dim(KOI_POINT_X(a), KOI_POINT_Y(a),
+                     KOI_POINT_X(b), KOI_POINT_Y(b), (int)c);
+        return 0;
     case SYS_GFX_TEXT:
         graphics_text(KOI_POINT_X(a), KOI_POINT_Y(a), (const char*)b,
                       (boot_uint32_t)c, (boot_uint32_t)(d < 0 ? 0 : d),

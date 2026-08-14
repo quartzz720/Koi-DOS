@@ -266,6 +266,12 @@ static void handle_scancode(boot_uint8_t code) {
         if (character >= 'a' && character <= 'z') character = (char)(character - 32);
         else if (character >= 'A' && character <= 'Z') character = (char)(character + 32);
     }
+    /* Ctrl+Escape asks for the shell's menu, and has to be told apart from a
+       plain Escape before the control-code rule below turns it into one. */
+    if (control_held && character == 27) {
+        buffer_push(KOI_KEY_MENU);
+        return;
+    }
     /* Ctrl+letter produces the control code, as every terminal has since. */
     if (control_held) {
         if (character >= 'a' && character <= 'z') character = (char)(character - 'a' + 1);

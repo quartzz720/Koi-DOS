@@ -76,7 +76,9 @@
  * nothing else, so raising it would refuse every program already installed on a
  * machine until each was reinstalled. A rule worth keeping is worth keeping for
  * its reason, and the reason does not apply here. */
-#define KOI_ABI_VERSION 14
+/* 15 adds SYS_GFX_DIM, which reuses nothing: the minimum stays where it is,
+   for the reason written above. */
+#define KOI_ABI_VERSION 15
 #define KOI_ABI_MINIMUM 8
 #define KOI_ABI_IS_ALPHA 1
 
@@ -162,6 +164,15 @@ typedef struct {
 #define KOI_KEY_CONTROL 0x10B
 #define KOI_KEY_ALT 0x10C
 #define KOI_KEY_F1 0x110     /* F1..F12 are consecutive from here */
+
+/* Ctrl+Escape, which is what Windows put its Start menu on and what a lot of
+ * fingers already know.
+ *
+ * A code of its own because Escape with Control held is otherwise
+ * indistinguishable from Escape: Ctrl only changes letters, and 27 is not a
+ * letter. Without this the gesture arrives as a plain Escape, which every
+ * program reads as "close this". */
+#define KOI_KEY_MENU 0x11D
 
 /* Set in a SYS_KEYEVENT result when the key came up rather than went down. */
 #define KOI_KEY_RELEASED 0x8000
@@ -396,6 +407,11 @@ typedef struct {
 #define SYS_GFX_TEXT_STYLED 0x3B   /* (point, text, colour, packed) */
 #define SYS_GFX_SCISSOR 0x3C       /* (point, size) - intersect clip rect */
 #define SYS_GFX_SCISSOR_RESET 0x3D /* () - restore full-screen clipping */
+/* (point, size, how much light survives out of 256). Darkens what is already
+   drawn instead of painting over it - the one operation that reads the buffer
+   back, which is why it is a call and not a loop in the caller: a program
+   doing it itself would need two calls per pixel. */
+#define SYS_GFX_DIM 0x3E           /* (point, size, keep) */
 
 #define KOI_TEXT_BOLD 1
 #define KOI_TEXT_ITALIC 2

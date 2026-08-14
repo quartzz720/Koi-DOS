@@ -1353,6 +1353,8 @@ static int hid_to_key(boot_uint8_t usage, boot_uint8_t modifiers) {
 
     character = shift ? hid_shifted[usage] : hid_plain[usage];
     if (!character) return 0;
+    /* Ctrl+Escape, before the control-code rule below: see keyboard.c. */
+    if (control && character == 27) return KOI_KEY_MENU;
     if (control && character >= 'a' && character <= 'z')
         character = (char)(character - 'a' + 1);
     else if (control && character >= 'A' && character <= 'Z')

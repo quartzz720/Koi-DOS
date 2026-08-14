@@ -337,6 +337,48 @@ void graphics_fill(int x, int y, int width, int height, boot_uint32_t color) {
         fill_run(row_of(line) + left, color, (boot_uint32_t)clipped_width);
 }
 
+/* Darken what is already there, rather than paint over it.
+ *
+ * This is the one drawing operation that has to read the buffer back, and it
+ * is here rather than in a program for that reason: a program would have to
+ * fetch and store every pixel through a system call each, which for a screen
+ * is a million calls. Windows dimmed the screen behind a modal box with a
+ * 50% dither pattern because it had no other way; we have the pixels in RAM.
+ *
+ * `keep` is how much of the light survives, out of 256 - so 128 is half.
+ * Red and blue are multiplied together, green on its own, which is the usual
+ * trick for doing two channels at once and works whichever way round the
+ * format puts them. The fourth byte is not colour and goes to zero. */
+void graphics_dim(int x, int y, int width, int height, int keep) {
+    int left;
+    int top;
+    int clipped_width;
+    int clipped_height;
+
+    if (!active || width <= 0 || height <= 0) return;
+    if (keep < 0) keep = 0;
+    if (keep > 255) keep = 255;
+    left = x;
+    top = y;
+    clipped_width = width;
+    clipped_height = height;
+    if (!clip_rect_to_scissor(&left, &top, &clipped_width, &clipped_height))
+        return;
+
+    for (int line = top; line < top + clipped_height; line++) {
+        boot_uint32_t* pixels = row_of(line) + left;
+
+        for (int column = 0; column < clipped_width; column++) {
+            boot_uint32_t color = pixels[column];
+            boot_uint32_t red_blue = ((color & 0x00FF00FF)
+                                      * (boot_uint32_t)keep >> 8) & 0x00FF00FF;
+            boot_uint32_t green = ((color & 0x0000FF00)
+                                   * (boot_uint32_t)keep >> 8) & 0x0000FF00;
+            pixels[column] = red_blue | green;
+        }
+    }
+}
+
 void graphics_rect(int x, int y, int width, int height, boot_uint32_t color) {
     int right = (int)((long long)x + width - 1);
     int bottom = (int)((long long)y + height - 1);

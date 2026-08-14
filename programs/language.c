@@ -41,8 +41,31 @@ static const char* phrases[SAY_COUNT][LANGUAGE_COUNT] = {
                                "система тримає одну за раз.", "το σύστημα διατηρεί ένα κάθε φορά." },
     /* SAY_FREE           */ { "KiB free", "КиБ свободно", "КіБ вільно", "KiB διαθέσιμα" },
     /* SAY_COULD_NOT_SAVE */ { "could not save", "не удалось сохранить",
-                               "не вдалося зберегти", "δεν ήταν δυνατή η αποθήκευση" }
+                               "не вдалося зберегти", "δεν ήταν δυνατή η αποθήκευση" },
+    /* SAY_START          */ { "Start", "Пуск", "Пуск", "Έναρξη" },
+    /* SAY_PROGRAMS       */ { "Programs", "Программы", "Програми",
+                               "Προγράμματα" },
+    /* SAY_SETTINGS       */ { "Settings", "Настройка", "Налаштування",
+                               "Ρυθμίσεις" },
+    /* SAY_SHUT_DOWN      */ { "Shut Down...", "Завершение работы...",
+                               "Завершення роботи...", "Τερματισμός..." },
+    /* SAY_SHUT_DOWN_ASK  */ { "Turn the machine off?",
+                               "Выключить машину?", "Вимкнути машину?",
+                               "Να σβήσει το μηχάνημα;" },
+    /* SAY_NO_PROGRAMS    */ { "(no packages installed)",
+                               "(пакеты не установлены)",
+                               "(пакети не встановлено)",
+                               "(δεν υπάρχουν πακέτα)" }
 };
+
+/* The table above is indexed by the enum in language.h, so the two orders have
+ * to agree - and the compiler cannot see when they do not, because both sides
+ * are just a list.
+ *
+ * These six were first added in the middle, where they read nicely, while the
+ * enum put them at the end: every phrase after that point would have come out
+ * as the one six places along, and nothing would have failed to build. New
+ * phrases go on the end of both, and this line is here to say so. */
 
 static const char* const weekdays[LANGUAGE_COUNT][7] = {
     { "Su", "Mo", "Tu", "We", "Th", "Fr", "Sa" },

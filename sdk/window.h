@@ -93,6 +93,7 @@ struct WINDOW {
 #define WINDOW_EVENT_CLOSE 2       /* a window's close box */
 #define WINDOW_EVENT_QUIT 3        /* the desktop was asked to end */
 #define WINDOW_EVENT_KEY 4         /* a key nothing else wanted */
+#define WINDOW_EVENT_LAUNCHER 5    /* the taskbar button was pressed */
 
 typedef struct {
     int type;
@@ -110,6 +111,47 @@ int window_reopen_desktop(void);
 
 /* The desktop's own menu bar, across the top. */
 void window_desktop_menu(const WINDOW_MENU* menus, int count);
+
+/* One button at the left of the taskbar, or NULL for none.
+ *
+ * Deliberately not called a Start button. This library draws a bar and knows
+ * the order things are stacked in; it has no business knowing what a shell
+ * puts on it. Pressing it produces WINDOW_EVENT_LAUNCHER and nothing else
+ * happens - what the button means is the caller's, and Mizu is the caller that
+ * makes it a Start menu.
+ *
+ * `pressed` draws it held down, for as long as the menu it opened is up. */
+void window_launcher(const char* label);
+void window_launcher_pressed(int pressed);
+
+/* A menu that appears where it is told and above everything.
+ *
+ * Here rather than in the caller because only this file knows what is drawn
+ * over what, and because the pointer has to be taken off the screen and put
+ * back around it. Blocks until something is chosen or the pointer is clicked
+ * away; returns the chosen item's `id`, or -1.
+ *
+ * `x` and `y` are the bottom-left corner, because the thing that opens one is
+ * on the taskbar and a menu that grew downwards from there would grow off the
+ * screen. */
+int window_popup(const WINDOW_ITEM* items, int count, int x, int y);
+
+/* A question in the middle of the screen, with the rest of it dimmed.
+ *
+ * Blocks until it is answered; returns 1 for `accept`, 0 for `cancel`, and 0
+ * for Escape - a question waved away should give the answer that does
+ * nothing. `accept_by_default` says which button the keyboard starts on, and
+ * for anything irreversible that is the other one.
+ *
+ * The dimming is what makes it a question rather than one more window: see
+ * the note in window.c. */
+int window_confirm(const char* title, const char* message, const char* accept,
+                   const char* cancel, int accept_by_default);
+
+/* Where a menu opened from the taskbar button belongs. The caller does not
+   know how tall the bar is or where the button sits, and should not have to
+   ask twice for something this file already decided. */
+void window_launcher_anchor(int* x, int* y);
 
 WINDOW* window_new(const char* title, int x, int y, int width, int height);
 void window_delete(WINDOW* window);

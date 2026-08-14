@@ -408,6 +408,15 @@ static inline void koi_gfx_fill(int x, int y, int width, int height,
                    (long)color);
 }
 
+/* Darken what is already drawn in this rectangle. `keep` is how much of the
+   light survives out of 256, so 128 halves it and 0 goes to black. This is
+   what puts a modal dialogue in front of a screen rather than merely on top
+   of it: everything behind it visibly stops being where the work is. */
+static inline void koi_gfx_dim(int x, int y, int width, int height, int keep) {
+    (void)koi_call(SYS_GFX_DIM, KOI_POINT(x, y), KOI_POINT(width, height),
+                   (long)keep);
+}
+
 /* Text in the system font at pixel coordinates. Pass KOI_TEXT_TRANSPARENT as
    the background to draw only the lit pixels over whatever is already there. */
 static inline void koi_gfx_text(int x, int y, const char* text,
