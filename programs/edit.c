@@ -243,7 +243,9 @@ int main(void) {
 
     if (path[0]) {
         if (!edit_load(&editor, path, BUFFER_BYTES)) {
-            koi_print("Not enough memory to open that file.\n");
+            koi_print("That file will not fit in the editor - it is larger "
+                      "than the buffer, and opening part of it would mean "
+                      "saving part of it.\n");
             return 1;
         }
     } else if (!edit_new(&editor, BUFFER_BYTES)) {

@@ -9,13 +9,18 @@
 #include "fat32.h"
 #include "partition.h"
 #include "program.h"
+#include "task.h"
 #include "string.h"
 #include "heap.h"
 #include "memory.h"
+#include "paging.h"
 #include "block.h"
 #include "timer.h"
 #include "pci.h"
 #include "xhci.h"
+#include "net.h"
+#include "tcp.h"
+#include "tls.h"
 #include "graphics.h"
 #include "mouse.h"
 #include "rtc.h"
@@ -147,6 +152,20 @@ static char* capture_into;
 static boot_uint32_t capture_room;
 static boot_uint32_t capture_used;
 
+/* Whether a program is collecting this output instead of it going to the
+ * screen.
+ *
+ * Asked by everything that would otherwise stop and wait for a keystroke. A
+ * captured command has no screen to fill and nobody to press anything: the
+ * program that asked for it is stopped inside the call, and on a graphical
+ * desktop that program is the only thing that could have read a key. So the
+ * pager waits for a key the desktop cannot deliver because the desktop is
+ * waiting for the pager - a deadlock with no way out but the power switch,
+ * which is what typing `log` in a terminal window did. */
+int syscall_capturing(void) {
+    return capture_into != (char*)0;
+}
+
 static void capture_for_program(char character) {
     /* Room for the terminating zero is kept back: a caller that reads the
        buffer as a string should not have to know how full it got. */
@@ -188,10 +207,21 @@ static VOLUME* resolve_place(const char* name, char* result) {
  *
  * Tracked rather than handed out and forgotten, because nothing here reclaims
  * memory later: a block a program leaks would be gone until the machine is
- * restarted. Eight blocks is generous - a program that needs more than a
- * handful of large allocations should be taking one and dividing it itself,
- * which is what a program large enough to care already does. */
-#define BLOCK_MAX 8
+ * restarted.
+ *
+ * This said eight, with a note that eight is generous and that a program
+ * needing more should take one block and divide it itself. That was wrong in
+ * a way that took a long time to see, because the failure is silent: the
+ * ninth allocation returns zero, and a program written to check its
+ * allocations does exactly what it should - it gives up on that one thing and
+ * carries on. The browser, holding one block of pixels per picture, drew a
+ * page of alt text and no pictures, and said nothing, because nothing had
+ * gone wrong that it could see.
+ *
+ * Sixty-four, and the table is a kilobyte. The rule that a program should
+ * divide its own memory still holds for a program allocating in a loop; it
+ * does not hold for one holding a handful of things per picture on a page. */
+#define BLOCK_MAX 64
 
 typedef struct {
     void* address;
@@ -223,6 +253,20 @@ static long do_alloc(long bytes) {
     blocks[slot].address = address;
     blocks[slot].pages = pages;
     blocks[slot].owner = program_depth();
+    /* A program at ring 3 has to be able to reach what it just asked for.
+       Kernel memory handed to a program that cannot touch it is not memory,
+       it is a page fault with a delay. */
+    if (program_is_user() &&
+        !program_allow_user((boot_uint64_t)(unsigned long long)address,
+                            pages * PAGE_SIZE)) {
+        /* Memory a program cannot reach is not memory. Better to fail the
+           request it can check than to hand back a pointer that faults. */
+        serial_write("ALLOC: could not map a block for ring 3\n");
+        free_pages(address, pages);
+        blocks[slot].address = (void*)0;
+        blocks[slot].pages = 0;
+        return 0;
+    }
     return (long)(unsigned long long)address;
 }
 
@@ -261,18 +305,41 @@ static long do_free(long address) {
  * started it reads an address that now belongs to something else - which is
  * not a wrong noise, it is a wrong noise a thousand times a second forever.
  * It is the same rule and now it has the same owner. */
-void syscall_close_all(void) {
-    int depth = program_depth();
-
-    audio_stop_deeper_than(depth);
+/* Is any program holding a file open?
+ *
+ * The question a rescan has to ask before it rebuilds the volume table: a
+ * handle carries the volume it was opened on, and rebuilding under it points
+ * that handle at whatever now occupies the same slot. */
+int syscall_files_open(void) {
     for (int slot = 0; slot < HANDLE_MAX; slot++)
-        if (handles[slot].used && handles[slot].owner > depth)
+        if (handles[slot].used) return 1;
+    for (int slot = 0; slot < SEARCH_MAX; slot++)
+        if (searches[slot].used) return 1;
+    return 0;
+}
+
+/* Everything one program was holding, given back.
+ *
+ * By owner rather than by depth. It used to be "everything deeper than the
+ * shell", which is the same set as long as programs run one at a time and
+ * disastrously not the same set the moment two of them do: a program that
+ * exits while another is still running would have taken the other one's
+ * files, memory and sound with it. The owner tag identifies a program rather
+ * than a position, and this frees exactly that program's. */
+void syscall_close_owner(int owner) {
+    if (owner <= 0) return;
+
+    audio_stop_owner(owner);
+    /* And the screen, if it ended while holding it. */
+    graphics_release_owner(owner);
+    for (int slot = 0; slot < HANDLE_MAX; slot++)
+        if (handles[slot].used && handles[slot].owner == owner)
             memset(&handles[slot], 0, sizeof(handles[slot]));
     for (int slot = 0; slot < SEARCH_MAX; slot++)
-        if (searches[slot].used && searches[slot].owner > depth)
+        if (searches[slot].used && searches[slot].owner == owner)
             memset(&searches[slot], 0, sizeof(searches[slot]));
     for (int slot = 0; slot < BLOCK_MAX; slot++) {
-        if (!blocks[slot].address || blocks[slot].owner <= depth) continue;
+        if (!blocks[slot].address || blocks[slot].owner != owner) continue;
         free_pages(blocks[slot].address, blocks[slot].pages);
         blocks[slot].address = (void*)0;
         blocks[slot].pages = 0;
@@ -388,7 +455,24 @@ static long do_open(const char* path, long mode) {
             return SYSCALL_ERROR;
         handles[slot].writable = 1;
     } else {
-        if (!fat32_stat(working_volume, absolute, &handles[slot].entry))
+        /* On the volume the path named, not on the one the shell happens to
+         * be standing in.
+         *
+         * resolve_place() has just worked out which drive "Y:\TEST.BMP"
+         * means, and the handle records it - and then this looked the file up
+         * somewhere else entirely. What came back was the directory entry of
+         * whatever had that name on the current drive: its first cluster and
+         * its size. Reading then used the handle's volume, correctly, with
+         * cluster numbers belonging to a different disk.
+         *
+         * So the file opened, the size was right, and the contents were
+         * another file's - or nobody's. It reads as a broken disk driver, and
+         * it survived a day of looking at one, because every test was run
+         * from the drive the file was on and there the two volumes are the
+         * same. What found it was opening a picture from a USB stick while
+         * standing on the system drive, and then noticing that the same
+         * picture opens perfectly after typing `Y:`. */
+        if (!fat32_stat(handles[slot].volume, absolute, &handles[slot].entry))
             return SYSCALL_ERROR;
         if (handles[slot].entry.attributes & FAT_ATTRIBUTE_DIRECTORY)
             return SYSCALL_ERROR;
@@ -481,6 +565,19 @@ static long system_info(long item, long index) {
         return volume ? (long)(fat32_free_bytes(volume) / 1024U)
                       : SYSCALL_ERROR;
     }
+    case KOI_INFO_LAST_EXIT:
+        return (long)command_last_exit();
+
+    case KOI_INFO_PROGRAM_RUNNING:
+        return program_is_running((int)index) ? 1 : 0;
+
+    case KOI_INFO_DISK_GENERATION:
+        /* And look again while answering, if it is safe to: a program asking
+           this is a program that keeps a list of drives, and the answer is
+           worth more if the table behind it is current. */
+        if (!syscall_files_open()) (void)partition_settle();
+        return (long)block_generation();
+
     case KOI_INFO_TIME: {
         RTC_TIME now;
         rtc_read(&now);
@@ -538,6 +635,21 @@ static long system_text(long item, long index, char* buffer, long size) {
     case KOI_TEXT_VERSION_NAME:
         source = KOI_VERSION_NAME;
         break;
+
+    case KOI_TEXT_WORKING_DIRECTORY: {
+        static char place[WORKING_PATH_MAX + 4];
+        int at = 0;
+
+        place[at++] = working_volume && working_volume->letter
+                      ? working_volume->letter : '?';
+        place[at++] = ':';
+        for (int index = 0; working_path[index] && at + 1 < (int)sizeof(place);
+             index++)
+            place[at++] = working_path[index];
+        place[at] = 0;
+        source = place;
+        break;
+    }
     default:
         return SYSCALL_ERROR;
     }
@@ -551,6 +663,29 @@ static long system_text(long item, long index, char* buffer, long size) {
         buffer[length] = 0;
         return length;
     }
+}
+
+/* End a program that has asked a person something nobody can answer.
+ *
+ * Its output is going into a buffer rather than onto the screen, the screen
+ * belongs to whoever started it, and that program is stopped inside the call
+ * and is the only thing that could read the keyboard. Waiting is waiting for
+ * ever, and from outside it is a machine that has died - which is what
+ * running the console editor from the file browser did.
+ *
+ * Answering Ctrl+C was tried first and is not enough: a program is free to
+ * ignore it, and the editor does - it asked four and a half thousand times in
+ * as many milliseconds. So the program is ended, which is the only outcome
+ * that is neither a hang nor a lie. The exit code says it was interrupted,
+ * because it was.
+ *
+ * What this is not: a rule that captured programs may not read input. A
+ * program that reads a line from a pipe is reading a file, not a person, and
+ * goes nowhere near here. */
+__attribute__((noreturn)) static void stop_for_want_of_an_answer(void) {
+    serial_write("SYSCALL: a captured program asked a question nobody can "
+                 "answer; stopping it\n");
+    program_exit(KOI_EXIT_INTERRUPTED);
 }
 
 long syscall_dispatch(long function, long a, long b, long c, long d);
@@ -650,11 +785,29 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
         return length;
     }
 
+    /* See stop_for_want_of_an_answer, above.
+     *
+     * A program asking a person something, while its output is being
+     * collected rather than shown.
+     *
+     * Nobody can answer: what it printed went into a buffer, the screen still
+     * belongs to whoever started it, and that program is stopped inside the
+     * call and is the only thing that could have read the keyboard. Waiting
+     * here waits for ever, and from outside it is indistinguishable from a
+     * machine that has died - which is what running the console editor from
+     * the file browser did.
+     *
+     * So the answer is the one a person would give by pressing Ctrl+C: stop.
+     * A program that reads that and carries on regardless is a program that
+     * would have hung anyway, and this at least leaves a line in the log
+     * saying which one it was. */
     case SYS_GETCHAR:
+        if (syscall_capturing()) stop_for_want_of_an_answer();
         return keyboard_getchar();
 
     case SYS_READLINE:
         if (!a || b <= 0) return 0;
+        if (syscall_capturing()) stop_for_want_of_an_answer();
         return (long)keyboard_read_line((char*)a, (boot_uint64_t)b);
 
     case SYS_CLS:
@@ -683,7 +836,17 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
     case SYS_SLEEP:
         /* Clamped rather than trusted. A program that computes a delay wrongly
            should stutter, not hang the only thread the system has. */
-        if (a > 0) timer_wait(a > 60000 ? 60000 : (boot_uint64_t)a);
+        if (a > 0) {
+            boot_uint64_t until = a > 60000 ? 60000 : (boot_uint64_t)a;
+            boot_uint64_t start = timer_ticks();
+
+            /* Sleeping is the plainest case of a program with nothing to do,
+               and the plainest case of somebody else being able to use the
+               processor while it has nothing to do. The wait itself is
+               unchanged; what is new is that it is not a wait the rest of the
+               machine has to sit through. */
+            while (!timer_expired(start, until)) task_yield();
+        }
         return 0;
 
     case SYS_SETTHEME: {
@@ -841,6 +1004,23 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
         KOI_SCREEN* out = (KOI_SCREEN*)a;
 
         if (!out || !graphics_enter(&screen)) return SYSCALL_ERROR;
+        /* The screen a program draws into is the kernel's back buffer, and a
+           program at ring 3 is handed a pointer to it. Handing over the
+           pointer without handing over the pages is what `ring3 demo` faulted
+           on: it drew its first rectangle straight into memory it did not
+           have. The buffer is the program's to write while it holds the
+           screen - the same bargain as the rest of graphics. */
+        if (program_is_user() &&
+            !program_allow_user((boot_uint64_t)(unsigned long long)
+                                screen.pixels,
+                                (boot_uint64_t)screen.pitch * screen.height)) {
+            /* Said out loud rather than left to become a page fault three
+               instructions later, in a program that did nothing wrong. */
+            console_write("The screen could not be given to this program.\n");
+            serial_write("GRAPHICS: could not map the buffer for ring 3\n");
+            graphics_leave();
+            return SYSCALL_ERROR;
+        }
         out->width = screen.width;
         out->height = screen.height;
         out->pitch = screen.pitch;
@@ -1012,6 +1192,111 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
         return (long)device->sector_size;
     }
 
+    case SYS_SOUND_OPEN: {
+        int voice = audio_stream_open((boot_uint32_t)a, (int)((b >> 8) & 0xFF),
+                                      (int)(b & 0xFF), (int)c);
+        if (voice >= 0) audio_set_owner(program_owner());
+        return voice;
+    }
+
+    case SYS_SOUND_QUEUE:
+        if (!b || c <= 0) return SYSCALL_ERROR;
+        return audio_stream_queue((int)a, (const void*)b, (boot_uint32_t)c);
+
+    case SYS_SOUND_SPACE:
+        return audio_stream_space((int)a);
+
+    case SYS_SOUND_PAUSE:
+        return audio_pause((int)a, (int)b);
+
+    case SYS_SOUND_PAUSED:
+        return audio_paused((int)a);
+
+    case SYS_SOUND_FLUSH:
+        return audio_stream_flush((int)a, (boot_uint32_t)b);
+
+    case SYS_NET_RESOLVE: {
+        boot_uint32_t address = 0;
+
+        if (!a || !b) return SYSCALL_ERROR;
+        if (!net_resolve((const char*)a, &address)) {
+            /* Said out loud. A program is told only that the name did not
+               resolve, and "it works in the browser but not for the picture
+               on the same page" is not a thing anybody can debug from
+               there. */
+            serial_write("DNS: no answer for ");
+            serial_write((const char*)a);
+            serial_write("\n");
+            return SYSCALL_ERROR;
+        }
+        *(boot_uint32_t*)b = address;
+        return 0;
+    }
+
+    case SYS_TCP_CONNECT:
+        return tcp_connect((boot_uint32_t)a, (boot_uint16_t)b,
+                           (boot_uint32_t)c);
+
+    case SYS_TCP_SEND:
+        if (!b) return SYSCALL_ERROR;
+        return tcp_send((int)a, (const void*)b, KOI_NET_LENGTH(c),
+                        KOI_NET_TIMEOUT(c));
+
+    case SYS_TCP_RECEIVE:
+        if (!b) return SYSCALL_ERROR;
+        return tcp_receive((int)a, (void*)b, KOI_NET_LENGTH(c),
+                           KOI_NET_TIMEOUT(c));
+
+    case SYS_TCP_CLOSE:
+        return tcp_close((int)a, 1000);
+
+    case SYS_TCP_OPEN:
+        return tcp_is_open((int)a);
+
+    case SYS_TLS_CONNECT: {
+        const char* name = (const char*)c;
+        int handle = tls_connect((boot_uint32_t)a,
+                                 (boot_uint16_t)KOI_NET_LENGTH(b),
+                                 name, KOI_NET_TIMEOUT(b));
+
+        if (handle < 0) {
+            serial_write("TLS: ");
+            serial_write(name ? name : "(no name)");
+            serial_write(": ");
+            serial_write(tls_trouble());
+            serial_write("\n");
+        }
+        return handle;
+    }
+
+    case SYS_TLS_SEND:
+        if (!b) return SYSCALL_ERROR;
+        return tls_send((int)a, (const void*)b, KOI_NET_LENGTH(c),
+                        KOI_NET_TIMEOUT(c));
+
+    case SYS_TLS_RECEIVE:
+        if (!b) return SYSCALL_ERROR;
+        return tls_receive((int)a, (void*)b, KOI_NET_LENGTH(c),
+                           KOI_NET_TIMEOUT(c));
+
+    case SYS_TLS_CLOSE:
+        return tls_close((int)a);
+
+    case SYS_TLS_CHECKED:
+        return tls_identity_checked((int)a);
+
+    case SYS_THREAD_START:
+        return program_thread_start((boot_uint64_t)a, (boot_uint64_t)b,
+                                    (boot_uint64_t)c);
+
+    case SYS_THREAD_EXIT:
+        program_thread_finish();
+        return 0;               /* never reached */
+
+    case SYS_YIELD:
+        task_yield();
+        return 0;
+
     case SYS_CAPTURE: {
         const char* line = (const char*)a;
         long size = c;
@@ -1064,6 +1349,26 @@ long syscall_dispatch(long function, long a, long b, long c, long d) {
            redraw the desktop over it. */
         const char* line = (const char*)a;
         if (!line) return -1;
+        /* `b` says whether to wait. Not waiting is what a desktop wants: it
+         * asked for a program to be started, not for its own drawing to stop
+         * until that program is finished.
+         *
+         * The exit code cannot be reported to a caller that is not waiting for
+         * one, so it returns 0 for "started" and the caller finds out the
+         * program has ended the way a desktop finds out anything - by looking
+         * at the screen. */
+        if (b) {
+            program_run_next_in_background();
+            {
+                long found = command_execute_line(line);
+                /* If nothing consumed the request, nothing was started - a
+                   built-in command, or no such program. */
+                program_run_next_cancel();
+                if (found == KOI_EXIT_NOT_FOUND) return KOI_EXIT_NOT_FOUND;
+                /* The name of what was started, for asking after it later. */
+                return (long)program_last_started();
+            }
+        }
         return command_execute_line(line);
     }
     case SYS_SECTOR_SIZE: {

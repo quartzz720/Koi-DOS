@@ -3,6 +3,7 @@
 #include "font.h"
 #include "memory.h"
 #include "string.h"
+#include "program.h"
 
 /* The same two format codes the console works from. They describe BYTE order,
    not the value of the 32-bit word - see the note in console.c, which is where
@@ -16,6 +17,39 @@ static boot_uint32_t screen_height;
 static boot_uint32_t pixels_per_scan_line;
 static boot_uint32_t pixel_format;
 
+/* The screen, stacked.
+ *
+ * One program held it and the next one was refused, so a desktop that wanted
+ * to run a program had to give the screen up first - and what somebody saw
+ * was the desktop vanish, half a second of console, and then the program.
+ * That flash is the whole reason this is a stack.
+ *
+ * Now a program that asks while somebody else is holding gets a buffer of its
+ * own, laid over the one below. The desktop's pixels are not touched, not
+ * copied and not redrawn: they sit in their buffer until the program above
+ * finishes, and coming back is one blit rather than a repaint of everything.
+ *
+ * It is also what makes a console program invisible. A program that only
+ * prints never asks for the screen at all, so the screen never changes hands
+ * and there is nothing to flash - the desktop can collect its output and show
+ * it in a window. Which is what a DOS box in Windows was: the same program,
+ * the same output, and the screen only changing hands when the program says
+ * it wants it.
+ *
+ * Bounded by the number of programs that can be resident, because a level is
+ * taken by a program and given back when it ends. */
+#define GRAPHICS_DEPTH 4
+
+typedef struct {
+    boot_uint32_t* buffer;
+    boot_uint64_t pages;
+    int owner;                 /* program_owner() of whoever took it */
+} GRAPHICS_LEVEL;
+
+static GRAPHICS_LEVEL levels[GRAPHICS_DEPTH];
+static int depth;
+
+/* The top of the stack, which is what every primitive draws into. */
 static boot_uint32_t* buffer;
 static boot_uint64_t buffer_pages;
 static int active;
@@ -51,16 +85,25 @@ int graphics_active(void) {
 }
 
 int graphics_enter(GRAPHICS_SCREEN* screen) {
-    if (!screen || active || !framebuffer || !screen_width || !screen_height)
-        return 0;
+    boot_uint32_t* taken;
+    boot_uint64_t pages;
 
-    buffer_pages = ((boot_uint64_t)screen_width * screen_height * 4
-                    + PAGE_SIZE - 1) / PAGE_SIZE;
-    buffer = (boot_uint32_t*)alloc_pages(buffer_pages);
-    if (!buffer) {
-        buffer_pages = 0;
-        return 0;
-    }
+    if (!screen || !framebuffer || !screen_width || !screen_height) return 0;
+    if (depth >= GRAPHICS_DEPTH) return 0;
+
+    pages = ((boot_uint64_t)screen_width * screen_height * 4
+             + PAGE_SIZE - 1) / PAGE_SIZE;
+    taken = (boot_uint32_t*)alloc_pages(pages);
+    if (!taken) return 0;
+
+    /* The one below keeps its buffer and its pixels; this goes on top. */
+    levels[depth].buffer = taken;
+    levels[depth].pages = pages;
+    levels[depth].owner = program_owner();
+    depth++;
+
+    buffer = taken;
+    buffer_pages = pages;
     /* Black rather than whatever the pages last held. A program that draws
        only part of the screen should not be shown someone else's memory. */
     memset(buffer, 0, buffer_pages * PAGE_SIZE);
@@ -165,15 +208,41 @@ void graphics_present_rect(int x, int y, int width, int height) {
 }
 
 void graphics_leave(void) {
-    if (!active) return;
+    if (!active || !depth) return;
+
+    free_pages(levels[depth - 1].buffer, levels[depth - 1].pages);
+    depth--;
+
+    if (depth) {
+        /* Back to whoever was holding it before, whose pixels never went
+           anywhere. One blit, and the desktop is on screen again exactly as
+           it was - no repaint, and nothing for the program underneath to
+           notice or have to do. */
+        buffer = levels[depth - 1].buffer;
+        buffer_pages = levels[depth - 1].pages;
+        active = 1;
+        reset_scissor();
+        graphics_present();
+        return;
+    }
+
     active = 0;
-    free_pages(buffer, buffer_pages);
     buffer = (boot_uint32_t*)0;
     buffer_pages = 0;
     /* The console still holds everything that was on screen, so giving it back
        is a repaint rather than a redraw - nothing was lost while it was
        hidden, and the shell does not have to know it ever happened. */
     console_redraw();
+}
+
+/* Give back every level a program took and did not.
+ *
+ * A program that ends while holding the screen used to leave it held, and the
+ * machine came back to a shell nobody could see. With a stack that is worse:
+ * a level nobody owns is a level nothing ever pops. Called when a slot is
+ * cleared away, with that slot's owner tag. */
+void graphics_release_owner(int owner) {
+    while (depth && levels[depth - 1].owner == owner) graphics_leave();
 }
 
 /* ---- Primitives ---------------------------------------------------------
@@ -448,10 +517,17 @@ void graphics_blit(const void* pixels, int x, int y, int width, int height,
     if (!clip_rect_to_scissor(&left, &top, &clipped_width, &clipped_height))
         return;
 
+    /* `stride` is in pixels, which is what the interface says and what every
+     * caller means. It was multiplied as though it were bytes, and nothing
+     * noticed for one reason: the only caller blitted a single row at a time,
+     * and with a height of one the step between rows is never taken. The
+     * first call with a real height drew the same narrow strip over and over
+     * with the colours smeared - which is exactly what reading each row a
+     * quarter of the way into the previous one looks like. */
     for (int line = 0; line < clipped_height; line++) {
         const boot_uint32_t* input =
-            (const boot_uint32_t*)(source + (boot_uint64_t)(top - y + line) * stride) +
-            (left - x);
+            (const boot_uint32_t*)source +
+            (boot_uint64_t)(top - y + line) * stride + (left - x);
         boot_uint32_t* output = row_of(top + line);
         for (int column = 0; column < clipped_width; column++)
             output[left + column] = input[column];

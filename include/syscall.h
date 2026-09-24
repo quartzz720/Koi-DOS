@@ -193,6 +193,16 @@ typedef struct {
  * letter. Without this the gesture arrives as a plain Escape, which every
  * program reads as "close this". */
 #define KOI_KEY_MENU 0x11D
+/* Alt+F4 and the Windows key with R, told apart from the keys they are made
+ * of for the same reason Ctrl+Escape was: F4 on its own is a key a program may
+ * want, and so is the letter R, and a window manager cannot go asking every
+ * program whether it minded.
+ *
+ * A gesture somebody already has in their fingers is worth more than a better
+ * one they would have to learn - which is the whole argument for using the
+ * three that every machine since 1995 has had. */
+#define KOI_KEY_CLOSE 0x11E      /* Alt+F4 */
+#define KOI_KEY_RUN 0x11F        /* the Windows key with R */
 
 /* Set in a SYS_KEYEVENT result when the key came up rather than went down. */
 #define KOI_KEY_RELEASED 0x8000
@@ -361,6 +371,32 @@ typedef struct {
 #define KOI_INFO_DATE 26             /* year << 16 | month << 8 | day */
 #define KOI_INFO_VOLUME_TOTAL_BYTES 27 /* index selects the volume, KiB */
 #define KOI_INFO_VOLUME_FREE_BYTES 28  /* index selects the volume, KiB */
+/* How many times a disk has appeared or disappeared since the machine
+ * started. A program that lists drives keeps the last number it saw and
+ * compares: when they differ, its list is out of date and a stick has been
+ * plugged in or pulled out.
+ *
+ * Asking also lets the kernel look again, which it does only when the asking
+ * program has no files open - rebuilding the volume table under an open file
+ * hands it another disk's bytes. */
+#define KOI_INFO_DISK_GENERATION 29
+
+/* Whether a program started with koi_start is still running. The index is the
+ * name that call handed back.
+ *
+ * A caller that does not wait for a program needs some way to find out that it
+ * has ended, and this is the smallest one that works: it asks, when it wants
+ * to know, instead of being told. A desktop that gave the screen to a program
+ * it started asks this on its way round the loop, and takes the screen back
+ * the moment the answer is no. */
+#define KOI_INFO_PROGRAM_RUNNING 30
+
+/* What the last command run through SYS_RUN or SYS_CAPTURE exited with.
+ *
+ * Capture returns how much was printed, which is what its caller asked for
+ * and not the same question. A desktop that ran something needs both: the
+ * text to show, and whether there was anything to run at all. */
+#define KOI_INFO_LAST_EXIT 31
 
 #define KOI_TIME_HOUR(packed) ((int)(((packed) >> 16) & 0xFF))
 #define KOI_TIME_MINUTE(packed) ((int)(((packed) >> 8) & 0xFF))
@@ -389,6 +425,13 @@ typedef struct {
 /* The version in words - "0.9 Pre-release" - so a program prints what the
    system calls itself rather than its own guess at it. */
 #define KOI_TEXT_VERSION_NAME 7
+/* Where the shell is standing: "Z:\\GAMES", drive letter included.
+ *
+ * For anything that draws a prompt of its own. A window with a prompt painted
+ * into it is a window that says Z: after you have changed to Y:, which is a
+ * lie told sixty times a second - and the only way to avoid it was to ask the
+ * one place that knows. */
+#define KOI_TEXT_WORKING_DIRECTORY 8
 
 /* Graphics.
  *
@@ -674,6 +717,110 @@ typedef struct {
  * read and act on however it likes. The kernel turns it back on when the
  * program exits, so this cannot leave a machine that will not stop. */
 #define SYS_BREAK 0x60       /* (enabled) -> 0 */
+
+/* ---- Streaming sound -----------------------------------------------------
+ *
+ * SYS_SOUND_PLAY takes a buffer that must stay where it is until the sound
+ * ends, which is right for an effect and impossible for a song: four minutes
+ * at 48 kHz stereo is forty-six megabytes of samples. These three are the
+ * other arrangement - open a stream, hand it frames as they are decoded, stop
+ * it when the music does.
+ *
+ * The kernel keeps the ring, so a program may reuse its own buffer the moment
+ * a queue call returns. A queue that takes fewer frames than offered means
+ * the ring is nearly full, which is what a stream that is keeping up looks
+ * like; come back with the rest.
+ */
+#define SYS_SOUND_OPEN 0x61  /* (rate, KOI_SOUND_SHAPE(bits, channels), volume)
+                                -> voice, or -1 */
+#define SYS_SOUND_QUEUE 0x62 /* (voice, samples, frames) -> frames taken, -1 */
+#define SYS_SOUND_SPACE 0x63 /* (voice) -> frames of room, or -1 */
+/* Pause any voice, and throw away a stream's queue.
+ *
+ * Pausing is the kernel's business rather than the player's: a player can
+ * stop feeding a stream, but it cannot un-hear the half second already in the
+ * ring. Flushing is what a seek needs for the same reason - the samples
+ * already handed over belong to the part of the song being left behind.
+ */
+#define SYS_SOUND_PAUSE 0x64 /* (voice, paused) -> 0, or -1 */
+#define SYS_SOUND_PAUSED 0x65 /* (voice) -> 1 when paused */
+#define SYS_SOUND_FLUSH 0x66 /* (voice, frames heard so far) -> 0, or -1 */
+
+/* ---- The network, for programs -------------------------------------------
+ *
+ * A program could ping nothing and fetch nothing: everything on a wire was
+ * the kernel's own - DHCP at boot, DNS inside `ping`, TFTP inside `dosget`.
+ * These four are what a program needs to have a conversation of its own, and
+ * they exist because a browser is a program.
+ *
+ * Every one blocks with a timeout and drives the network while it waits. A
+ * program that must keep drawing asks for a short one and comes back - which
+ * is what a window in a cooperative desktop does anyway.
+ *
+ * Addresses are in host order, the way the kernel keeps them. Ports are
+ * ordinary numbers.
+ */
+#define SYS_NET_RESOLVE 0x67  /* (name, &address) -> 0, or -1 */
+#define SYS_TCP_CONNECT 0x68  /* (address, port, timeout ms) -> handle, or -1 */
+#define SYS_TCP_SEND 0x69     /* (handle, data, KOI_NET_ARG(length, timeout)) */
+#define SYS_TCP_RECEIVE 0x6A  /* (handle, buffer, KOI_NET_ARG(size, timeout)) */
+#define SYS_TCP_CLOSE 0x6B    /* (handle) -> 0 */
+#define SYS_TCP_OPEN 0x6C     /* (handle) -> 1 while there is more to read */
+
+/* And the same over TLS, which is what https is made of.
+ *
+ * The same five calls with the same shapes, so that a program which can speak
+ * to a server in the clear speaks to one in private by changing which it
+ * calls. SYS_TLS_CONNECT takes the name as well as the address: a server with
+ * several sites needs to be told which one is wanted, and the name is what a
+ * certificate is checked against once certificates are checked at all.
+ *
+ * SYS_TLS_CHECKED answers the question that matters and answers it honestly:
+ * 1 when somebody verified who is on the other end, 0 when the connection is
+ * merely private. Anything drawing a padlock must ask this first. */
+#define SYS_TLS_CONNECT 0x6D  /* (address, KOI_NET_ARG(port, timeout), name) */
+#define SYS_TLS_SEND 0x6E     /* (handle, data, KOI_NET_ARG(length, timeout)) */
+#define SYS_TLS_RECEIVE 0x6F  /* (handle, buffer, KOI_NET_ARG(size, timeout)) */
+#define SYS_TLS_CLOSE 0x70    /* (handle) -> 0 */
+#define SYS_TLS_CHECKED 0x71  /* (handle) -> 1 when the identity was verified */
+
+/* ---- Threads -------------------------------------------------------------
+ *
+ * Another line of execution inside this same program: the same memory, the
+ * same open files, its own stack. What it is for is the thing a desktop
+ * cannot do without it - go on drawing while one of its own routines sits in
+ * a system call waiting for a server to answer.
+ *
+ * The stack is the program's to provide, and its top is what goes in. The
+ * kernel does not know how much stack somebody else's function wants; the
+ * program does, and a kernel that guessed would guess wrong for somebody.
+ *
+ * There is no protection between threads, because there is none inside a
+ * program at all: two of them writing the same variable is two of them
+ * writing the same variable. What keeps that honest is a rule the program
+ * makes and keeps - who owns what - and, where that is not enough, the lock
+ * in koi.h. */
+#define SYS_THREAD_START 0x72  /* (entry, stack top, argument) -> 1 or 0 */
+#define SYS_THREAD_EXIT 0x73   /* () - this thread ends; never returns */
+
+/* Give up the rest of this turn but stay runnable.
+ *
+ * Sleeping for a millisecond would do nearly the same thing and would waste a
+ * millisecond every time; this hands the processor to whoever is waiting and
+ * comes back as soon as it is free. It is what a thread does when it finds a
+ * lock already taken. */
+#define SYS_YIELD 0x74         /* () -> 0 */
+
+/* A length and a timeout in one argument, for the same reason a point is:
+   the call convention carries four and these calls need five. */
+#define KOI_NET_ARG(length, timeout) \
+    ((long)(((unsigned long)(unsigned int)(length) << 32) | \
+            (unsigned int)(timeout)))
+#define KOI_NET_LENGTH(packed) ((unsigned int)(((unsigned long)(packed)) >> 32))
+#define KOI_NET_TIMEOUT(packed) ((unsigned int)((packed) & 0xFFFFFFFF))
+
+/* Two small numbers in one argument, for the same reason a point is. */
+#define KOI_SOUND_SHAPE(bits, channels) (((long)(bits) << 8) | (channels))
 
 #define SYS_LOAD 0x5D        /* (path, KOI_MODULE*) -> 0, or -1 */
 #define SYS_UNLOAD 0x5E      /* (base) -> 0, or -1 */

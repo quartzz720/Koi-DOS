@@ -26,9 +26,20 @@
 __attribute__((noreturn)) void cpu_enter_user(boot_uint64_t entry,
                                               boot_uint64_t stack);
 
+/* The same with a first argument for the function being entered - which is
+   what a thread needs and a program does not. */
+__attribute__((noreturn)) void cpu_enter_user_with(boot_uint64_t entry,
+                                                   boot_uint64_t stack,
+                                                   boot_uint64_t argument);
+
 /* Where interrupts from ring 3 will find a kernel stack. Set before anything
    is entered at ring 3, and again whenever that stack changes. */
 void cpu_set_kernel_stack(boot_uint64_t top);
+
+/* Turn on SSE, so that programs may use floating point. The kernel does not:
+   it is built without it on purpose, which is why a system call needs no
+   saving and only the scheduler does. */
+void cpu_enable_sse(void);
 
 /* Interrupt stack table slot used for the double-fault handler. */
 #define IST_DOUBLE_FAULT 1

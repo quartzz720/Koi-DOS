@@ -43,6 +43,35 @@ boot_uint64_t paging_table_bytes(void);
  * application - which is the plan - this becomes "map it there" instead. */
 int paging_allow_user(boot_uint64_t base, boot_uint64_t size);
 
+/* ---- An address space of its own ------------------------------------------
+ *
+ * Ring 3 keeps a program out of the kernel; it does not keep it out of another
+ * program. A space per program is what makes "its own memory" true.
+ *
+ * A space begins as a copy of the kernel's top level, so everything is mapped
+ * where the kernel has it - which is what lets an interrupt arrive while a
+ * program is running - and none of it is reachable from ring 3. Marking a
+ * range user-accessible clones every table on the way down to it first, so the
+ * bit lands where nobody else is looking. Four or five pages per program. */
+#define PROGRAM_SPACES_MAX 8
+
+typedef struct PAGING_SPACE PAGING_SPACE;
+
+PAGING_SPACE* paging_space_create(void);
+void paging_space_destroy(PAGING_SPACE* space);
+
+/* Load this space's tables, or the kernel's when given nothing. */
+void paging_space_enter(const PAGING_SPACE* space);
+
+/* Whether a range is already reachable from ring 3 - the question to ask
+   before running a thread on memory a program named. */
+int paging_is_user(boot_uint64_t base, boot_uint64_t size);
+int paging_space_is_user(PAGING_SPACE* space, boot_uint64_t base,
+                         boot_uint64_t size);
+
+int paging_space_allow_user(PAGING_SPACE* space, boot_uint64_t base,
+                            boot_uint64_t size);
+
 int paging_map_device(boot_uint64_t base, boot_uint64_t size);
 
 /* Whether the framebuffer ended up write-combining rather than write-through.

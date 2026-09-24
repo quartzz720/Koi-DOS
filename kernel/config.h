@@ -33,6 +33,23 @@ void config_load(VOLUME* volume);
 /* Extra directories the shell searches for programs, in PATH order. */
 const char* config_program_path(void);
 
+/* What to start once the machine is up, instead of leaving somebody at a
+ * prompt they did not ask for: `command = \MIZU\MIZU` in DESKTOP.CFG.
+ *
+ * This is the line that decides what kind of system this is. With it empty,
+ * Koi-DOS is a shell that can start a desktop - which is DOS with a graphical
+ * program on top, and is what running Mizu from AUTOEXEC.BAT amounts to. With
+ * it set, the desktop is what the machine starts and the shell is underneath
+ * it, available to anything that asks: which is what MS-DOS 7 was to Windows
+ * 95, and the shape this system is aimed at.
+ *
+ * Empty when there is no such line, and an empty answer means the prompt. */
+const char* config_desktop(void);
+
+/* Whether the machine asks for an address at boot rather than waiting to be
+   told. On unless `network = manual` says otherwise. */
+int config_network_automatic(void);
+
 /* Put a directory on that path and write it back to the settings file, so it
  * is still there after a reboot. Returns 1 when the path now contains it -
  * including when it already did, which is not a failure and is the ordinary

@@ -59,6 +59,9 @@ int keyboard_break_taken(void);
    unsaved work. Backs SYS_BREAK. The kernel turns it back on when the program
    exits. */
 void keyboard_break_enable(int enabled);
+/* What it is set to now, so that whoever changes it around a program can put
+   it back rather than guess. */
+int keyboard_break_enabled(void);
 
 /* A byte the controller says came from the first port, read by somebody else,
    and the shared drain both drivers use. See keyboard.c. */

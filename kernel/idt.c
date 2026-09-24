@@ -4,6 +4,7 @@
 #include "apic.h"
 #include "console.h"
 #include "program.h"
+#include "task.h"
 #include "serial.h"
 #include "string.h"
 #include "../include/syscall.h"
@@ -163,6 +164,19 @@ void interrupt_dispatch(INTERRUPT_FRAME* frame) {
             console_write("\n");
             console_write(exception_name(frame->vector));
             console_write(" in this program. It has been stopped.\n");
+            /* Where, and what it touched. Two numbers, on the screen rather
+               than only in the serial log, because the machine this fails on
+               is somebody's laptop and it has no serial port: RIP says which
+               instruction, CR2 says which address it wanted, and the program's
+               base turns both into an offset anybody can look up in a
+               disassembly. */
+            console_write("  at ");
+            console_write_hex(frame->rip);
+            console_write("  wanted ");
+            console_write_hex(read_cr2());
+            console_write("\n  program loaded at ");
+            console_write_hex(program_base());
+            console_write("\n");
             console_use_theme();
             serial_write("PROGRAM: fault at ring 3 - ");
             serial_write(exception_name(frame->vector));
@@ -194,6 +208,12 @@ void interrupt_dispatch(INTERRUPT_FRAME* frame) {
            nothing of that priority is ever delivered again. */
         if (apic_available()) apic_end_of_interrupt();
         else pic_send_eoi(irq);
+        /* And only now, with the controller told and nothing of the kernel's
+           held, may the processor be given to somebody else. Before the
+           end-of-interrupt this would switch away with the interrupt still in
+           service, and nothing of that priority would ever be delivered
+           again - a scheduler that runs one context switch and stops. */
+        task_preempt(frame);
     }
 }
 

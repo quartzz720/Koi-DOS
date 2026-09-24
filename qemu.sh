@@ -337,6 +337,18 @@ for program in build/*.EXE; do
     mcopy -o -i "$SYSVOL" "$program" "::/BIN/$(basename "$program" | tr 'a-z' 'A-Z')"
 done
 
+# Anything in extra/ goes to the root of the system volume.
+#
+# For testing with real files - a picture, a song, a page - without keeping
+# them in the repository or rebuilding the image by hand every time. The
+# directory is not in git and does not have to exist.
+if [ -d extra ]; then
+    for file in extra/*; do
+        [ -f "$file" ] || continue
+        mcopy -o -i "$SYSVOL" "$file" "::/$(basename "$file" | tr 'a-z' 'A-Z')"
+    done
+fi
+
 # Koi-Commander, where `dosget install commander` would have put it. On release
 # media it is absent entirely: it arrives over the wire, and a system without
 # it is the same system.

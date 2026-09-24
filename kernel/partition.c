@@ -1,4 +1,6 @@
 #include "partition.h"
+#include "block.h"
+#include "fat32.h"
 #include "memory.h"
 #include "string.h"
 #include "rtc.h"
@@ -254,13 +256,42 @@ static int try_whole_device(BLOCK_DEVICE* device, boot_uint32_t device_index,
     return add_volume(device, 0, count, sector);
 }
 
+/* Whether a volume sits on a partition the GPT calls an EFI System Partition.
+ *
+ * Looked up rather than carried on the volume, because the partition table is
+ * already built by the time anybody asks and it is the table that knows. The
+ * same match label_partitions() makes, in the other direction. */
+int volume_is_efi_system(const VOLUME* volume) {
+    for (boot_uint32_t index = 0; index < partitions_found; index++)
+        if (partitions[index].device == volume->device &&
+            partitions[index].first_sector == volume->first_sector)
+            return partitions[index].is_efi_system;
+    return 0;
+}
+
 /* The boot volume takes Z:, and the rest follow at Y:, X: downward.
  *
  * It is found by matching the FAT serial the bootloader read from the device
  * the firmware actually loaded us from. Nothing falls back to "the first one":
  * on a machine booted from a USB stick, the first FAT volume the AHCI driver
  * can see is the internal disk's EFI System Partition, and handing that Z:
- * would point every command at the real system's boot files. */
+ * would point every command at the real system's boot files.
+ *
+ * ---- Why an EFI System Partition gets no letter --------------------------
+ *
+ * Because it is not a place anybody keeps anything. It exists so that
+ * firmware can find a loader, every machine with UEFI has one, and on a
+ * laptop that also runs Windows there are two - and each of them turning up
+ * as a drive full of \EFI and \BOOT is a drive letter spent on somebody
+ * else's boot files. Windows does exactly this and has since 2006: the
+ * partition is there, it is mounted, and it has no letter.
+ *
+ * With one exception, and it is the important one: the volume this system
+ * booted from keeps its letter whatever the GPT calls it. A Koi-DOS stick
+ * that was quick-formatted is one FAT32 partition marked EFI System, holding
+ * the loader and everything else - hiding that would hide the whole system.
+ * So the rule is "an EFI System Partition that is not ours", which is both
+ * what Windows means and what anybody would say out loud. */
 static void assign_letters(boot_uint32_t boot_serial, int serial_known) {
     boot_uint32_t boot_index = VOLUME_MAX;
     char letter = 'Z';
@@ -283,6 +314,15 @@ static void assign_letters(boot_uint32_t boot_serial, int serial_known) {
     }
     for (boot_uint32_t index = 0; index < volumes_found; index++) {
         if (index == boot_index) continue;
+        /* A volume nothing could mount gets no letter: see partition_scan. */
+        if (!fat32_is_mounted(&volumes[index])) {
+            volumes[index].letter = 0;
+            continue;
+        }
+        if (volume_is_efi_system(&volumes[index])) {
+            volumes[index].letter = 0;
+            continue;
+        }
         volumes[index].letter = (letter >= 'A') ? letter-- : 0;
     }
 }
@@ -303,12 +343,52 @@ static void label_partitions(void) {
     }
 }
 
+/* Mount everything, then find out which volume the system is installed on.
+ *
+ * Both halves belong to the scan and neither used to be part of it, which cost
+ * two evenings between them.
+ *
+ * The mounting: the volume table is a static array, so a rescan refills the
+ * same addresses. A mount record still pointing at one of them carries the old
+ * filesystem's geometry into the new filesystem's device, and what that looks
+ * like is a drive letter with nothing behind it - a stick plugged in, and the
+ * drive beside it suddenly empty.
+ *
+ * The identifying: which volume carries \BOOT\KOIDOS.SYS cannot be known
+ * while scanning, because it is a file and files need a mounted volume. It was
+ * done at boot and in the shell's own remount, and not in the rescan a program
+ * triggers by asking whether the disks have changed - so plugging in a stick
+ * handed Z: back to the loader's partition, which is the one volume that is
+ * meant to have no letter at all.
+ *
+ * Here, once, at the end of every scan: there is one place that answers "what
+ * are the drives", and it answers the whole question. */
+static void mount_and_identify(void) {
+    VOLUME* loader;
+
+    loader = volume_boot();
+    for (boot_uint32_t index = 0; loader && index < volumes_found; index++) {
+        VOLUME* candidate = &volumes[index];
+        FAT_ENTRY entry;
+
+        if (candidate == loader) continue;
+        /* Only on the disk we booted from: a marker on some other disk
+           describes some other installation, not this one. */
+        if (candidate->device != loader->device) continue;
+        if (!fat32_stat(candidate, SYSTEM_VOLUME_MARKER, &entry)) continue;
+        partition_set_system_volume(candidate);
+        break;
+    }
+}
+
 boot_uint32_t partition_scan(boot_uint32_t boot_serial, int serial_known) {
     boot_uint8_t* sector = (boot_uint8_t*)alloc_page();
 
     remembered_boot_serial = boot_serial;
     remembered_serial_known = serial_known;
 
+    /* Before anything is overwritten. See mount_and_identify. */
+    fat32_unmount_all();
     volumes_found = 0;
     partitions_found = 0;
     if (!sector) return 0;
@@ -331,8 +411,23 @@ boot_uint32_t partition_scan(boot_uint32_t boot_serial, int serial_known) {
     }
 
     free_page(sector);
+
+    /* Mounting before the letters, because a letter is a promise.
+     *
+     * A volume gets into the table on the strength of a boot sector that
+     * looks like FAT, which is the right test for "worth trying" and the
+     * wrong one for "can be opened": FAT12 and FAT16 pass it, and this driver
+     * reads neither. Handing such a volume a letter produces a drive that
+     * appears in `disk`, cannot be entered, and says nothing about why - a
+     * partition seen and not usable, which took an evening and two
+     * photographs to pin down. Mounted first, and only what mounted gets a
+     * name. */
+    for (boot_uint32_t index = 0; index < volumes_found; index++)
+        (void)fat32_mount(&volumes[index]);
+
     assign_letters(boot_serial, serial_known);
     label_partitions();
+    mount_and_identify();
     return volumes_found;
 }
 
@@ -402,13 +497,48 @@ void partition_set_system_volume(VOLUME* system) {
             volumes[index].letter = 0;
             continue;
         }
+        /* And the same rule as at the first scan: somebody else's boot
+           partition is not a drive. */
+        if (volume_is_efi_system(&volumes[index])) {
+            volumes[index].letter = 0;
+            continue;
+        }
         volumes[index].letter = letter--;
     }
     label_partitions();
 }
 
+/* Which generation of disks this table describes. */
+static boot_uint32_t seen_generation;
+
 boot_uint32_t partition_rescan(void) {
+    seen_generation = block_generation();
     return partition_scan(remembered_boot_serial, remembered_serial_known);
+}
+
+/* Look again, but only if a disk has appeared or disappeared since the last
+ * look.
+ *
+ * A stick plugged in is noticed by the USB driver, which registers a disk -
+ * and until somebody reads its partitions there is no drive letter, so the
+ * machine has a device it cannot open. It used to take a command that
+ * happened to remount everything, which is why walking to another drive and
+ * back made the stick appear: the fix was a side effect of something else.
+ *
+ * Called where a rescan is safe rather than from the driver: rebuilding the
+ * table under a program that is in the middle of reading a file is a way to
+ * hand it somebody else's bytes. */
+int partition_settle(void) {
+    if (!partition_changed()) return 0;
+    (void)partition_rescan();
+    return 1;
+}
+
+/* Has a disk appeared or gone since this table was built? Asked by the shell,
+   which does more than a rescan when the answer is yes - it has mounts and a
+   current directory to put back. */
+int partition_changed(void) {
+    return block_generation() != seen_generation;
 }
 
 /* ---- Writing a partition table ------------------------------------------ */

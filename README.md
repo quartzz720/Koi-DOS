@@ -998,6 +998,7 @@ kernel/
   config.c             settings in \BOOT\CONFIG, read at boot and written by dosget
   environment.c        the environment: PATH, PROMPT and whatever SET puts there
   program.c            loads and runs programs
+  task.c               the scheduler: a task per program, preempted at ring 3
   syscall.c            system call dispatch
 programs/
   koi.h                the interface programs are written against
@@ -1006,8 +1007,11 @@ programs/
   hello.c cat.c save.c ls.c color.c demo.c show.c edit.c play.c
   spin.c where.c       two programs that exist to be tested with
   commander.c          the file manager - built here, shipped by dosget
-  window.c dialog.c    the libraries programs are written against, shipped in the SDK
-  settings.c language.c wav.c editcore.c
+  dialog.c settings.c  the libraries programs are written against, shipped in
+  language.c wav.c     the SDK. Not window.c: a taskbar and a Start button are
+  editcore.c           one desktop's face rather than a service this system
+                       owes every program, so the windowing library lives in
+                       the Mizu repository, where its only user is.
 sdk/                   everything a program needs, plus koicc and the flags it builds with
 legacy/                the old UEFI Boot Services shell, kept for reference
 linker.ld              kernel layout, fixed at 1 MiB

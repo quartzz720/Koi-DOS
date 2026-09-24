@@ -4,6 +4,7 @@
 #include "cpu.h"
 #include "serial.h"
 #include "string.h"
+#include "memory.h"
 
 /* The mixer.
  *
@@ -28,6 +29,20 @@
 
 #define VOICE_SAMPLES 0
 #define VOICE_TONE 1
+/* A voice whose samples arrive while it plays, rather than being there from
+ * the start.
+ *
+ * A sound effect is a lump already in memory and playing it needs nothing
+ * else. A song is not: four minutes of 48 kHz stereo is forty-six megabytes
+ * of samples, so a player decodes a little at a time and hands it over as it
+ * goes. That is the whole difference, and it is the reason this exists.
+ *
+ * The ring belongs to the kernel and the program copies into it. The other
+ * arrangement - the mixer reading the program's own buffer - saves a copy
+ * worth a hundred and ninety kilobytes a second and costs the rule that a
+ * program may not touch what the interrupt is reading. This one cannot be got
+ * wrong from outside. */
+#define VOICE_STREAM 2
 
 typedef struct {
     const void* samples;
@@ -51,6 +66,23 @@ typedef struct {
        voice instead silenced the desktop's music whenever anything was run
        from it. */
     boot_uint8_t owner;
+
+    /* For a stream: the ring, and where the two ends of it are.
+     *
+     * `written` and `read` are counts of frames since the voice opened, not
+     * positions - so the difference is what is waiting, and neither has to be
+     * compared for wrap-around. Sixty-four bits at 48 kHz is six million
+     * years. */
+    short* ring;                    /* stereo 16-bit, whatever came in */
+    boot_uint32_t ring_frames;
+    boot_uint64_t ring_pages;
+    volatile boot_uint64_t written;
+    volatile boot_uint64_t read;
+    boot_uint32_t starved;          /* frames of silence played, for the log */
+    /* Output frames consumed before the last flush, so that position keeps
+       meaning "how far into the song" across a seek. */
+    boot_uint64_t consumed_base;
+    volatile boot_uint8_t paused;
 } VOICE;
 
 static VOICE voices[AUDIO_VOICES];
@@ -225,6 +257,148 @@ int audio_play(const void* samples, boot_uint32_t frames, boot_uint32_t rate,
     return handle;
 }
 
+static VOICE* voice_of(int handle);
+static void release_stream(VOICE* voice);
+
+/* ---- Streams -------------------------------------------------------------
+ *
+ * Open one, hand it frames as they are decoded, stop it when the song ends.
+ *
+ * Everything arrives in the source's own rate and shape and is converted here,
+ * on the way into the ring, so the mixer's inner loop stays what it was: one
+ * source frame per output frame, no arithmetic, no resampler state to carry
+ * across a refill. A conversion done once when a chunk arrives is cheaper than
+ * one done per frame per voice, and the awkward part - a resampler whose
+ * position must survive between chunks - simply does not exist.
+ *
+ * Two seconds of ring.
+ *
+ * It was half a second, chosen against a decoder being late - and a decoder is
+ * never late by much. Then the machine learned to fetch a page while playing,
+ * and the thing that goes quiet is not a late decoder: it is the program that
+ * feeds this ring not getting a turn, because something else is deep in a
+ * certificate. Half a second of buffer meant half a second of silence,
+ * exactly, every time - which is what was heard.
+ *
+ * The cost of two seconds is 384 kilobytes and the fact that stopping a song
+ * leaves up to two seconds of it already queued - which is why `flush` exists
+ * and why stopping calls it. The gain is that nothing short of a real stall
+ * can be heard at all.
+ */
+#define STREAM_RING_MS 2000
+
+int audio_stream_open(boot_uint32_t rate, int bits, int channels, int volume) {
+    VOICE* voice;
+    boot_uint64_t flags;
+    int handle;
+    boot_uint32_t frames;
+    boot_uint64_t pages;
+    short* ring;
+
+    if (!ready || !rate || rate > 192000) return -1;
+    if (bits != AUDIO_U8 && bits != AUDIO_S16) return -1;
+    if (channels != 1 && channels != 2) return -1;
+    if (volume < 0) volume = 0;
+    if (volume > 255) volume = 255;
+
+    frames = HDA_RATE * STREAM_RING_MS / 1000;
+    pages = ((boot_uint64_t)frames * 4 + PAGE_SIZE - 1) / PAGE_SIZE;
+    ring = (short*)alloc_pages(pages);
+    if (!ring) return -1;
+    memset(ring, 0, pages * PAGE_SIZE);
+
+    handle = claim(&voice, &flags);
+    if (handle < 0) {
+        free_pages(ring, pages);
+        return -1;
+    }
+
+    voice->kind = VOICE_STREAM;
+    voice->ring = ring;
+    voice->ring_frames = frames;
+    voice->ring_pages = pages;
+    voice->written = 0;
+    voice->read = 0;
+    voice->starved = 0;
+    /* What the frames arriving will be turned from. */
+    voice->step = ((boot_uint64_t)rate << 32) / HDA_RATE;
+    voice->bits = (boot_uint8_t)bits;
+    voice->channels = (boot_uint8_t)channels;
+    voice->volume = (boot_uint8_t)volume;
+    voice->loop = 0;
+    voice->position = 0;
+    set_pan(voice, 128);
+    publish(voice, flags);
+    return handle;
+}
+
+/* How many output frames of room there are. */
+int audio_stream_space(int handle) {
+    VOICE* voice = voice_of(handle);
+
+    if (!voice || voice->kind != VOICE_STREAM) return -1;
+    return (int)(voice->ring_frames - (boot_uint32_t)(voice->written -
+                                                      voice->read) - 1);
+}
+
+/* Take what fits, and say how many source frames were taken.
+ *
+ * A short answer is not a failure: it means the ring is nearly full, which is
+ * the normal state of a stream that is keeping up. The caller comes back with
+ * the rest. */
+int audio_stream_queue(int handle, const void* samples, boot_uint32_t frames) {
+    VOICE* voice = voice_of(handle);
+    const boot_uint8_t* source = (const boot_uint8_t*)samples;
+    boot_uint32_t taken = 0;
+    boot_uint64_t at;
+
+    if (!voice || voice->kind != VOICE_STREAM || !samples) return -1;
+    if (!frames) return 0;
+
+    at = voice->written;
+    while (taken < frames) {
+        boot_uint32_t waiting = (boot_uint32_t)(at - voice->read);
+        boot_uint32_t slot;
+        int left;
+        int right;
+
+        if (waiting + 1 >= voice->ring_frames) break;   /* full */
+
+        /* Which source frame this output frame comes from. The step is the
+           same 32.32 the sample voices use, and the position walks it. */
+        {
+            boot_uint32_t index = (boot_uint32_t)(voice->position >> 32);
+
+            if (index >= frames) break;   /* need more source than we were given */
+            if (voice->bits == AUDIO_S16) {
+                const short* pcm = (const short*)source;
+                left = pcm[index * voice->channels];
+                right = voice->channels == 2 ? pcm[index * 2 + 1] : left;
+            } else {
+                left = ((int)source[index * voice->channels] - 128) << 8;
+                right = voice->channels == 2
+                        ? ((int)source[index * 2 + 1] - 128) << 8 : left;
+            }
+            voice->position += voice->step;
+            /* Whole source frames consumed are reported back, so the caller
+               knows what it may throw away. */
+            taken = (boot_uint32_t)(voice->position >> 32);
+        }
+
+        slot = (boot_uint32_t)(at % voice->ring_frames);
+        voice->ring[slot * 2] = (short)left;
+        voice->ring[slot * 2 + 1] = (short)right;
+        at++;
+        voice->written = at;
+    }
+
+    /* What is left of this chunk starts the next one, so the fractional part
+       of the position is kept and the whole part is not. */
+    voice->position &= 0xFFFFFFFFULL;
+    if (taken > frames) taken = frames;
+    return (int)taken;
+}
+
 int audio_tone(boot_uint32_t hertz, boot_uint32_t milliseconds, int volume) {
     VOICE* voice;
     boot_uint64_t flags;
@@ -272,6 +446,18 @@ int audio_set_params(int voice, int volume, int pan) {
     return changed ? 0 : -1;
 }
 
+/* The voice a handle names, or null. The generation is what stops a handle
+   kept too long from reaching whatever sound is in that slot now. */
+static VOICE* voice_of(int handle) {
+    int index = handle & 0xFF;
+    boot_uint16_t generation = (boot_uint16_t)((handle >> 8) & 0xFFFF);
+
+    if (handle < 0 || index >= AUDIO_VOICES) return (VOICE*)0;
+    if (voices[index].generation != generation) return (VOICE*)0;
+    if (!voices[index].active) return (VOICE*)0;
+    return &voices[index];
+}
+
 void audio_stop(int voice) {
     boot_uint64_t flags;
     int index = voice & 0xFF;
@@ -281,14 +467,20 @@ void audio_stop(int voice) {
     flags = cpu_hold_interrupts();
     /* The generation is what stops a handle kept too long from silencing
        whatever sound happens to be in that slot now. */
-    if (voices[index].generation == generation) voices[index].active = 0;
+    if (voices[index].generation == generation) {
+        voices[index].active = 0;
+        release_stream(&voices[index]);
+    }
     cpu_release_interrupts(flags);
 }
 
 void audio_stop_all(void) {
     boot_uint64_t flags = cpu_hold_interrupts();
     int index;
-    for (index = 0; index < AUDIO_VOICES; index++) voices[index].active = 0;
+    for (index = 0; index < AUDIO_VOICES; index++) {
+        voices[index].active = 0;
+        release_stream(&voices[index]);
+    }
     cpu_release_interrupts(flags);
 }
 
@@ -300,11 +492,36 @@ void audio_set_owner(int owner) {
     cpu_release_interrupts(flags);
 }
 
+/* One program's voices, silenced. See syscall_close_owner: by owner rather
+   than by depth, because a program that ends while another is still playing
+   must not take the other one's sound with it. */
+/* A stream's ring goes back when the voice does. Nothing else here allocates,
+   which is why this is the only place that frees. */
+static void release_stream(VOICE* voice) {
+    if (voice->kind != VOICE_STREAM || !voice->ring) return;
+    free_pages(voice->ring, voice->ring_pages);
+    voice->ring = (short*)0;
+    voice->ring_frames = 0;
+    voice->ring_pages = 0;
+}
+
+void audio_stop_owner(int owner) {
+    boot_uint64_t flags = cpu_hold_interrupts();
+    for (int index = 0; index < AUDIO_VOICES; index++)
+        if (voices[index].owner == (boot_uint8_t)owner) {
+            voices[index].active = 0;
+            release_stream(&voices[index]);
+            voices[index].owner = 0;
+        }
+    cpu_release_interrupts(flags);
+}
+
 void audio_stop_deeper_than(int depth) {
     boot_uint64_t flags = cpu_hold_interrupts();
     for (int index = 0; index < AUDIO_VOICES; index++)
         if (voices[index].owner > (boot_uint8_t)depth) {
             voices[index].active = 0;
+            release_stream(&voices[index]);
             voices[index].owner = 0;
         }
     cpu_release_interrupts(flags);
@@ -335,7 +552,62 @@ boot_uint32_t audio_position(int voice) {
 
     if (voice < 0 || index >= AUDIO_VOICES) return 0;
     if (!voices[index].active || voices[index].generation != generation) return 0;
+    /* For a stream, how much has been heard rather than how far into a buffer
+       we are: frames the mixer has taken, plus whatever was heard before the
+       last seek threw the queue away. In the mixer's own rate, which is what
+       "seconds" divides out of. */
+    if (voices[index].kind == VOICE_STREAM) {
+        /* In the source's own rate, not the mixer's.
+         *
+         * The ring holds frames at 48 kHz because that is what the hardware
+         * plays; the caller counts in the rate its file was recorded at, and
+         * a clock that divided one by the other ran nine per cent fast on a
+         * 44.1 kHz song. The step is the ratio between them and is already
+         * here. */
+        boot_uint64_t heard = voices[index].read;
+
+        heard = (heard * voices[index].step) >> 32;
+        return (boot_uint32_t)(voices[index].consumed_base + heard);
+    }
     return (boot_uint32_t)(voices[index].position >> 32);
+}
+
+/* Stop taking from a voice, or start again. A paused voice is still playing
+   in every sense except that no time passes for it. */
+int audio_pause(int handle, int paused) {
+    VOICE* voice = voice_of(handle);
+
+    if (!voice) return -1;
+    voice->paused = (boot_uint8_t)(paused ? 1 : 0);
+    return 0;
+}
+
+int audio_paused(int handle) {
+    VOICE* voice = voice_of(handle);
+
+    return voice ? voice->paused : 0;
+}
+
+/* Throw away what is queued and start counting from `heard`.
+ *
+ * What a seek is made of: the samples already handed over belong to the part
+ * of the song being left behind, and playing them before the new position
+ * would be half a second of the wrong music every time somebody moved the
+ * bar. The caller says where in the song it is about to start feeding from,
+ * because only the caller knows - the ring holds samples, not seconds. */
+int audio_stream_flush(int handle, boot_uint32_t heard) {
+    VOICE* voice = voice_of(handle);
+    boot_uint64_t flags;
+
+    if (!voice || voice->kind != VOICE_STREAM) return -1;
+    flags = cpu_hold_interrupts();
+    voice->read = 0;
+    voice->written = 0;
+    voice->position = 0;
+    voice->consumed_base = heard;
+    voice->starved = 0;
+    cpu_release_interrupts(flags);
+    return 0;
 }
 
 boot_uint32_t audio_length(int voice) {
@@ -410,8 +682,31 @@ static void mix_frame(short* out) {
         int sample_right;
 
         if (!voice->active) continue;
+        /* Paused is not stopped: the voice stays, its queue stays, and
+           nothing is consumed. Resuming continues from the exact frame,
+           which is the whole reason this is here rather than in the player -
+           a player can stop feeding a stream, but it cannot un-hear the half
+           second already in the ring. */
+        if (voice->paused) continue;
 
-        if (voice->kind == VOICE_TONE) {
+        if (voice->kind == VOICE_STREAM) {
+            /* One output frame per output frame: the queued samples were
+               converted to the mixer's own rate and shape on the way in, so
+               there is nothing to resample here and nothing to get wrong. */
+            if (voice->read >= voice->written) {
+                /* Nothing waiting. Silence rather than stopping: a decoder
+                   that was late once should cause a gap, not an ending. */
+                voice->starved++;
+                continue;
+            }
+            {
+                boot_uint32_t at = (boot_uint32_t)(voice->read %
+                                                   voice->ring_frames);
+                sample_left = voice->ring[at * 2];
+                sample_right = voice->ring[at * 2 + 1];
+                voice->read++;
+            }
+        } else if (voice->kind == VOICE_TONE) {
             int value = sine[(voice->position >> 24) & 0xFF];
             sample_left = value;
             sample_right = value;

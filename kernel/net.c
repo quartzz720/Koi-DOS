@@ -1,4 +1,6 @@
 #include "net.h"
+#include "task.h"
+#include "net_internal.h"
 #include "xhci.h"
 #include "e1000.h"
 #include "string.h"
@@ -106,6 +108,18 @@ static int dhcp_ack_seen;
 static boot_uint32_t dhcp_transaction;
 static boot_uint32_t dhcp_offered;
 static boot_uint32_t dhcp_server;
+/* The address is borrowed, not given.
+ *
+ * A DHCP server hands out an address for a stated time and expects to be
+ * asked again halfway through; a client that never asks keeps using an
+ * address the server has since handed to somebody else, and the router simply
+ * stops forwarding for it. Nothing announces this. The machine goes on
+ * believing it has an address, every packet leaves, none comes back, and the
+ * log has nothing in it because nothing failed - which is exactly what an
+ * hour of working internet followed by silence looks like. */
+static boot_uint32_t dhcp_lease_seconds;
+static boot_uint64_t dhcp_lease_start;
+static boot_uint64_t dhcp_next_renewal;
 
 /* ---- Which wire ----------------------------------------------------------
  *
@@ -394,6 +408,7 @@ int net_ping(boot_uint32_t address, boot_uint32_t timeout_ms) {
 #define DHCP_OPTION_REQUESTED 50
 #define DHCP_OPTION_TYPE 53
 #define DHCP_OPTION_SERVER 54
+#define DHCP_OPTION_LEASE 51
 #define DHCP_OPTION_PARAMETERS 55
 #define DHCP_OPTION_END 255
 
@@ -431,7 +446,8 @@ static boot_uint32_t begin_dhcp(boot_uint8_t type) {
 
 static boot_uint32_t end_dhcp(boot_uint32_t at) {
     dhcp_buffer[at++] = DHCP_OPTION_PARAMETERS;
-    dhcp_buffer[at++] = 3;
+    dhcp_buffer[at++] = 4;
+    dhcp_buffer[at++] = DHCP_OPTION_LEASE;
     dhcp_buffer[at++] = DHCP_OPTION_NETMASK;
     dhcp_buffer[at++] = DHCP_OPTION_ROUTER;
     dhcp_buffer[at++] = DHCP_OPTION_DNS;
@@ -450,6 +466,7 @@ static void handle_dhcp(const boot_uint8_t* message, boot_uint32_t length) {
     boot_uint32_t router = 0;
     boot_uint32_t dns = 0;
     boot_uint32_t server = 0;
+    boot_uint32_t lease = 0;
 
     if (length < 241) return;
     if (dhcp_buffer[0] && get_be32(message + 4) != dhcp_transaction) return;
@@ -472,6 +489,7 @@ static void handle_dhcp(const boot_uint8_t* message, boot_uint32_t length) {
         case DHCP_OPTION_ROUTER: if (size >= 4) router = get_be32(message + at + 2); break;
         case DHCP_OPTION_DNS: if (size >= 4) dns = get_be32(message + at + 2); break;
         case DHCP_OPTION_SERVER: if (size >= 4) server = get_be32(message + at + 2); break;
+        case DHCP_OPTION_LEASE: if (size >= 4) lease = get_be32(message + at + 2); break;
         default: break;
         }
         at += 2 + size;
@@ -488,6 +506,12 @@ static void handle_dhcp(const boot_uint8_t* message, boot_uint32_t length) {
         our_netmask = netmask ? netmask : 0xFFFFFF00U;
         our_gateway = router;
         our_dns = dns;
+        if (server) dhcp_server = server;
+        /* An hour, when the server does not say - short enough that a machine
+           whose server went quiet finds out while somebody is still at it. */
+        dhcp_lease_seconds = lease ? lease : 3600;
+        dhcp_lease_start = timer_ticks();
+        dhcp_next_renewal = 0;
         dhcp_ack_seen = 1;
     }
 }
@@ -775,6 +799,10 @@ int net_resolve(const char* name, boot_uint32_t* out) {
                 *out = dns_result;
                 return 1;
             }
+            /* Two seconds of waiting for a name is two seconds the rest of
+               the machine can have. Nothing here is half done between one
+               poll and the next. */
+            task_yield();
         }
     }
     return 0;
@@ -830,7 +858,69 @@ static void handle_ip(const boot_uint8_t* ip, boot_uint32_t length) {
     case IP_PROTOCOL_UDP:
         handle_udp(ip + header, total - header, get_be32(ip + 12));
         break;
+    case NET_IP_PROTOCOL_TCP:
+        tcp_receive_segment(get_be32(ip + 12), get_be32(ip + 16),
+                            ip + header, total - header);
+        break;
     default: break;
+    }
+}
+
+/* Keeping the address, which is a thing that has to be done on a timer and
+ * not on demand.
+ *
+ * Asked for at half the lease, which is what the standard calls T1 and what
+ * every other client on the wire does. The request goes to the server that
+ * granted it, with our address in the field that says "this is what I have" -
+ * that is the difference between renewing a lease and asking for a new one,
+ * and a server answers the first without taking the address away.
+ *
+ * Nothing here blocks. The reply arrives through the ordinary receive path and
+ * refreshes the lease; if none arrives, this tries again in half a minute, and
+ * when the lease actually runs out it starts over from nothing. A renewal that
+ * stopped the machine for two seconds every half hour would be worse than the
+ * problem it fixes.
+ */
+void net_maintain(void) {
+    boot_uint64_t now;
+    boot_uint64_t elapsed;
+
+    if (!configured || !dhcp_lease_seconds || !link_ready()) return;
+
+    now = timer_ticks();
+    elapsed = (now - dhcp_lease_start) / 1000U;
+
+    if (elapsed >= dhcp_lease_seconds) {
+        /* Gone. Everything above this has been talking to nobody, so say so
+           and start again from a broadcast. */
+        log("NET: the address lease ran out; asking again\n");
+        dhcp_lease_seconds = 0;
+        net_start();
+        return;
+    }
+
+    if (elapsed < dhcp_lease_seconds / 2) return;
+    if (dhcp_next_renewal && now < dhcp_next_renewal) return;
+    dhcp_next_renewal = now + 30000U;
+
+    {
+        boot_uint32_t at;
+        boot_uint8_t server_mac[6];
+
+        dhcp_transaction = (boot_uint32_t)(now * 2654435761U) | 1;
+        at = begin_dhcp(DHCP_REQUEST);
+        at = end_dhcp(at);
+        /* Our own address in ciaddr, and the reply wanted at it rather than
+           by broadcast: this is a client that already has one. */
+        put_be32(dhcp_buffer + 12, our_address);
+        put_be16(dhcp_buffer + 10, 0);
+
+        if (dhcp_server && net_hardware_for(dhcp_server, server_mac))
+            send_udp(server_mac, dhcp_server, DHCP_CLIENT_PORT,
+                     DHCP_SERVER_PORT, dhcp_buffer, at);
+        else
+            send_udp(broadcast_mac, 0xFFFFFFFFU, DHCP_CLIENT_PORT,
+                     DHCP_SERVER_PORT, dhcp_buffer, at);
     }
 }
 
@@ -924,4 +1014,56 @@ void net_format_address(boot_uint32_t address, char* out) {
         out[at++] = (char)('0' + octet % 10);
     }
     out[at] = 0;
+}
+
+
+/* ---- What tcp.c uses ------------------------------------------------------
+ *
+ * The same frame builder, the same checksum, the same ARP. Declared in
+ * net_internal.h and defined here rather than copied there: a second copy of
+ * a one's complement sum is a second place for it to be subtly wrong, and the
+ * wrongness would show as a protocol that mostly works.
+ */
+
+boot_uint16_t net_get_be16(const boot_uint8_t* at) { return get_be16(at); }
+boot_uint32_t net_get_be32(const boot_uint8_t* at) { return get_be32(at); }
+void net_put_be16(boot_uint8_t* at, boot_uint16_t value) { put_be16(at, value); }
+void net_put_be32(boot_uint8_t* at, boot_uint32_t value) { put_be32(at, value); }
+
+boot_uint16_t net_checksum_partial(const boot_uint8_t* data,
+                                   boot_uint32_t length,
+                                   boot_uint32_t partial) {
+    return checksum_partial(data, length, partial);
+}
+
+boot_uint32_t net_pseudo_header_sum(boot_uint32_t source,
+                                    boot_uint32_t destination,
+                                    boot_uint8_t protocol,
+                                    boot_uint16_t length) {
+    return pseudo_header_sum(source, destination, protocol, length);
+}
+
+boot_uint8_t* net_begin_ip_frame(const boot_uint8_t* destination_mac,
+                                 boot_uint32_t destination,
+                                 boot_uint8_t protocol,
+                                 boot_uint32_t payload_length) {
+    begin_frame(destination_mac, ETHERTYPE_IPV4);
+    return begin_ip(destination, protocol, payload_length);
+}
+
+int net_send_frame(boot_uint32_t length) {
+    return link_send(out_frame, length);
+}
+
+int net_hardware_for(boot_uint32_t address, boot_uint8_t* mac) {
+    /* Off this wire, it goes to the gateway: the address in the packet stays
+       the far machine's and only the hardware address changes. That is the
+       whole of routing at this level, and leaving it out is why the first TCP
+       connection to a machine on the internet went nowhere - it asked the
+       local wire, by name, for a host in Switzerland. */
+    boot_uint32_t target = ((address ^ our_address) & our_netmask)
+                           ? our_gateway : address;
+
+    if (!target) return 0;
+    return resolve_neighbour(target, mac);
 }

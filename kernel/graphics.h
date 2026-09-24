@@ -49,6 +49,11 @@ void graphics_present_rect(int x, int y, int width, int height);
    graphics mode. */
 void graphics_leave(void);
 
+/* Give back every level of the screen a program is still holding. Called when
+   its slot is cleared away: a level whose owner has gone is a level nothing
+   would ever pop. */
+void graphics_release_owner(int owner);
+
 int graphics_active(void);
 
 /* Pack a colour for this framebuffer's channel order. A program must never

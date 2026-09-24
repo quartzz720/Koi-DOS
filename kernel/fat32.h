@@ -57,6 +57,11 @@ typedef struct {
    FAT32 filesystem this driver understands. */
 int fat32_mount(VOLUME* volume);
 
+/* Whether that volume has a filesystem this driver could open. A volume in the
+   table with no mount behind it is a drive letter that cannot be used, which
+   is why letters are only handed to volumes that answer yes. */
+int fat32_is_mounted(VOLUME* volume);
+
 /* Forget every mounted filesystem.
  *
  * Required before the volume table is rebuilt, and not merely tidy. The table

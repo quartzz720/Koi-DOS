@@ -24,6 +24,11 @@ typedef struct BLOCK_DEVICE {
 /* Register a device. Returns the assigned index, or -1 when full. */
 int block_register(const BLOCK_DEVICE* device);
 
+/* How many times a disk has appeared or disappeared. Anything that keeps a
+   list of drives compares this with what it saw last time; when the two differ
+   its list is out of date. */
+boot_uint32_t block_generation(void);
+
 /* Forget one by name, for a device that has been unplugged.
  *
  * The entry is emptied rather than the list compacted: an index handed out

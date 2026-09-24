@@ -1,4 +1,6 @@
 #include "koi.h"
+#include "png.h"
+#include "gif.h"
 
 /* Show a BMP file.
  *
@@ -78,6 +80,196 @@ static int skip_forward(long handle, long count) {
     return 1;
 }
 
+/* A GIF, shown as its first frame - or, when it has several, as all of them
+ * in turn until a key is pressed.
+ *
+ * The canvas is kept between frames because a GIF frame is a change to the
+ * one before it rather than a picture of its own; that is the whole reason
+ * `gif_frame` takes a canvas rather than returning one. */
+static int show_gif(long handle, const char* name) {
+    long size = koi_filesize(handle);
+    koi_uint8* file;
+    koi_uint8* scratch;
+    koi_uint32* canvas;
+    GIF gif;
+    KOI_SCREEN screen;
+    long got = 0;
+    int origin_x, origin_y;
+
+    (void)name;
+    koi_seek(handle, 0, 0);
+    file = (koi_uint8*)koi_alloc(size);
+    if (!file) { koi_print("Not enough memory to read it.\n"); return 0; }
+    while (got < size) {
+        long step = koi_read(handle, file + got, size - got);
+
+        if (step <= 0) break;
+        got += step;
+    }
+    if (got != size || !gif_open(file, got, &gif)) {
+        koi_print(gif_trouble());
+        koi_print("\n");
+        koi_free(file);
+        return 0;
+    }
+
+    canvas = (koi_uint32*)koi_alloc((long)gif.width * gif.height * 4);
+    scratch = (koi_uint8*)koi_alloc((long)gif.width * gif.height + 64);
+    if (!canvas || !scratch) {
+        koi_print("Not enough memory for a picture that size.\n");
+        if (canvas) koi_free(canvas);
+        if (scratch) koi_free(scratch);
+        koi_free(file);
+        return 0;
+    }
+
+    if (koi_gfx_enter(&screen) != 0) {
+        koi_print("This system has no framebuffer to draw on.\n");
+        koi_free(canvas); koi_free(scratch); koi_free(file);
+        return 0;
+    }
+    koi_gfx_clear(koi_gfx_color(0, 0, 0));
+    origin_x = ((int)screen.width - gif.width) / 2;
+    origin_y = ((int)screen.height - gif.height) / 2;
+
+    for (int round = 0; ; round++) {
+        for (int at = 0; at < gif.frame_count; at++) {
+            if (!gif_frame(&gif, at, canvas, 0, scratch,
+                           (long)gif.width * gif.height + 64)) break;
+            for (int line = 0; line < gif.height; line++) {
+                int y = origin_y + line;
+                koi_uint8* base;
+                koi_uint32* output;
+
+                if (y < 0 || y >= (int)screen.height) continue;
+                base = (koi_uint8*)screen.pixels;
+                output = (koi_uint32*)(base + (koi_uint64)y * screen.pitch);
+                for (int x = 0; x < gif.width; x++) {
+                    int target = origin_x + x;
+                    koi_uint32 colour = canvas[(long)line * gif.width + x];
+
+                    if (target < 0 || target >= (int)screen.width) continue;
+                    output[target] = koi_gfx_color((colour >> 16) & 0xFF,
+                                                   (colour >> 8) & 0xFF,
+                                                   colour & 0xFF);
+                }
+            }
+            koi_gfx_present();
+            if (gif.frame_count == 1) { (void)koi_getchar(); goto done; }
+            koi_sleep(gif.frames[at].delay_ms > 0 ? gif.frames[at].delay_ms : 100);
+            if (koi_keypressed()) { (void)koi_getchar(); goto done; }
+        }
+        (void)round;
+    }
+done:
+    koi_gfx_leave();
+    koi_free(canvas);
+    koi_free(scratch);
+    koi_free(file);
+    return 1;
+}
+
+/* A PNG, shown the same way: decoded whole, then put on the screen centred.
+ *
+ * The memory is asked for and given back around the call. A viewer that keeps
+ * a picture's worth of memory after it has finished showing it is a viewer
+ * that cannot be run twice on a small machine. */
+static int show_png(long handle, const char* name) {
+    long size = koi_filesize(handle);
+    koi_uint8* work;
+    koi_uint32* pixels;
+    long work_size;
+    long got = 0;
+    int width = 0, height = 0;
+    PNG picture;
+    KOI_SCREEN screen;
+    int origin_x, origin_y;
+
+    koi_seek(handle, 0, 0);
+    if (size < 8) { koi_print("There is nothing in that file.\n"); return 0; }
+
+    /* Read it in, then leave room after it for the rows it expands into:
+       inflate reads its input while writing its output, so the two live in
+       one buffer end to end rather than on top of each other. */
+    work_size = size + 64;
+    work = (koi_uint8*)koi_alloc(work_size);
+    if (!work) { koi_print("Not enough memory to read it.\n"); return 0; }
+    while (got < size) {
+        long step = koi_read(handle, work + got, size - got);
+
+        if (step <= 0) break;
+        got += step;
+    }
+    if (got != size || !png_size(work, got, &width, &height)) {
+        koi_print(png_trouble());
+        koi_print("\n");
+        koi_free(work);
+        return 0;
+    }
+    koi_free(work);
+
+    work_size = size + ((long)width * 4 + 1) * height + 64;
+    work = (koi_uint8*)koi_alloc(work_size);
+    pixels = (koi_uint32*)koi_alloc((long)width * height * 4);
+    if (!work || !pixels) {
+        koi_print("Not enough memory for a picture that size.\n");
+        if (work) koi_free(work);
+        if (pixels) koi_free(pixels);
+        return 0;
+    }
+    koi_seek(handle, 0, 0);
+    got = 0;
+    while (got < size) {
+        long step = koi_read(handle, work + got, size - got);
+
+        if (step <= 0) break;
+        got += step;
+    }
+
+    png_scratch(work, work_size);
+    if (!png_decode(work, got, pixels, (long)width * height, 0, &picture)) {
+        koi_print(png_trouble());
+        koi_print("\n");
+        koi_free(work);
+        koi_free(pixels);
+        return 0;
+    }
+    koi_free(work);
+
+    if (koi_gfx_enter(&screen) != 0) {
+        koi_print("This system has no framebuffer to draw on.\n");
+        koi_free(pixels);
+        return 0;
+    }
+    koi_gfx_clear(koi_gfx_color(0, 0, 0));
+    origin_x = ((int)screen.width - picture.width) / 2;
+    origin_y = ((int)screen.height - picture.height) / 2;
+    for (int line = 0; line < picture.height; line++) {
+        int y = origin_y + line;
+        koi_uint8* base;
+        koi_uint32* output;
+
+        if (y < 0 || y >= (int)screen.height) continue;
+        base = (koi_uint8*)screen.pixels;
+        output = (koi_uint32*)(base + (koi_uint64)y * screen.pitch);
+        for (int x = 0; x < picture.width; x++) {
+            int target_x = origin_x + x;
+            koi_uint32 colour = pixels[(long)line * picture.width + x];
+
+            if (target_x < 0 || target_x >= (int)screen.width) continue;
+            output[target_x] = koi_gfx_color((colour >> 16) & 0xFF,
+                                             (colour >> 8) & 0xFF,
+                                             colour & 0xFF);
+        }
+    }
+    koi_gfx_present();
+    (void)name;
+    (void)koi_getchar();
+    koi_gfx_leave();
+    koi_free(pixels);
+    return 1;
+}
+
 int main(const char* arguments) {
     KOI_SCREEN screen;
     koi_uint8 header[HEADER_SIZE];
@@ -99,8 +291,9 @@ int main(const char* arguments) {
     int origin_y;
 
     if (!arguments || !arguments[0]) {
-        koi_print("show <file.bmp>\n\n");
-        koi_print("Displays an uncompressed 24- or 32-bit BMP, centred.\n");
+        koi_print("show <file.png|file.gif|file.bmp>\n\n");
+        koi_print("Displays a PNG, a GIF - animated ones play until a key is\n"
+              "pressed - or an uncompressed 24- or 32-bit BMP, centred.\n");
         koi_print("Press any key to return to the shell.\n");
         return 1;
     }
@@ -114,12 +307,27 @@ int main(const char* arguments) {
     }
 
     if (!read_exactly(handle, header, HEADER_SIZE)) {
-        koi_print("That file is too short to be a BMP.\n");
+        koi_print("That file is too short to be a picture.\n");
         koi_close(handle);
         return 1;
     }
+    /* A PNG, if that is what it is. Told apart by what is in the file rather
+       than by what it is called: a picture saved with the wrong ending is
+       somebody else's mistake and not a reason to refuse it. */
+    if (gif_is_gif(header, 8)) {
+        int ok = show_gif(handle, arguments);
+
+        koi_close(handle);
+        return ok ? 0 : 1;
+    }
+    if (png_is_png(header, 8)) {
+        int ok = show_png(handle, arguments);
+
+        koi_close(handle);
+        return ok ? 0 : 1;
+    }
     if (header[0] != 'B' || header[1] != 'M') {
-        koi_print("That is not a BMP - the first two bytes are not \"BM\".\n");
+        koi_print("That is neither a BMP nor a PNG.\n");
         koi_close(handle);
         return 1;
     }

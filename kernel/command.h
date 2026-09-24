@@ -13,4 +13,9 @@ __attribute__((noreturn)) void command_run(void);
    KOI_EXIT_NOT_FOUND when there was no such command. */
 int command_execute_line(const char* line);
 
+/* What the last command exited with, for a caller that ran one a different
+   way - SYS_CAPTURE returns how much was printed, which is a different
+   question from whether there was anything to run. */
+int command_last_exit(void);
+
 #endif

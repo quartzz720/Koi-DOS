@@ -29,16 +29,17 @@ KERNEL_SOURCES = kernel/kernel.c kernel/console.c kernel/font.c kernel/font_glyp
                  kernel/isr.S kernel/pic.c kernel/acpi.c kernel/keyboard.c kernel/layout.c \
                  kernel/heap.c kernel/paging.c kernel/rtc.c kernel/block.c \
                  kernel/partition.c kernel/fat32.c kernel/command.c \
-                 kernel/syscall.c kernel/program.c kernel/config.c kernel/environment.c kernel/xhci.c \
+                 kernel/syscall.c kernel/program.c kernel/task.c kernel/config.c kernel/environment.c kernel/xhci.c \
                  kernel/timer.c kernel/pci.c kernel/ahci.c kernel/nvme.c kernel/hpet.c \
-                 kernel/apic.c kernel/graphics.c kernel/hda.c kernel/audio.c kernel/net.c kernel/ehci.c kernel/e1000.c kernel/tftp.c kernel/mouse.c
+                 kernel/apic.c kernel/graphics.c kernel/hda.c kernel/audio.c kernel/net.c kernel/tcp.c kernel/tls.c kernel/x509.c kernel/bignum.c kernel/p256.c kernel/roots.c kernel/ehci.c kernel/e1000.c kernel/tftp.c kernel/http.c kernel/mouse.c \
+                 kernel/sha256.c kernel/aead.c kernel/x25519.c kernel/random.c kernel/crypto_check.c
 KERNEL_HEADERS = kernel/kernel.h kernel/console.h kernel/font.h kernel/serial.h \
                  kernel/string.h kernel/io.h kernel/memory.h kernel/cpu.h \
                  kernel/idt.h kernel/pic.h kernel/acpi.h kernel/keyboard.h \
                  kernel/layout.h kernel/heap.h kernel/paging.h kernel/rtc.h kernel/block.h \
                  kernel/partition.h kernel/fat32.h kernel/command.h \
-                 kernel/syscall.h kernel/program.h kernel/config.h kernel/environment.h kernel/xhci.h \
-                 kernel/graphics.h kernel/hda.h kernel/audio.h kernel/net.h kernel/ehci.h kernel/e1000.h kernel/tftp.h kernel/mouse.h \
+                 kernel/syscall.h kernel/program.h kernel/task.h kernel/config.h kernel/environment.h kernel/xhci.h \
+                 kernel/graphics.h kernel/hda.h kernel/audio.h kernel/net.h kernel/tcp.h kernel/ehci.h kernel/e1000.h kernel/tftp.h kernel/http.h kernel/mouse.h \
                  include/syscall.h $(BUILD_HEADER) \
                  kernel/timer.h kernel/pci.h kernel/ahci.h kernel/nvme.h kernel/hpet.h kernel/apic.h \
                  include/bootinfo.h
@@ -46,8 +47,21 @@ KERNEL_HEADERS = kernel/kernel.h kernel/console.h kernel/font.h kernel/serial.h 
 # Programs are built with the same compiler as the kernel but their own linker
 # script, and end up as .EXE files on the disk image. The format underneath is
 # ELF64; the extension is the DOS-familiar one.
+# Programs may use floating point; the kernel may not.
+#
+# -mgeneral-regs-only was here for the same reason it is still on the kernel:
+# after ExitBootServices nothing had set up the FPU or SSE, so an instruction
+# touching them worked on whatever the firmware left. The kernel now turns SSE
+# on at boot and saves its registers across a task switch, which makes the
+# restriction wrong for programs and still right for the kernel - a kernel
+# that cannot touch those registers is a kernel that cannot corrupt them, and
+# that is why a system call needs no saving at all.
+#
+# -mfpmath=sse and no x87: the state saved per task is the FXSAVE area, which
+# covers both, but SSE2 is what a 64-bit compiler emits anyway and mixing in
+# x87 would buy nothing.
 PROGRAM_CFLAGS = -ffreestanding -fno-stack-protector -fno-stack-check \
-                 -fno-builtin -fpie -mno-red-zone -mgeneral-regs-only \
+                 -fno-builtin -fpie -mno-red-zone -msse2 -mfpmath=sse \
                  -fno-asynchronous-unwind-tables \
                  -ffunction-sections -fdata-sections \
                  -Wall -Wextra -Werror -std=c11 -I . -I include
@@ -65,7 +79,14 @@ PROGRAM_SOURCES = $(wildcard programs/*.c)
 # SDK's koicc has always accepted several sources as one program - "there is no
 # linker to run afterwards and no object files to keep" - and this Makefile
 # could not, which made the tree less capable than the SDK it ships.
-PROGRAM_SHARED = programs/editcore.c programs/dialog.c programs/settings.c programs/window.c programs/language.c programs/wav.c
+# What any program may share, and deliberately not a windowing library.
+#
+# window.c used to be in this list. It draws a taskbar, a Start button, window
+# frames and a shutdown dialogue - which is one desktop's face rather than a
+# service this system owes every program, and shipping it in the SDK meant
+# Koi-DOS carried a desktop while claiming to be complete without one. It lives
+# in the Mizu repository now, where its only user is.
+PROGRAM_SHARED = programs/editcore.c programs/dialog.c programs/settings.c programs/language.c programs/wav.c programs/inflate.c programs/png.c programs/gif.c
 
 PROGRAMS = $(patsubst programs/%.c,build/%.EXE,\
              $(filter-out programs/start.c programs/koimod.c programs/koilib.c \
@@ -76,6 +97,7 @@ PROGRAMS = $(patsubst programs/%.c,build/%.EXE,\
 build/edit.EXE: EXTRA_SOURCES = programs/editcore.c
 build/color.EXE: EXTRA_SOURCES = programs/settings.c
 build/play.EXE: EXTRA_SOURCES = programs/wav.c
+build/show.EXE: EXTRA_SOURCES = programs/png.c programs/inflate.c programs/gif.c
 build/commander.EXE: EXTRA_SOURCES = programs/editcore.c programs/settings.c
 build/cmdrcfg.EXE: EXTRA_SOURCES = programs/dialog.c programs/settings.c programs/language.c
 
@@ -104,7 +126,7 @@ $(BUILD_HEADER): FORCE
 
 FORCE:
 
-build/%.EXE: programs/%.c programs/start.c programs/koilib.c programs/koi.h programs/program.ld include/syscall.h $(PROGRAM_SHARED) programs/editcore.h programs/dialog.h programs/settings.h programs/window.h programs/language.h programs/wav.h
+build/%.EXE: programs/%.c programs/start.c programs/koilib.c programs/koi.h programs/program.ld include/syscall.h $(PROGRAM_SHARED) programs/editcore.h programs/dialog.h programs/settings.h programs/language.h programs/wav.h
 	mkdir -p build
 	$(KERNEL_CC) $(PROGRAM_CFLAGS) $(PROGRAM_LDFLAGS) -o $@ $< $(EXTRA_SOURCES) programs/start.c programs/koilib.c
 

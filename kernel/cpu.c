@@ -155,8 +155,55 @@ void cpu_set_kernel_stack(boot_uint64_t top) {
  * and then return from it. Interrupts are enabled in the flags it pops rather
  * than beforehand, because between here and there the stack belongs to nobody
  * in particular. */
+/* The same, with a value for the function's first argument.
+ *
+ * A thread is entered at a function the program chose, and that function takes
+ * something - which window, which connection, what to fetch. The value goes in
+ * the register the calling convention uses for a first parameter, so the
+ * thread reads it as an ordinary argument and nothing in the program has to
+ * know it arrived from the kernel. */
+__attribute__((noreturn)) void cpu_enter_user_with(boot_uint64_t entry,
+                                                   boot_uint64_t stack,
+                                                   boot_uint64_t argument) {
+    stack -= 8;
+    __asm__ volatile (
+        "mov %w2, %%ds\n"
+        "mov %w2, %%es\n"
+        "mov %w2, %%fs\n"
+        "mov %w2, %%gs\n"
+        "pushq %3\n"           /* SS  */
+        "pushq %1\n"           /* RSP */
+        "pushq $0x202\n"       /* RFLAGS: reserved bit, interrupts enabled */
+        "pushq %4\n"           /* CS  */
+        "pushq %0\n"           /* RIP */
+        "iretq\n"
+        :
+        : "r"(entry), "r"(stack),
+          "r"((boot_uint16_t)USER_DATA_SELECTOR),
+          "i"((boot_uint64_t)USER_DATA_SELECTOR),
+          "i"((boot_uint64_t)USER_CODE_SELECTOR),
+          "D"(argument)
+        : "memory");
+    __builtin_unreachable();
+}
+
 __attribute__((noreturn)) void cpu_enter_user(boot_uint64_t entry,
                                               boot_uint64_t stack) {
+    /* Eight bytes down, so the stack looks the way a call would have left it.
+     *
+     * The x86-64 convention is that at the first instruction of a function
+     * the stack pointer is eight less than a multiple of sixteen - because a
+     * call has just pushed a return address onto an aligned stack. A program
+     * entered at ring 0 arrives through `call` and gets that for free. This
+     * one arrives through iretq, which pushes nothing, so it used to start
+     * eight bytes out.
+     *
+     * Nothing noticed while programs had no floating point: the compiler only
+     * assumes the alignment when it emits an instruction that requires it,
+     * and every one of those is an SSE instruction. The first program built
+     * with SSE enabled stopped with a general protection fault, which is what
+     * `movaps` does to an address ending in 8. */
+    stack -= 8;
     __asm__ volatile (
         "mov %w2, %%ds\n"
         "mov %w2, %%es\n"
@@ -175,6 +222,45 @@ __attribute__((noreturn)) void cpu_enter_user(boot_uint64_t entry,
           "i"((boot_uint64_t)USER_CODE_SELECTOR)
         : "memory");
     __builtin_unreachable();
+}
+
+/* Floating point, which this machine did not have.
+ *
+ * Not because the processor lacks it - every x86-64 has SSE2 and the compiler
+ * would use it by default - but because nothing had set it up. After
+ * ExitBootServices the FPU and SSE state is whatever the firmware left, and
+ * an instruction touching it either faults or works on somebody else's
+ * numbers. So the kernel and every program were built -mgeneral-regs-only,
+ * and the machine could not add two fractions.
+ *
+ * That was the right trade while nothing needed them. It stops being right at
+ * the first thing that does: an MP3 decoder, a JPEG, anything that scales a
+ * picture properly. Four bits in two registers is the whole cost.
+ *
+ *   CR0.EM off   - do not trap SSE as though it were absent
+ *   CR0.MP on    - the FPU is present and WAIT should behave
+ *   CR4.OSFXSR   - the operating system uses FXSAVE/FXRSTOR, so SSE is legal
+ *   CR4.OSXMMEXCPT - and it handles SIMD exceptions rather than #UD
+ *
+ * The kernel itself stays -mgeneral-regs-only. It has no arithmetic that
+ * wants this, and a kernel that never touches SSE is a kernel that cannot
+ * corrupt a program's - which makes a system call free of any save at all.
+ * Only the scheduler has to care, and only between programs. */
+void cpu_enable_sse(void) {
+    boot_uint64_t cr0;
+    boot_uint64_t cr4;
+
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    cr0 &= ~(1ULL << 2);            /* EM */
+    cr0 |= (1ULL << 1);             /* MP */
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0));
+
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+    cr4 |= (1ULL << 9) | (1ULL << 10);   /* OSFXSR, OSXMMEXCPT */
+    __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
+
+    /* And a known state to start from, rather than the firmware's. */
+    __asm__ volatile ("fninit");
 }
 
 /* The cache line size, from CPUID leaf 1. Sixty-four everywhere that matters,

@@ -820,11 +820,19 @@ static int noop_round_trip(XHCI_CONTROLLER* self) {
  * until it is reset, and only then does the device answer anything. USB 3
  * ports train themselves and arrive already enabled, so a reset there is
  * unnecessary but harmless. */
-static int reset_port(XHCI_CONTROLLER* self, boot_uint32_t port) {
+/* `force` resets a port that is already enabled.
+ *
+ * Without it a retry was not a retry. The port comes out of the first attempt
+ * enabled, this returned immediately on the strength of that, and the second
+ * and third attempts ran against exactly the state that had just failed - so
+ * "three goes, each from a fresh reset" was one go and two hopes. A device
+ * that answers with a transaction error is a device whose link wants
+ * retraining, which is the one thing the shortcut skipped. */
+static int reset_port(XHCI_CONTROLLER* self, boot_uint32_t port, int force) {
     boot_uint32_t status = op_read32(self, OP_PORTSC(port));
     boot_uint64_t start;
 
-    if (status & PORTSC_ENABLED) return 1;   /* already trained */
+    if (!force && (status & PORTSC_ENABLED)) return 1;   /* already trained */
 
     op_write32(self, OP_PORTSC(port),
                (status & ~PORTSC_WRITE_MASK) | PORTSC_RESET);
@@ -1023,6 +1031,21 @@ static int address_device(USB_DEVICE* device) {
     log(", state ");
     log_dec(((boot_uint32_t*)output)[3] >> 27);
     log("\n");
+
+    /* And then leave it alone for a moment.
+     *
+     * A device that has just been given an address is allowed a recovery
+     * interval before anybody talks to it - two milliseconds in the USB
+     * specification, and more in practice on flash that has only just powered
+     * up. Speaking too early gets a transaction error on the very first
+     * control transfer, which reads exactly like a broken device: "slot
+     * addressed", then "could not read the start of the device descriptor",
+     * then the whole enumeration thrown away and started again. One stick did
+     * that eleven times before it came up, allocating a slot each round.
+     *
+     * Ten milliseconds, which is what every other host driver waits and which
+     * nobody will feel once per plugged-in device. */
+    timer_wait(10);
     return 1;
 }
 
@@ -1332,7 +1355,16 @@ static const char hid_shifted[0x40] = {
 static int hid_to_key(boot_uint8_t usage, boot_uint8_t modifiers) {
     int shift = (modifiers & 0x22) != 0;    /* either shift key */
     int control = (modifiers & 0x11) != 0;  /* either control key */
+    int alt = (modifiers & 0x44) != 0;      /* either alt key */
+    int gui = (modifiers & 0x88) != 0;      /* either Windows key */
     char character;
+
+    /* The two the window manager claims, before anything else looks: Alt+F4
+       closes, and the Windows key with R opens the Run box. Same reasoning as
+       Ctrl+Escape below - see keyboard.c, where the other keyboard does the
+       same thing with scancodes. */
+    if (alt && usage == 0x3D) return KOI_KEY_CLOSE;      /* F4 */
+    if (gui && usage == 0x15) return KOI_KEY_RUN;        /* r */
 
     /* Arrows and the navigation block sit above the printable range. */
     switch (usage) {
@@ -1777,12 +1809,32 @@ static int bulk_transfer(USB_DEVICE* device, RING* ring, boot_uint32_t dci,
  * block carrying somebody else's tag means the two ends have lost sync.
  *
  * Returns 1 when the device reports the command succeeded. */
+/* One command, and how much of the data actually moved.
+ *
+ * `arrived` is not optional information and used to be discarded. A device
+ * that sends fewer bytes than it was asked for is not a failure the transport
+ * reports - the status block comes back saying the command succeeded, and the
+ * count of what was short is in a field nobody read. So the caller copied a
+ * whole buffer out of which only part had been filled, and the rest was
+ * whatever the previous transfer had left in it.
+ *
+ * What that looks like from the outside is a file whose contents are somebody
+ * else's: directory listings correct, because a directory is read one sector
+ * at a time and one sector always arrives, and file contents wrong, because
+ * those are read a cluster at a time. Two photographs of a laptop screen and
+ * an afternoon.
+ *
+ * Two sources, and the smaller wins: what the transfer said it moved, and what
+ * the device says it did not send. */
 static int scsi_command(const boot_uint8_t* command, boot_uint32_t command_length,
-                        void* data, boot_uint32_t data_length, int data_in) {
+                        void* data, boot_uint32_t data_length, int data_in,
+                        boot_uint32_t* arrived) {
     COMMAND_BLOCK* cbw = (COMMAND_BLOCK*)storage->blocks;
     STATUS_BLOCK* csw = (STATUS_BLOCK*)(storage->blocks + 64);
     int moved;
+    boot_uint32_t got = 0;
 
+    if (arrived) *arrived = 0;
     if (!storage->device || command_length > 16) return 0;
 
     memset(cbw, 0, sizeof(*cbw));
@@ -1808,6 +1860,7 @@ static int scsi_command(const boot_uint8_t* command, boot_uint32_t command_lengt
         boot_uint32_t dci = data_in ? storage->in_dci : storage->out_dci;
 
         moved = bulk_transfer(storage->device, ring, dci, data, data_length, 5000);
+        if (moved > 0) got = (boot_uint32_t)moved;
         if (moved == -2) {
             /* A stalled data stage is not fatal: the device still owes us a
                status block, and it will send one once the endpoint is clear. */
@@ -1839,7 +1892,16 @@ static int scsi_command(const boot_uint8_t* command, boot_uint32_t command_lengt
         log("XHCI: status block tag does not match\n");
         return 0;
     }
-    return csw->status == 0;
+    if (csw->status != 0) return 0;
+
+    /* And what the device says it did not send. A residue larger than the
+       request is a device talking nonsense; believe the transfer instead. */
+    if (csw->residue && csw->residue <= data_length) {
+        boot_uint32_t by_status = data_length - csw->residue;
+        if (by_status < got) got = by_status;
+    }
+    if (arrived) *arrived = got;
+    return 1;
 }
 
 /* What a sense key means, in the words the reader needs rather than a number.
@@ -1876,7 +1938,7 @@ static boot_uint8_t request_sense(void) {
     memset(command, 0, sizeof(command));
     command[0] = SCSI_REQUEST_SENSE;
     command[4] = 18;
-    if (!scsi_command(command, sizeof(command), storage->bounce, 18, 1))
+    if (!scsi_command(command, sizeof(command), storage->bounce, 18, 1, 0))
         return 0xFF;
 
     key = (boot_uint8_t)(storage->bounce[2] & 0x0F);
@@ -1904,7 +1966,7 @@ static int wait_until_ready(void) {
     for (int attempt = 0; attempt < 20; attempt++) {
         boot_uint64_t start;
 
-        if (scsi_command(command, sizeof(command), 0, 0, 0)) return 1;
+        if (scsi_command(command, sizeof(command), 0, 0, 0, 0)) return 1;
         (void)request_sense();
         start = timer_ticks();
         while (timer_ticks() - start < 100) timer_poll();
@@ -1948,7 +2010,7 @@ static int inquiry(void) {
     command[4] = 36;
     memset(storage->bounce, 0, 64);
 
-    if (!scsi_command(command, sizeof(command), storage->bounce, 36, 1)) {
+    if (!scsi_command(command, sizeof(command), storage->bounce, 36, 1, 0)) {
         log("XHCI: INQUIRY failed\n");
         return 0;
     }
@@ -1971,7 +2033,7 @@ static int read_capacity(void) {
     command[0] = SCSI_READ_CAPACITY_10;
     memset(storage->bounce, 0, 16);
 
-    if (!scsi_command(command, sizeof(command), storage->bounce, 8, 1)) {
+    if (!scsi_command(command, sizeof(command), storage->bounce, 8, 1, 0)) {
         log("XHCI: READ CAPACITY failed\n");
         return 0;
     }
@@ -2015,6 +2077,7 @@ static int storage_transfer(boot_uint64_t lba, boot_uint32_t count,
     while (count) {
         boot_uint32_t chunk = count < per_chunk ? count : per_chunk;
         boot_uint32_t bytes = chunk * storage->sector_size;
+        boot_uint32_t got = 0;
         boot_uint8_t command[10];
 
         memset(command, 0, sizeof(command));
@@ -2024,7 +2087,8 @@ static int storage_transfer(boot_uint64_t lba, boot_uint32_t count,
         command[8] = (boot_uint8_t)chunk;
 
         if (write) memcpy(storage->bounce, caller, bytes);
-        if (!scsi_command(command, sizeof(command), storage->bounce, bytes, !write)) {
+        if (!scsi_command(command, sizeof(command), storage->bounce, bytes,
+                          !write, &got)) {
             /* Ask why before giving up. The answer goes to the log, and the
                sense key is kept so the shell can say something better than
                that a copy failed. */
@@ -2034,6 +2098,37 @@ static int storage_transfer(boot_uint64_t lba, boot_uint32_t count,
             storage->last_sense = request_sense();
             return 0;
         }
+
+        /* Short, and it said the command succeeded.
+         *
+         * Some devices will not move a whole page in one go, whatever they
+         * agreed to. The old code copied the buffer out regardless, which
+         * handed the caller the tail of whatever had been read before it -
+         * and nothing anywhere said a word. So: never copy what did not
+         * arrive, and drop to one sector at a time, which every device
+         * manages. Slower, correct, and said out loud once.
+         *
+         * If a single sector comes back short there is nothing left to try
+         * and the read fails, which is the honest answer. */
+        if (got < bytes) {
+            if (chunk > 1) {
+                if (per_chunk > 1) {
+                    log("XHCI: storage returned ");
+                    log_dec(got);
+                    log(" of ");
+                    log_dec(bytes);
+                    log(" bytes; reading one sector at a time from now on\n");
+                    per_chunk = 1;
+                }
+                continue;   /* the same sectors, in smaller pieces */
+            }
+            log("XHCI: short read of sector ");
+            log_hex(lba);
+            log("\n");
+            storage->last_sense = request_sense();
+            return 0;
+        }
+
         if (!write) memcpy(caller, storage->bounce, bytes);
 
         caller += bytes;
@@ -2157,6 +2252,38 @@ static int configure_storage(USB_DEVICE* device,
     storage->in_address = in_address;
     storage->out_address = out_address;
 
+    /* A bulk packet larger than the link can carry.
+     *
+     * The USB specification allows a bulk endpoint 64 bytes at full speed and
+     * 512 at high speed, and a device answers with the descriptor for the
+     * speed it is running at - so the two agree, and this cannot happen. It
+     * happens anyway: a device whose link failed to train to high speed, and
+     * which was asked for its descriptors while still believing otherwise,
+     * hands back 512 on a line that carries 64. What follows is not an error
+     * anybody sees. The controller sends packets the link cannot deliver
+     * whole, the transfers come back looking successful, and what arrives is
+     * the wrong bytes - a photograph that is not a photograph and a text file
+     * of somebody else's fragments.
+     *
+     * So it is clamped to what the speed permits, and said out loud. A device
+     * that then works is a device that was being talked to too loudly. */
+    {
+        boot_uint16_t ceiling = 0;
+
+        if (device->speed == SPEED_FULL) ceiling = 64;
+        else if (device->speed == SPEED_LOW) ceiling = 8;
+        if (ceiling && (in_packet > ceiling || out_packet > ceiling)) {
+            log_controller(self);
+            log("storage asks for packets of ");
+            log_dec(in_packet > out_packet ? in_packet : out_packet);
+            log(" bytes on a link that carries ");
+            log_dec(ceiling);
+            log("; clamping\n");
+            if (in_packet > ceiling) in_packet = ceiling;
+            if (out_packet > ceiling) out_packet = ceiling;
+        }
+    }
+
     log_controller(self);
     log("mass storage on interface ");
     log_dec(interface);
@@ -2164,6 +2291,16 @@ static int configure_storage(USB_DEVICE* device,
     log_dec(storage->in_address & 0x0F);
     log(" out ");
     log_dec(storage->out_address & 0x0F);
+    /* And how large a packet each of them takes.
+     *
+     * 512 is high speed and 64 is full speed, and which one appears here
+     * against which speed the port trained at is the difference between a
+     * device that is merely slow and a device being talked to in packets its
+     * link cannot carry. */
+    log(", packets ");
+    log_dec(in_packet);
+    log("/");
+    log_dec(out_packet);
     log("\n");
 
     storage->in_dci = (boot_uint32_t)(storage->in_address & 0x0F) * 2 + 1;
@@ -3780,6 +3917,15 @@ static USB_DEVICE* attach_at(XHCI_CONTROLLER* self, boot_uint32_t root_port,
    noticed as such rather than retried forever. */
 static int attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
     boot_uint32_t status;
+    /* How long the machine stands still for this.
+     *
+     * Enumeration happens inside whatever poll noticed the port, which for a
+     * desktop is the middle of its event loop - so this number is exactly the
+     * pause somebody feels when they plug a stick in. Measuring it is the
+     * first half of fixing it: the reset alone is fifty milliseconds by the
+     * specification, and everything after it is round trips to a device that
+     * has only just been given power. */
+    boot_uint64_t started = timer_ticks();
 
     /* Three goes at it, each starting from a fresh port reset.
      *
@@ -3798,7 +3944,7 @@ static int attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
             log(": trying again\n");
             timer_wait(100);
         }
-        if (!reset_port(self, port)) {
+        if (!reset_port(self, port, attempt != 0)) {
             log_controller(self);
             log("port ");
             log_dec(port + 1);
@@ -3806,10 +3952,31 @@ static int attach_device(XHCI_CONTROLLER* self, boot_uint32_t port) {
             continue;
         }
         status = op_read32(self, OP_PORTSC(port));
+        /* The speed the link actually trained at, which is the one that
+         * matters and was never printed.
+         *
+         * The number in "port N has a new device, speed S" is read before the
+         * reset and means little; this one is read after, when the field is
+         * valid. 1 is full speed, 2 low, 3 high, 4 SuperSpeed - and a storage
+         * device that lands on 1 is a device whose link did not train, not a
+         * device that is simply slow. */
+        log_controller(self);
+        log("port ");
+        log_dec(port + 1);
+        log(" trained at speed ");
+        log_dec((status >> PORTSC_SPEED_SHIFT) & PORTSC_SPEED_MASK);
+        log("\n");
         if (attach_at(self, port, 0, 0,
                       (status >> PORTSC_SPEED_SHIFT) & PORTSC_SPEED_MASK,
-                      0, 0))
+                      0, 0)) {
+            log_controller(self);
+            log("port ");
+            log_dec(port + 1);
+            log(" was ready after ");
+            log_dec(timer_ticks() - started);
+            log(" ms, and the machine waited all of it\n");
             return 1;
+        }
         /* Anything still connected is worth another go; anything that has been
            pulled out in the meantime is not. */
         if (!(op_read32(self, OP_PORTSC(port)) & PORTSC_CONNECTED)) break;

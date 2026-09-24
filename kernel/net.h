@@ -44,6 +44,10 @@ const boot_uint8_t* net_hardware_address(void);
    machine that replies. */
 void net_poll(void);
 
+/* Renew the address before the lease on it expires. Cheap, does not block,
+   and safe to call as often as anything else polls. */
+void net_maintain(void);
+
 /* Take the interface up with an address chosen by hand. Netmask zero means a
    /24; gateway and name server may be zero, which is what a cable between two
    machines looks like. */

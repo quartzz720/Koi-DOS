@@ -40,7 +40,34 @@ static const CP437_NAME cp437_names[] = {
     { 0x255A, 0xC8 }, { 0x255D, 0xBC }, { 0x2560, 0xCC }, { 0x2563, 0xB9 },
     { 0x2566, 0xCB }, { 0x2569, 0xCA }, { 0x256C, 0xCE },
     /* The odds and ends with a glyph already in the page. */
-    { 0x25A0, 0xFE }, { 0x00A0, 0xFF }
+    { 0x25A0, 0xFE }, { 0x00A0, 0xFF },
+    /* Typography, which arrives the moment anything reads the web.
+     *
+     * An em dash, a curly quote and an ellipsis are on every page written
+     * since about 1998, and none of them is in a code page from 1981. The
+     * choice is a gap or a near-enough shape; a sentence with holes punched
+     * through its punctuation reads as broken text, and one with a hyphen
+     * where a dash should be reads as a sentence.
+     *
+     * Only code points above 255 are listed. Below that, a byte is a byte:
+     * the shapes are code page 437's, and a program printing a box-drawing
+     * character straight out of a DOS file must go on getting the box. */
+    { 0x2022, 0xFA }, { 0x25CF, 0xFA }, { 0x2219, 0xFA },
+    { 0x2013, 0x2D }, { 0x2014, 0x2D }, { 0x2015, 0x2D }, { 0x2212, 0x2D },
+    { 0x2018, 0x27 }, { 0x2019, 0x27 }, { 0x201B, 0x27 },
+    { 0x201C, 0x22 }, { 0x201D, 0x22 }, { 0x201E, 0x22 },
+    { 0x201A, 0x2C }, { 0x2026, 0x2E }, { 0x2039, 0x3C }, { 0x203A, 0x3E },
+    { 0x2116, 0x4E },                              /* № , as an N */
+    { 0x20AC, 0x45 },                              /* € , as an E */
+    { 0x2122, 0x54 },                              /* ™ , as a T */
+    { 0x221A, 0xFB },
+    /* Arrows as ASCII rather than as the code page's own, because the shapes
+       in font_glyphs.c stop at the printable range: 0x18 to 0x1B are the four
+       arrows in code page 437 and are not in this font, and a mapping to a
+       glyph that does not exist is the gap it was meant to remove. Every
+       substitution here points at a shape that is really there. */
+    { 0x2190, 0x3C }, { 0x2192, 0x3E }, { 0x2191, 0x5E }, { 0x2193, 0x76 },
+    { 0x2194, 0x2D }
 };
 
 const boot_uint8_t* font_glyph(boot_uint32_t codepoint) {

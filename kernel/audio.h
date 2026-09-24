@@ -52,6 +52,42 @@ const char* audio_failure(void);
 int audio_play(const void* samples, boot_uint32_t frames, boot_uint32_t rate,
                int bits, int channels, int volume, int pan, int loop);
 
+/* ---- Streams -------------------------------------------------------------
+ *
+ * A sound whose samples arrive while it plays. A song is four minutes and
+ * forty-six megabytes of samples at the mixer's rate; a player decodes a
+ * little at a time and hands it over as it goes, which is the whole
+ * difference between this and audio_play.
+ *
+ * The ring belongs to the kernel, so nothing the program does to its own
+ * buffer afterwards can reach what the interrupt is reading. Frames arrive in
+ * the source's rate and shape and are converted on the way in - once per
+ * chunk rather than once per frame per voice, and with no resampler state to
+ * carry across a refill.
+ */
+int audio_stream_open(boot_uint32_t rate, int bits, int channels, int volume);
+
+/* Output frames of room. Nothing has to ask - a short answer from queue says
+   the same thing - but a player deciding whether to decode another frame
+   wants it without handing anything over. */
+int audio_stream_space(int handle);
+
+/* Take what fits; returns the number of SOURCE frames taken, which may be
+   fewer than offered when the ring is nearly full. That is the normal state
+   of a stream that is keeping up, not a failure. */
+int audio_stream_queue(int handle, const void* samples, boot_uint32_t frames);
+
+/* Stop taking from a voice, or start again. A paused voice keeps its queue
+   and its place: nothing is lost and nothing is heard. Works for any voice,
+   which is what makes pausing a song exact rather than "and then half a
+   second more of it". */
+int audio_pause(int handle, int paused);
+int audio_paused(int handle);
+
+/* Throw away what is queued, and say how far into the song the caller is
+   about to start feeding from. What a seek is made of. */
+int audio_stream_flush(int handle, boot_uint32_t heard);
+
 /* A tone, generated rather than sampled. What `beep` is made of. */
 int audio_tone(boot_uint32_t hertz, boot_uint32_t milliseconds, int volume);
 
@@ -71,6 +107,10 @@ void audio_stop_all(void);
    programs that have gone. */
 void audio_set_owner(int owner);
 void audio_stop_deeper_than(int depth);
+
+/* And one program's, by the owner tag rather than by how deep it was: two
+   programs can be playing at once now. */
+void audio_stop_owner(int owner);
 int audio_active(int voice);
 /* Where a voice has got to and how long it is, both in source frames, and a
    way to move the first. A player with a bar needs all three and the mixer

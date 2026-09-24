@@ -4,10 +4,12 @@
 #include "memory.h"
 #include "paging.h"
 #include "cpu.h"
+#include "task.h"
 #include "string.h"
 #include "heap.h"
 #include "../include/elf.h"
 #include "../include/syscall.h"
+#include "syscall.h"
 #include "console.h"
 #include "serial.h"
 
@@ -18,88 +20,100 @@
  * the structures cannot drift.
  */
 
-/* One entry per resident program, innermost last.
+/* One entry per resident program.
  *
- * A program can now run another and get control back when it ends, with
+ * A program can run another and get control back when it ends, with
  * everything it had in memory still there - which is what DOS's EXEC did and
  * what SYS_CHAIN was standing in for while this machine could hold one image
- * at a time. Only one of them is running at any moment: the caller is stopped
- * inside the call, not scheduled alongside it. That is a smaller claim than
- * multitasking and it is the whole of what "run this and come back" needs. */
+ * at a time. The caller stops inside the call, and now that is a decision
+ * rather than the only thing available: each slot is a task (task.c), the
+ * caller is a task that has asked to wait, and a program started without one
+ * waiting for it runs alongside everything else.
+ *
+ * A slot is claimed by index rather than by depth, because "the innermost
+ * program" stops being a meaningful phrase the moment two of them are
+ * running. The index is also the owner tag the system calls use, which is why
+ * it has to identify a program rather than a position in a stack. */
 typedef struct {
     boot_uint64_t base;
     const char* arguments;
     char path[PROGRAM_CHAIN_MAX];
     int exit_code;
+    int used;                  /* claimed: loaded, running, or awaiting reaping */
+    int generation;            /* how many programs this slot has held */
+    int finished;              /* the task has ended; the memory has not */
+    int user;                  /* running at ring 3 */
+    int threads;               /* extra tasks this program has started */
+    boot_uint64_t entry;       /* where its task begins */
+    PAGING_SPACE* space;       /* its own tables, when it has them */
 } PROGRAM_SLOT;
 
 static PROGRAM_SLOT slots[PROGRAM_SLOTS];
-static int depth;                       /* how many are resident */
 
-/* Where to resume when the program exits.
- *
- * SYS_EXIT is reached from inside an interrupt handler, several frames deep,
- * and has to get back out to program_run() without unwinding through any of
- * it. Saving the callee-saved registers and the stack pointer on entry and
- * restoring them on exit is the whole mechanism - a setjmp/longjmp pair with
- * no library to borrow one from. */
-typedef struct {
-    boot_uint64_t rsp, rbp, rbx, r12, r13, r14, r15, rip;
-} RESUME_POINT;
+/* The slot the processor is in now, which is a question only the scheduler
+   can answer. -1 means the shell. */
+static int current_slot(void) { return task_current_slot(); }
 
-/* One resume point per depth, for the same reason there is one slot: the
-   innermost program exits back into the call that started it, not into the
-   outermost one. A single point here meant the second exit returned to a
-   stack frame that had already been left. */
-static RESUME_POINT resume[PROGRAM_SLOTS];
-
-/* Returns 0 when saving, and 1 when arrived at through program_resume().
-   Not static: the definitions below are global assembly labels, and the
-   assembler has no way to satisfy a file-local declaration. The offsets in
-   that assembly track RESUME_POINT above, which is why the two are kept
-   next to each other. */
-int program_save(RESUME_POINT* point);
-__attribute__((noreturn)) void program_resume(RESUME_POINT* point);
-
-__asm__(
-".text\n"
-".global program_save\n"
-"program_save:\n"
-"    movq (%rsp), %rax\n"        /* return address becomes the resume point */
-"    movq %rax, 56(%rdi)\n"
-"    leaq 8(%rsp), %rax\n"       /* stack as it will be after we return */
-"    movq %rax, 0(%rdi)\n"
-"    movq %rbp, 8(%rdi)\n"
-"    movq %rbx, 16(%rdi)\n"
-"    movq %r12, 24(%rdi)\n"
-"    movq %r13, 32(%rdi)\n"
-"    movq %r14, 40(%rdi)\n"
-"    movq %r15, 48(%rdi)\n"
-"    xorl %eax, %eax\n"
-"    ret\n"
-".global program_resume\n"
-"program_resume:\n"
-"    movq 0(%rdi), %rsp\n"
-"    movq 8(%rdi), %rbp\n"
-"    movq 16(%rdi), %rbx\n"
-"    movq 24(%rdi), %r12\n"
-"    movq 32(%rdi), %r13\n"
-"    movq 40(%rdi), %r14\n"
-"    movq 48(%rdi), %r15\n"
-"    movl $1, %eax\n"
-"    jmp *56(%rdi)\n"
-);
-
-/* Whichever program is running now, which is the innermost one. */
+/* Whichever program is running now. */
 const char* program_arguments(void) {
-    return depth ? slots[depth - 1].arguments : "";
+    int slot = current_slot();
+    return slot >= 0 ? slots[slot].arguments : "";
+}
+
+/* Where the running program was loaded. With the address a fault reports,
+   this is what turns "it died somewhere" into an offset in one program. */
+boot_uint64_t program_base(void) {
+    int slot = current_slot();
+    return slot >= 0 ? slots[slot].base : 0;
 }
 
 const char* program_path(void) {
-    return depth ? slots[depth - 1].path : "";
+    int slot = current_slot();
+    return slot >= 0 ? slots[slot].path : "";
 }
 
-int program_depth(void) { return depth; }
+/* Zero at the prompt, and otherwise one more than the slot of the program
+ * asking - which is what this returned when a slot was a depth, and is what
+ * every caller actually wanted: an identity for "whose is this?" that is zero
+ * for the kernel's own. */
+int program_depth(void) { return current_slot() + 1; }
+
+int program_owner(void) { return current_slot() + 1; }
+
+/* Is the program that is running now at ring 3?
+ *
+ * Asked by the calls that hand a program memory - a block it allocated, the
+ * screen it is about to draw on. Memory given to a program that cannot reach
+ * it is not a gift, it is a page fault with a delay, and the kernel is the
+ * only side that can say which ring the receiver is in. */
+int program_is_user(void) {
+    int slot = current_slot();
+    return slot >= 0 ? slots[slot].user : 0;
+}
+
+/* The tables the running program is using, so that the calls which hand it
+   memory mark it where that program will look. */
+static PAGING_SPACE* current_space(void) {
+    int slot = current_slot();
+    return slot >= 0 ? slots[slot].space : (PAGING_SPACE*)0;
+}
+
+/* Called by the scheduler on every switch, before the task it names runs.
+ *
+ * The address space is the one thing that cannot be left until the new task
+ * asks for it: the first instruction it executes is already being fetched
+ * through whatever tables CR3 points at, and if those are somebody else's the
+ * program is reading somebody else's memory - or, on a good day, faulting. */
+void task_switched_to(int slot) {
+    paging_space_enter(slot >= 0 ? slots[slot].space : (PAGING_SPACE*)0);
+}
+
+int program_allow_user(boot_uint64_t base, boot_uint64_t size) {
+    PAGING_SPACE* space = current_space();
+
+    if (space) return paging_space_allow_user(space, base, size);
+    return paging_allow_user(base, size);
+}
 
 /* The chain: what to run once the running program has gone.
  *
@@ -142,15 +156,22 @@ int program_chain_take(char* command, boot_uint64_t size) {
 void program_chain_clear(void) { chain_count = 0; }
 
 __attribute__((noreturn)) void program_exit(int code) {
-    int leaving = depth - 1;
+    int leaving = current_slot();
 
-    if (leaving < 0) leaving = 0;
+    /* The shell does not exit. Nothing should call this from there, and the
+       one thing that might - a stray SYS_EXIT from kernel code - would
+       otherwise end the task the whole machine is standing in. */
+    if (leaving < 0) {
+        serial_write("PROGRAM: exit outside a program, ignored\n");
+        for (;;) __asm__ volatile ("hlt");
+    }
+
     slots[leaving].exit_code = code;
-    if (depth) depth--;
-    /* Interrupts were left enabled by the trap gate, so nothing has to be
-       re-enabled here; the abandoned interrupt frame simply goes with the
-       stack we are throwing away. */
-    program_resume(&resume[leaving]);
+    /* The slot stays claimed until somebody else clears it: its memory, its
+       tables and its exit code are all still needed, and the tables in
+       particular cannot be freed by the task that is standing in them. */
+    slots[leaving].finished = 1;
+    task_finish();
 }
 
 /* Read the whole file into a buffer. Programs are small; streaming the ELF
@@ -469,6 +490,14 @@ int program_load(VOLUME* volume, const char* path, boot_uint64_t* base_out,
     }
     kfree(contents);
 
+    /* A module loaded by a program at ring 3 is code that program is about to
+       call, so it has to live where that program can reach - and execute. The
+       desktop and its applications end up in the same ring, which is the
+       shape the plan asks for: one boundary, around all of Mizu, with the
+       kernel on the other side of it. */
+    if (program_is_user())
+        (void)program_allow_user(base, pages * PAGE_SIZE);
+
     modules[slot].base = base;
     modules[slot].pages = pages;
     if (base_out) *base_out = base;
@@ -489,6 +518,23 @@ int program_unload(boot_uint64_t base) {
     return 0;
 }
 
+/* The kernel stack each program runs on lives in task.c now.
+ *
+ * TSS.RSP0 is the stack the processor switches to when an interrupt arrives
+ * from ring 3, and there was one of them for the whole machine. That is
+ * enough for one program and wrong for two: a desktop at ring 3 makes a
+ * system call, the kernel runs on that stack, and while it is still in the
+ * middle of it, it starts a second program at ring 3 - whose first system
+ * call arrives on the same stack and writes over the frames of the first.
+ *
+ * What that looks like is a machine that survives everything it was supposed
+ * to survive and then dies on the way home: the inner program faulted, was
+ * stopped correctly, and the kernel returned into a stack frame that no
+ * longer existed. RIP 0x798B, somewhere below the first megabyte, in nothing.
+ *
+ * That stack turned out to be the same object a task needs to be suspended
+ * on, so there is one array of them and the scheduler owns it. */
+
 /* The top of a program's stack: below the command line, aligned. */
 static boot_uint64_t program_stack_top(int slot) {
     return (PROGRAM_SLOT_TOP(slot) - PROGRAM_ARGUMENTS_MAX) & ~15ULL;
@@ -505,13 +551,254 @@ static int enter_at_ring3;
 
 void program_run_next_at_ring3(void) { enter_at_ring3 = 1; }
 
+/* Whether the next program is one to wait for.
+ *
+ * Set for one program and cleared as it starts, for the same reason as the
+ * flag above: what decides is the shell at the top and what acts on it is the
+ * bottom of program_run, and threading a parameter through everything between
+ * them would mean changing every caller to say "no, the usual" - which is how
+ * an option becomes a thing nobody can read. */
+static int background;
+
+void program_run_next_in_background(void) { background = 1; }
+
+/* Whether such a request is waiting to be acted on. Asked by the shell before
+   it runs a program, because what it does afterwards depends on whether the
+   program has ended or has only started: taking the screen and the colours
+   back is right for the first and takes them from a running program in the
+   second. */
+int program_run_next_is_background(void) { return background; }
+
+/* Which program the last background start actually started.
+ *
+ * A caller that does not wait gets no exit code, so what it needs back is a
+ * name for the thing it started - something to ask about later, when it wants
+ * to know whether that program is still running.
+ *
+ * The slot number alone will not do. Slots are reused, so a desktop holding
+ * the number of a program that ended would be told "still running" about
+ * whatever was started next - and would go on waiting for the wrong thing, or
+ * refuse to take its screen back. The count of programs the slot has held is
+ * folded in, which makes the name unique for as long as anybody could still be
+ * holding it. */
+static int last_started;
+
+static int program_name_of(int slot) {
+    return ((slots[slot].generation & 0xFFFFFF) << 8) | (slot + 1);
+}
+
+int program_last_started(void) { return last_started; }
+
+int program_is_running(int name) {
+    int slot = (name & 0xFF) - 1;
+
+    if (slot < 0 || slot >= PROGRAM_SLOTS) return 0;
+    if (program_name_of(slot) != name) return 0;
+    return slots[slot].used && !slots[slot].finished;
+}
+
+/* Both of the above, undone. For a caller that asked for something unusual
+   and then found there was no program to run: an option that outlives the
+   command that set it is worse than no option at all. */
+void program_run_next_cancel(void) {
+    background = 0;
+    enter_at_ring3 = 0;
+}
+
+/* Give back what a finished program was holding.
+ *
+ * Not done by the program itself: the last thing it needs is the address
+ * space it is standing in, and a task cannot free the tables the processor is
+ * walking for it. So the slot stays claimed until somebody who is not it says
+ * otherwise - the caller that was waiting, or the shell on its way round the
+ * loop for a program nobody waited for. */
+static void reap(int slot) {
+    if (slot < 0 || slot >= PROGRAM_SLOTS) return;
+    if (!slots[slot].used || !slots[slot].finished) return;
+    /* The files it left open, the memory it asked for, the sound it was
+       playing. Here rather than in the shell, because a program nobody waited
+       for has no shell to notice that it ended. */
+    syscall_close_owner(slot + 1);
+    if (slots[slot].space) {
+        paging_space_destroy(slots[slot].space);
+        slots[slot].space = (PAGING_SPACE*)0;
+    }
+    slots[slot].used = 0;
+    slots[slot].finished = 0;
+}
+
+void program_reap(void) {
+    for (int slot = 0; slot < PROGRAM_SLOTS; slot++)
+        if (slots[slot].used && slots[slot].finished) reap(slot);
+}
+
+/* Where a task begins.
+ *
+ * Everything that had to happen before the program's first instruction has
+ * happened by now, and most of it happened in the scheduler rather than here:
+ * the kernel stack this is standing on is the slot's own, and CR3 already
+ * points at the slot's tables. What is left is the jump. */
+/* ---- Threads --------------------------------------------------------------
+ *
+ * A thread is a task that shares everything with the one that made it: the
+ * same program, the same memory, the same open files. What it does not share
+ * is the two stacks - one at ring 3 for its own code, one in the kernel for
+ * the system calls it makes - because a stack is the one thing that cannot be
+ * shared by two things running at once.
+ *
+ * The user stack is the program's own: it allocates it and passes the top in.
+ * That is deliberate. The kernel does not know how much stack a thread of
+ * somebody else's program needs, the program does, and a kernel that guessed
+ * would be a kernel that guessed wrong for somebody.
+ *
+ * What this buys, and it is the whole reason it exists: a desktop that goes on
+ * drawing while one of its threads sits inside a system call waiting for a
+ * server on the other side of the sea to answer.
+ */
+typedef struct {
+    boot_uint64_t entry;
+    boot_uint64_t stack;
+    boot_uint64_t argument;
+    int slot;
+    int taken;
+} THREAD_REQUEST;
+
+/* One at a time, and read by the new task the moment it starts. The task is
+   created and then runs immediately or soon; nothing else may ask for a
+   thread until this one has been picked up, which the flag below enforces. */
+static THREAD_REQUEST pending_thread;
+
+__attribute__((noreturn)) static void enter_thread(boot_uint64_t entry_point,
+                                                   boot_uint64_t stack_top,
+                                                   boot_uint64_t argument) {
+    __asm__ volatile (
+        "movq %0, %%rsp\n"
+        "andq $-16, %%rsp\n"
+        "xorl %%ebp, %%ebp\n"
+        "movq %2, %%rdi\n"
+        "callq *%1\n"
+        /* A thread that returns instead of asking to end still has to end. */
+        "call program_thread_finish\n"
+        : : "r"(stack_top), "r"(entry_point), "r"(argument) : "memory");
+    __builtin_unreachable();
+}
+
+static void program_thread_entry(void) {
+    boot_uint64_t entry = pending_thread.entry;
+    boot_uint64_t stack = pending_thread.stack;
+    boot_uint64_t argument = pending_thread.argument;
+    int slot = pending_thread.slot;
+
+    pending_thread.taken = 1;
+    /* A thread runs where its program runs. Most programs here are at ring 0 -
+       the DOS contract, free of the machine - and a thread of one entered at
+       ring 3 would fault on the first thing its program does. */
+    if (slot >= 0 && slots[slot].user)
+        cpu_enter_user_with(entry, stack, argument);
+    enter_thread(entry, stack, argument);
+}
+
+int program_thread_start(boot_uint64_t entry, boot_uint64_t stack,
+                         boot_uint64_t argument) {
+    int slot = task_current_slot();
+
+    if (slot < 0) return 0;
+    if (!slots[slot].used || slots[slot].finished) return 0;
+    if (!entry || !stack) return 0;
+    /* Both addresses must be memory this program can already reach at ring 3.
+     *
+     * Not "inside the program's slot", which was the first version and was
+     * wrong: what koi_alloc hands back is a kernel page marked reachable, and
+     * it lives nowhere near the slot - so every thread was refused, and the
+     * check was measuring the wrong thing anyway. The question that matters
+     * is whether the program could touch this memory itself. If it could,
+     * running a thread there grants nothing new; if it could not, the kernel
+     * would be handing ring 3 a page nobody gave it. */
+    /* For a program at ring 3, both addresses must be memory it can already
+     * reach there - otherwise the kernel would be handing ring 3 a page
+     * nobody gave it. For a program at ring 0 there is nothing to check: it
+     * can already reach everything, which is what ring 0 means and why this
+     * system says so out loud rather than pretending otherwise. */
+    if (slots[slot].user) {
+        if (!paging_space_is_user(slots[slot].space, entry, 16)) {
+            serial_write("THREAD: refused - the entry point is not memory "
+                         "this program can reach at ring 3\n");
+            return 0;
+        }
+        if (!paging_space_is_user(slots[slot].space, stack - PAGE_SIZE,
+                                  PAGE_SIZE)) {
+            serial_write("THREAD: refused - the stack is not memory this "
+                         "program can reach at ring 3\n");
+            return 0;
+        }
+    }
+
+    pending_thread.entry = entry;
+    pending_thread.stack = stack;
+    pending_thread.argument = argument;
+    pending_thread.slot = slot;
+    pending_thread.taken = 0;
+
+    if (!task_start(slot, program_thread_entry)) {
+        serial_write("THREAD: refused - no room for another task\n");
+        return 0;
+    }
+    slots[slot].threads++;
+
+    /* Wait until the new task has picked its request up.
+     *
+     * There is one request at a time, and the first version returned as soon
+     * as the task existed - so a program starting two threads in a row
+     * overwrote the first one's entry and argument before it had run. Both
+     * threads then started as the second, which the test program noticed by
+     * printing the same number twice. Handing over one at a time is the whole
+     * fix, and it costs one yield. */
+    while (!pending_thread.taken) task_yield();
+    return 1;
+}
+
+/* The thread is over. Its program is not: only the last task out turns off
+   the lights, and that is the one program_run is waiting for. */
+__attribute__((noreturn)) void program_thread_finish(void) {
+    int slot = task_current_slot();
+
+    if (slot >= 0 && slots[slot].threads) slots[slot].threads--;
+    task_finish();
+}
+
+static void program_task_entry(void) {
+    int slot = task_current_slot();
+
+    if (slot < 0) task_finish();
+    if (slots[slot].user)
+        cpu_enter_user(slots[slot].entry, program_stack_top(slot));
+    enter_program(slots[slot].entry, program_stack_top(slot));
+}
+
 int program_run(VOLUME* volume, const char* path, const char* arguments,
                 int* exit_code_out) {
     boot_uint8_t* contents;
     boot_uint32_t length = 0;
     boot_uint64_t entry_point = 0;
-    int slot = depth;
+    int slot;
     boot_uint64_t base;
+    /* Both requests are taken here, at the top, rather than at the point they
+       are acted on: a program that turns out not to exist would otherwise
+       leave one of them set for whatever is typed next, and "the next program
+       you run happens to be at ring 3" is a bug nobody would connect to the
+       command that caused it. */
+    int at_ring3 = enter_at_ring3;
+    int waiting = !background;
+
+    enter_at_ring3 = 0;
+    background = 0;
+
+    /* Anything that finished while nobody was waiting for it is cleared away
+       first, so that "no free slot" means four programs are running rather
+       than four have run. */
+    program_reap();
+    for (slot = 0; slot < PROGRAM_SLOTS; slot++)
+        if (!slots[slot].used) break;
 
     /* Out of slots is a real answer and not a failure of the file: a program
        that runs a program that runs a program eventually meets the end of the
@@ -597,33 +884,64 @@ int program_run(VOLUME* volume, const char* path, const char* arguments,
         slots[slot].path[index] = 0;
     }
     slots[slot].exit_code = 0;
+    slots[slot].user = 0;
+    slots[slot].finished = 0;
+    slots[slot].entry = entry_point;
+    slots[slot].space = (PAGING_SPACE*)0;
+    slots[slot].generation++;
+    slots[slot].used = 1;
     /* A Ctrl+C nobody acted on belongs to whatever it was aimed at, which is
        not this. Pressed at the prompt it stops here; pressed at a program that
        had already finished, likewise. Without this it would be waiting for the
        next program to make its first system call, and stop that one instead. */
     keyboard_break_clear();
 
-    if (program_save(&resume[slot])) {
-        /* Arrived here through program_exit(). Whatever this program was
-           given is gone with it; the one underneath keeps its own. */
-        if (exit_code_out) *exit_code_out = slots[slot].exit_code;
-        return PROGRAM_OK;
-    }
-    depth = slot + 1;
-
-    if (enter_at_ring3) {
-        enter_at_ring3 = 0;
-        /* The program's own window, and nothing else in the machine. Its
-           image and its stack are both inside the slot, so one range covers
-           what it is allowed to touch; everything else - the kernel, the
-           other slots, the framebuffer - faults. */
-        if (!paging_allow_user(base, PROGRAM_SLOT_SIZE)) {
+    if (at_ring3) {
+        slots[slot].user = 1;
+        /* Its own tables, and in them its own window of memory. Everything
+           else - the kernel, the other slots, the framebuffer - is mapped
+           where the kernel has it and is reachable by nothing at ring 3. */
+        slots[slot].space = paging_space_create();
+        if (!slots[slot].space ||
+            !paging_space_allow_user(slots[slot].space, base,
+                                     PROGRAM_SLOT_SIZE)) {
             console_write("Cannot give this program its own memory.\n");
-            depth = slot;
+            if (slots[slot].space) paging_space_destroy(slots[slot].space);
+            slots[slot].space = (PAGING_SPACE*)0;
+            slots[slot].used = 0;
             return PROGRAM_REFUSED;
         }
-        serial_write("PROGRAM: entering at ring 3\n");
-        cpu_enter_user(entry_point, program_stack_top(slot));
+        serial_write("PROGRAM: entering at ring 3, in its own space\n");
     }
-    enter_program(entry_point, program_stack_top(slot));
+
+    {
+        TASK* task = task_start(slot, program_task_entry);
+
+        if (!task) {
+            console_write("Cannot start this program.\n");
+            if (slots[slot].space) paging_space_destroy(slots[slot].space);
+            slots[slot].space = (PAGING_SPACE*)0;
+            slots[slot].used = 0;
+            return PROGRAM_REFUSED;
+        }
+        if (!waiting) {
+            /* Nobody is waiting. The program is runnable and gets its turn
+               from the scheduler like everything else; whoever asked for it
+               carries on with the next line. */
+            last_started = program_name_of(slot);
+            if (exit_code_out) *exit_code_out = 0;
+            return PROGRAM_OK;
+        }
+        /* Waiting, which is what "run this and come back" means. The stack
+           this is standing on is the caller's own and stays exactly as it is
+           until the task it is waiting for has ended. */
+        task_wait(task);
+    }
+
+    /* Back, and the program is gone. The tables it was using were left behind
+       by the scheduler on the way here - which is why they can be freed now
+       and could not have been freed by the program itself. */
+    if (exit_code_out) *exit_code_out = slots[slot].exit_code;
+    reap(slot);
+    return PROGRAM_OK;
 }

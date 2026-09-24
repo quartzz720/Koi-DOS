@@ -470,6 +470,39 @@ static inline int koi_run(const char* command) {
     return (int)koi_call(SYS_RUN, (long)command, 0, 0);
 }
 
+/* The same, without waiting for it.
+ *
+ * Returns as soon as the program has started, and the program runs alongside
+ * this one - two programs, two turns of the processor, arranged by the kernel.
+ * There is no exit code to give back, because nothing has exited. What comes
+ * back instead is a name for the program that was started, to ask after it
+ * with koi_running() - or KOI_EXIT_NOT_FOUND when there was nothing to start,
+ * and 0 when the line turned out to be a built-in command and nothing was
+ * started that could be waited for.
+ *
+ * This is what a desktop wants and what koi_run could never be. Every freeze
+ * while something loaded was a shell that had stopped because the program it
+ * started had not finished; a desktop that starts a program this way goes on
+ * drawing, and the program it started goes on running when the desktop is
+ * asked to do something else.
+ *
+ * The screen is still one screen. A program started this way that draws on the
+ * framebuffer draws over whatever was there - starting two of those is not
+ * something the kernel can arbitrate, and the arbitration is the desktop's
+ * job. */
+static inline int koi_start(const char* command) {
+    return (int)koi_call(SYS_RUN, (long)command, 1, 0);
+}
+
+/* Whether a program started that way is still running.
+ *
+ * The only thing a caller that did not wait can ask, and everything a desktop
+ * needs: it gave the screen to what it started, and this is how it learns that
+ * it may have the screen back. */
+static inline int koi_running(int name) {
+    return name > 0 && koi_sysinfo(KOI_INFO_PROGRAM_RUNNING, name) == 1;
+}
+
 /* Whether Ctrl+C stops this program. On for everything by default; a program
    that draws - a desktop, a game - turns it off and reads the character
    itself. The kernel turns it back on when the program exits. */
@@ -484,6 +517,12 @@ static inline void koi_break(int enabled) {
  * caller is stopped until the command finishes, and a command that waits for
  * a key waits forever - nothing is reading the keyboard for it. Returns the
  * number of bytes, with a zero after them. */
+/* What the last command run through koi_run or koi_capture exited with.
+   Capture answers how much was printed; this answers how it went. */
+static inline int koi_last_exit(void) {
+    return (int)koi_sysinfo(KOI_INFO_LAST_EXIT, 0);
+}
+
 static inline long koi_capture(const char* line, char* buffer, long size) {
     return koi_call(SYS_CAPTURE, (long)line, (long)buffer, size);
 }
@@ -609,6 +648,146 @@ static inline int koi_mouse_place(int x, int y) {
     return (int)koi_call(SYS_MOUSE_PLACE, KOI_POINT(x, y), 0, 0);
 }
 
+/* ---- The network ---------------------------------------------------------
+ *
+ * A conversation with another machine. Everything here blocks with a timeout
+ * and drives the network while it waits, so a program that must keep drawing
+ * asks for a short one and comes back - which is what a window in this
+ * desktop does anyway.
+ *
+ * There is no TLS. These reach http:// and not https://, which in 2026 is a
+ * real limit and an honest one.
+ */
+static inline int koi_net_resolve(const char* name, unsigned int* address) {
+    return (int)koi_call(SYS_NET_RESOLVE, (long)name, (long)address, 0);
+}
+
+/* Dial. Returns a handle, or -1 when nothing answered. */
+static inline int koi_tcp_connect(unsigned int address, int port,
+                                  unsigned int timeout_ms) {
+    return (int)koi_call(SYS_TCP_CONNECT, (long)address, port,
+                         (long)timeout_ms);
+}
+
+static inline int koi_tcp_send(int handle, const void* data,
+                               unsigned int length, unsigned int timeout_ms) {
+    return (int)koi_call(SYS_TCP_SEND, handle, (long)data,
+                         KOI_NET_ARG(length, timeout_ms));
+}
+
+/* Returns what arrived, 0 when the other end has finished and there is
+   nothing left, and -1 when it failed or nothing came in time. */
+static inline int koi_tcp_receive(int handle, void* buffer, unsigned int size,
+                                  unsigned int timeout_ms) {
+    return (int)koi_call(SYS_TCP_RECEIVE, handle, (long)buffer,
+                         KOI_NET_ARG(size, timeout_ms));
+}
+
+static inline int koi_tcp_close(int handle) {
+    return (int)koi_call(SYS_TCP_CLOSE, handle, 0, 0);
+}
+
+/* Whether there is any point asking for more. */
+/* ---- Threads --------------------------------------------------------------
+ *
+ * `koi_thread_start` runs `entry(argument)` beside the caller, in the same
+ * memory, on a stack the caller provides. It returns as soon as the thread
+ * exists; the two run side by side from then on, and the kernel takes the
+ * processor from whichever has had it long enough.
+ *
+ * The stack must be memory this program owns and must stay owned for as long
+ * as the thread runs - koi_alloc is the obvious source, and freeing it while
+ * the thread is standing on it is the obvious way to ruin an afternoon.
+ *
+ * A thread ends by returning from `entry` or by calling koi_thread_exit.
+ *
+ * ---- The rule that keeps this from becoming a mess -------------------------
+ *
+ * There is no protection between threads: they are one program. Two threads
+ * writing one variable is exactly as bad as it sounds, and no tool here will
+ * catch it. What works is deciding, in advance and in writing, which thread
+ * owns which state - and having the others hand work to it rather than reach
+ * into it. The lock below is for the places where that is not enough, and it
+ * should be needed rarely.
+ */
+static inline int koi_thread_start(void (*entry)(void*), void* stack_top,
+                                   void* argument) {
+    return (int)koi_call(SYS_THREAD_START, (long)entry, (long)stack_top,
+                         (long)argument);
+}
+
+static inline void koi_thread_exit(void) {
+    koi_call(SYS_THREAD_EXIT, 0, 0, 0);
+    for (;;) { }                 /* the call does not return */
+}
+
+/* A lock, for the state two threads really must share.
+ *
+ * One word, taken with an atomic exchange - the one instruction that cannot
+ * be interrupted between reading and writing. A thread that finds it taken
+ * gives up the rest of its turn rather than spinning: on one processor,
+ * spinning means waiting for a turn that cannot come until this one ends.
+ */
+typedef struct { volatile long held; } KOI_LOCK;
+
+static inline void koi_lock(KOI_LOCK* lock) {
+    for (;;) {
+        long was = 1;
+
+        __asm__ volatile ("xchg %0, %1"
+                          : "+r"(was), "+m"(lock->held)
+                          : : "memory");
+        if (!was) return;
+        koi_call(SYS_YIELD, 0, 0, 0);
+    }
+}
+
+static inline void koi_unlock(KOI_LOCK* lock) {
+    __asm__ volatile ("" : : : "memory");
+    lock->held = 0;
+}
+
+/* ---- The same, in private ------------------------------------------------
+ *
+ * https, which is these five calls instead of the five above. `name` is what
+ * was typed - a server with several sites needs telling which one is wanted,
+ * and it is what a certificate will be checked against.
+ *
+ * koi_tls_checked answers the question a padlock claims to answer: whether
+ * anybody verified who is on the other end. While it returns 0 the connection
+ * is private and unauthenticated - safe from somebody reading the wire, worth
+ * nothing against somebody who can answer in the server's place - and a
+ * program must say that in words rather than draw a padlock. */
+static inline int koi_tls_connect(unsigned int address, int port,
+                                  const char* name, unsigned int timeout_ms) {
+    return (int)koi_call(SYS_TLS_CONNECT, (long)address,
+                         KOI_NET_ARG(port, timeout_ms), (long)name);
+}
+
+static inline int koi_tls_send(int handle, const void* data,
+                               unsigned int length, unsigned int timeout_ms) {
+    return (int)koi_call(SYS_TLS_SEND, handle, (long)data,
+                         KOI_NET_ARG(length, timeout_ms));
+}
+
+static inline int koi_tls_receive(int handle, void* buffer, unsigned int size,
+                                  unsigned int timeout_ms) {
+    return (int)koi_call(SYS_TLS_RECEIVE, handle, (long)buffer,
+                         KOI_NET_ARG(size, timeout_ms));
+}
+
+static inline int koi_tls_close(int handle) {
+    return (int)koi_call(SYS_TLS_CLOSE, handle, 0, 0);
+}
+
+static inline int koi_tls_checked(int handle) {
+    return (int)koi_call(SYS_TLS_CHECKED, handle, 0, 0);
+}
+
+static inline int koi_tcp_open(int handle) {
+    return (int)koi_call(SYS_TCP_OPEN, handle, 0, 0);
+}
+
 /* ---- Sound ---------------------------------------------------------------
  *
  * There is nothing to open. One stream of 48 kHz stereo is always running and
@@ -641,6 +820,51 @@ static inline int koi_sound_play_simple(const void* samples,
     sound.loop = 0;
     sound.reserved = 0;
     return koi_sound_play(&sound);
+}
+
+/* ---- A stream of sound ---------------------------------------------------
+ *
+ * For music, where the samples do not exist all at once. Open a stream at the
+ * rate and shape the decoder produces, hand it frames as they come, stop it
+ * at the end.
+ *
+ * koi_sound_queue takes what fits and answers how many frames it took - a
+ * short answer means the ring is nearly full, which is what keeping up looks
+ * like. The buffer is copied, so it may be reused as soon as the call
+ * returns.
+ */
+static inline int koi_sound_open(unsigned int rate, int bits, int channels,
+                                 int volume) {
+    return (int)koi_call(SYS_SOUND_OPEN, (long)rate,
+                         KOI_SOUND_SHAPE(bits, channels), (long)volume);
+}
+
+static inline int koi_sound_queue(int voice, const void* samples,
+                                  unsigned int frames) {
+    return (int)koi_call(SYS_SOUND_QUEUE, voice, (long)samples, (long)frames);
+}
+
+/* How many frames of room there are, for a decoder deciding whether to do
+   more work. */
+static inline int koi_sound_space(int voice) {
+    return (int)koi_call(SYS_SOUND_SPACE, voice, 0, 0);
+}
+
+/* Pause a voice, or let it go on. Exact: nothing already queued is heard
+   after the pause and nothing is lost by it. */
+static inline int koi_sound_pause(int voice, int paused) {
+    return (int)koi_call(SYS_SOUND_PAUSE, voice, paused, 0);
+}
+
+static inline int koi_sound_is_paused(int voice) {
+    return (int)koi_call(SYS_SOUND_PAUSED, voice, 0, 0);
+}
+
+/* Throw away what is queued, saying how far into the sound the caller is
+   about to start feeding from. Half of a seek; the other half is the caller
+   moving to that place in the file. */
+static inline int koi_sound_flush(int voice, unsigned int heard) {
+    return (int)koi_call(SYS_SOUND_FLUSH, voice, (long)heard, 0);
 }
 
 static inline int koi_sound_tone(unsigned int hertz,

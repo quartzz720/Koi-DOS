@@ -6,6 +6,7 @@
 #include "cpu.h"
 #include "console.h"
 #include "idt.h"
+#include "task.h"
 #include "io.h"
 #include "pic.h"
 #include "xhci.h"
@@ -58,6 +59,7 @@ static volatile boot_uint32_t buffer_tail;
 static int shift_held;
 static int control_held;
 static int alt_held;
+static int gui_held;
 static int caps_lock;
 static int escape_pending;
 
@@ -237,9 +239,11 @@ static void handle_scancode(boot_uint8_t code) {
             keyboard_attention(control_held, alt_held,
                                (int)translate_escaped(code));
         /* The right-hand modifiers arrive escaped; treat them as their
-           left-hand twins. */
+           left-hand twins. And the Windows keys, which arrive only escaped
+           and are held rather than typed. */
         if (code == 0x1D) { control_held = !released; return; }
         if (code == 0x38) { alt_held = !released; return; }
+        if (code == 0x5B || code == 0x5C) { gui_held = !released; return; }
         if (!released) {
             boot_uint16_t key = translate_escaped(code);
             if (key) buffer_push(key);
@@ -270,6 +274,11 @@ static void handle_scancode(boot_uint8_t code) {
 
     /* F1..F12: 0x3B-0x44 then 0x57, 0x58. */
     if (code >= 0x3B && code <= 0x44) {
+        /* Alt+F4 closes a window, everywhere, and has since 1985. It is
+           recognised here rather than left to the program, because the whole
+           point of it is that it works when the program in front is not
+           listening for anything else. */
+        if (code == 0x3E && alt_held) { buffer_push(KOI_KEY_CLOSE); return; }
         buffer_push((boot_uint16_t)(KEY_F1 + (code - 0x3B)));
         return;
     }
@@ -279,6 +288,14 @@ static void handle_scancode(boot_uint8_t code) {
     if (code >= sizeof(plain_map)) return;
     character = shift_held ? shift_map[code] : plain_map[code];
     if (!character) return;
+
+    /* The Windows key with R, which is where a Run box has lived for thirty
+       years. Taken before the layout is applied, so it works with a Cyrillic
+       keyboard selected as well - the key is the key whatever it types. */
+    if (gui_held && (character == 'r' || character == 'R')) {
+        buffer_push(KOI_KEY_RUN);
+        return;
+    }
 
     /* Caps lock affects letters only, and inverts whatever shift decided. */
     if (caps_lock) {
@@ -471,6 +488,7 @@ static int break_requested;
 static int break_enabled = 1;
 
 void keyboard_break_enable(int enabled) { break_enabled = enabled != 0; }
+int keyboard_break_enabled(void) { return break_enabled; }
 
 int keyboard_break_taken(void) {
     int asked = break_requested;
@@ -583,6 +601,15 @@ int keyboard_getchar(void) {
             console_show_cursor(0);
             return 3;
         }
+        /* And a turn for anybody else who wants one.
+         *
+         * Waiting for a key is a task doing nothing, and the shell does it for
+         * almost the whole life of the machine. Preemption cannot help here -
+         * it takes the processor only from a program at ring 3, and this is
+         * the kernel - so the wait has to give it up itself. Without this line
+         * a program started with START would get the processor for the first
+         * time when somebody pressed a key. */
+        task_yield();
         /* Before the sleep, whichever keyboard we are waiting on: this is the
            only place a device plugged in while somebody sits at the prompt can
            be noticed. */
@@ -593,7 +620,7 @@ int keyboard_getchar(void) {
            asks, and nobody was listening between commands. A machine that
            replies only while it is running `ping` itself is a machine no other
            machine can find. */
-        if (net_link_ready()) net_poll();
+        if (net_link_ready()) { net_poll(); net_maintain(); }
         if (usb || controllers) {
             /* The controller's interrupt is still not routed anywhere, so USB
                keystrokes have to be collected rather than waited for.

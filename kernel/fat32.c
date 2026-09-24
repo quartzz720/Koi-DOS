@@ -1,4 +1,5 @@
 #include "fat32.h"
+#include "serial.h"
 #include "heap.h"
 #include "memory.h"
 #include "string.h"
@@ -66,6 +67,28 @@ typedef struct {
     boot_uint32_t fat_cache_sector;   /* index within one copy of the table */
     int fat_cache_valid;
     int fat_cache_dirty;
+
+    /* Where the last read of a file left off.
+     *
+     * Reading is by absolute offset, so every call started at the file's first
+     * cluster and walked the chain to reach it - which for a program reading a
+     * file in order is the whole chain again on every call, and the work grows
+     * as the square of the file's length. A picture read one row at a time is
+     * exactly that shape: two megabytes cost a few hundred thousand walks, and
+     * on a USB stick each one that misses the cached table sector is a round
+     * trip to the device. That is what "big pictures take forever, and worse
+     * from the stick" was, and the machine crawling while one loaded.
+     *
+     * One position, not a table: the case worth having is a program reading
+     * one file forwards, which is nearly every program. A read that starts
+     * before the remembered point, or in another file, walks from the
+     * beginning as before.
+     *
+     * Only meaningful while the chain is unchanged, so anything that writes
+     * to the table clears it. */
+    boot_uint32_t walk_first_cluster;   /* which file, 0 for none */
+    boot_uint32_t walk_offset;          /* where that cluster starts */
+    boot_uint32_t walk_cluster;
     int mounted;
 } FAT_VOLUME;
 
@@ -187,6 +210,10 @@ static boot_uint32_t next_cluster(FAT_VOLUME* fat, boot_uint32_t cluster) {
     return read32(sector + offset % fat->bytes_per_sector) & CLUSTER_MASK;
 }
 
+int fat32_is_mounted(VOLUME* volume) {
+    return volume && mount_for(volume) != (FAT_VOLUME*)0;
+}
+
 void fat32_unmount_all(void) {
     /* Anything still held for a volume goes out to the disk before the record
        of that volume disappears. */
@@ -229,15 +256,29 @@ int fat32_mount(VOLUME* volume) {
     fat->sectors_per_fat = read32(sector + 36);
     fat->root_cluster = read32(sector + 44);
 
-    /* FAT32 is identified by what it does NOT have: no fixed-size root
-       directory and a 32-bit FAT size field. FAT12 and FAT16 both put a
-       non-zero value in the 16-bit field and a real count in root_entries. */
+    /* Refusing to mount is a normal answer - not every FAT volume is FAT32 -
+     * but refusing in silence is not.
+     *
+     * A volume whose boot sector merely looks like FAT gets into the table and
+     * is handed a drive letter; if the mount then fails and says nothing, what
+     * is left is a letter that exists, appears in `disk`, and cannot be
+     * opened. There is no way to tell that from a broken driver, and one
+     * evening was spent proving which it was. So each refusal names itself,
+     * and the words are the ones somebody would search for. */
     if (root_entries != 0 || sectors_per_fat_16 != 0 || !fat->sectors_per_fat) {
+        serial_write("FAT32: not FAT32 - this volume is FAT12 or FAT16\n");
         free_page(sector);
         return 0;
     }
-    if (fat->bytes_per_sector != SECTOR_SIZE || !fat->sectors_per_cluster ||
-        !fat->reserved_sectors || !fat->fat_count || fat->root_cluster < 2) {
+    if (fat->bytes_per_sector != SECTOR_SIZE) {
+        serial_write("FAT32: sector size is not 512, which this driver "
+                     "requires\n");
+        free_page(sector);
+        return 0;
+    }
+    if (!fat->sectors_per_cluster || !fat->reserved_sectors ||
+        !fat->fat_count || fat->root_cluster < 2) {
+        serial_write("FAT32: the boot sector is not usable\n");
         free_page(sector);
         return 0;
     }
@@ -245,6 +286,7 @@ int fat32_mount(VOLUME* volume) {
     fat->first_data_sector = fat->reserved_sectors +
                              fat->fat_count * fat->sectors_per_fat;
     if (fat->total_sectors <= fat->first_data_sector) {
+        serial_write("FAT32: the volume is smaller than its own tables say\n");
         free_page(sector);
         return 0;
     }
@@ -596,11 +638,30 @@ boot_uint32_t fat32_read(VOLUME* volume, const FAT_ENTRY* entry,
     cluster = entry->first_cluster;
     cluster_bytes = fat->sectors_per_cluster * fat->bytes_per_sector;
 
-    /* Skip whole clusters until the one holding `offset`. */
-    while (offset >= cluster_bytes) {
-        cluster = next_cluster(fat, cluster);
-        if (cluster_is_end(cluster) || cluster < 2) return 0;
-        offset -= cluster_bytes;
+    /* Start from where the last read of this file ended, when that is on the
+       way to where this one begins. See walk_first_cluster. */
+    {
+        boot_uint32_t walked = 0;
+
+        if (fat->walk_first_cluster == entry->first_cluster &&
+            entry->first_cluster >= 2 && fat->walk_cluster >= 2 &&
+            fat->walk_offset <= offset) {
+            cluster = fat->walk_cluster;
+            walked = fat->walk_offset;
+        }
+        offset -= walked;
+
+        /* Skip whole clusters until the one holding `offset`. */
+        while (offset >= cluster_bytes) {
+            cluster = next_cluster(fat, cluster);
+            if (cluster_is_end(cluster) || cluster < 2) return 0;
+            offset -= cluster_bytes;
+            walked += cluster_bytes;
+        }
+
+        fat->walk_first_cluster = entry->first_cluster;
+        fat->walk_offset = walked;
+        fat->walk_cluster = cluster;
     }
 
     sector = (boot_uint8_t*)alloc_page();
@@ -621,6 +682,10 @@ boot_uint32_t fat32_read(VOLUME* volume, const FAT_ENTRY* entry,
             cluster = next_cluster(fat, cluster);
             if (cluster_is_end(cluster) || cluster < 2) break;
             offset -= cluster_bytes;
+            /* And remembered as we go, so the next call starts here rather
+               than at the last place a walk began. */
+            fat->walk_offset += cluster_bytes;
+            fat->walk_cluster = cluster;
             continue;
         }
 
@@ -700,6 +765,12 @@ static int write_fat_entry(FAT_VOLUME* fat, boot_uint32_t cluster,
     write32(sector + within,
             (read32(sector + within) & 0xF0000000U) | (value & CLUSTER_MASK));
     fat->fat_cache_dirty = 1;
+    /* The chain has changed shape, so a remembered position in it means
+       nothing. Cleared here rather than at each of the half-dozen callers,
+       because this is the one place a chain can change. */
+    fat->walk_first_cluster = 0;
+    fat->walk_offset = 0;
+    fat->walk_cluster = 0;
 
     was_free = previous_value == CLUSTER_FREE;
     now_free = (value & CLUSTER_MASK) == CLUSTER_FREE;

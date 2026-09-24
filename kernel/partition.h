@@ -85,6 +85,15 @@ int partition_write_gpt(BLOCK_DEVICE* device, const GPT_REQUEST* requests,
    Every VOLUME pointer handed out before this call is stale afterwards. */
 boot_uint32_t partition_rescan(void);
 
+/* Rescan if, and only if, the set of disks has changed since the last scan.
+   Returns whether it did. Cheap enough to call from a prompt or an event
+   loop; safe only where no program is midway through a file. */
+int partition_settle(void);
+
+/* Whether the disks have changed since the table was built, without doing
+   anything about it. */
+int partition_changed(void);
+
 boot_uint32_t volume_count(void);
 VOLUME* volume_at(boot_uint32_t index);
 
@@ -105,6 +114,14 @@ VOLUME* volume_by_letter(char letter);
  * a name. Nothing marked means nothing changes: the boot volume stays Z:, and
  * a single-partition install keeps working exactly as before. */
 #define SYSTEM_VOLUME_MARKER "\\BOOT\\KOIDOS.SYS"
+
+/* Whether this volume sits on a partition the GPT calls an EFI System
+ * Partition - somebody's boot files, this machine's or another system's.
+ *
+ * Such a volume gets no drive letter unless it is the one we booted from,
+ * which is what Windows has done since UEFI existed and for the same reason:
+ * it is not a place anybody keeps anything. */
+int volume_is_efi_system(const VOLUME* volume);
 
 /* Hand Z: to `system`, and take the letter away from the volume the firmware
    loaded from. Everything else shifts down from Y:. */

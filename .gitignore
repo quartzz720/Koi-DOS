@@ -17,8 +17,14 @@ sdk/*.EXE
 *.img
 *.fd
 
-# Working notes, kept out of the repo on purpose
+# Working notes, kept out of the repo on purpose. Russian, and written for
+# one person rather than for the repository.
 PLAN.md
+CHECKLIST.md
+NAMI.md
+
+# Media dropped in the tree for testing, not part of the system
+start.mp3
 
 # Editor and OS leftovers
 *.save
@@ -53,3 +59,4 @@ koi.log
 # Other stuff
 wall.bmp
 *.txt
+extra/

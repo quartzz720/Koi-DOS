@@ -4,9 +4,20 @@
 static BLOCK_DEVICE devices[BLOCK_MAX_DEVICES];
 static boot_uint32_t device_count;
 
+/* How many times the set of disks has changed.
+ *
+ * A number rather than a flag, because more than one thing wants to know and
+ * each of them wants to know whether it has changed since *it* last looked.
+ * The shell asks at its prompt; a file browser asks while it is running. A
+ * flag would be read by the first of them and gone for the second. */
+static boot_uint32_t generation;
+
+boot_uint32_t block_generation(void) { return generation; }
+
 int block_register(const BLOCK_DEVICE* device) {
     if (device_count >= BLOCK_MAX_DEVICES || !device || !device->read) return -1;
     devices[device_count] = *device;
+    generation++;
     return (int)device_count++;
 }
 
@@ -15,6 +26,7 @@ int block_register(const BLOCK_DEVICE* device) {
    to know that. */
 int block_forget(const char* name) {
     if (!name) return 0;
+    generation++;
     for (boot_uint32_t index = 0; index < device_count; index++) {
         if (strcmp(devices[index].name, name)) continue;
         /* Emptied in place, not removed from the list. An index handed out

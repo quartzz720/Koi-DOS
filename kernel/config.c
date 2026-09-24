@@ -344,10 +344,53 @@ static void apply_console(const char* key, const char* value, void* context) {
    chose Ukrainian at setup wants Ukrainian and English on Alt+Shift, and
    having to say so twice is the kind of question software asks when it has not
    been thought about. */
+/* What to start instead of the prompt, if anything.
+ *
+ * Its own file rather than a key in SYSTEM.CFG, for the reason the directory
+ * exists: a file has one owner, and this one belongs to whichever desktop was
+ * installed. Two desktops cannot both be the desktop, and having them contend
+ * for one file is the honest expression of that - the same contention they
+ * already had over one line of AUTOEXEC.BAT, in a place where it is a setting
+ * rather than a command.
+ *
+ * Kernel memory rather than a pointer into the file, which is read into a
+ * buffer that does not outlive config_load. */
+#define DESKTOP_MAX 128
+static char desktop_command[DESKTOP_MAX];
+
+const char* config_desktop(void) { return desktop_command; }
+
+static void apply_desktop(const char* key, const char* value, void* context) {
+    boot_uint64_t length = 0;
+
+    (void)context;
+    if (!equals_ignoring_case(key, "command")) return;
+    while (value[length] && length + 1 < DESKTOP_MAX) {
+        desktop_command[length] = value[length];
+        length++;
+    }
+    desktop_command[length] = 0;
+    trim(desktop_command);
+}
+
+/* Whether to ask for an address at boot. On unless somebody says otherwise:
+   a machine on a network with a server is the ordinary case, and `net start`
+   was a command people had to know existed. */
+static int network_automatic = 1;
+
+int config_network_automatic(void) { return network_automatic; }
+
 static void apply_system(const char* key, const char* value, void* context) {
     (void)context;
 
-    if (equals_ignoring_case(key, "language")) {
+    if (equals_ignoring_case(key, "network")) {
+        /* `network = manual` for a machine that should not go asking - a
+           laptop on somebody else's wire, or one where the wait is not worth
+           it. Anything else, including nothing, means ask. */
+        network_automatic = !(value[0] == 'm' || value[0] == 'M' ||
+                              value[0] == 'o' || value[0] == 'O' ||
+                              value[0] == 'n' || value[0] == 'N');
+    } else if (equals_ignoring_case(key, "language")) {
         if (value[0] == 'r' && value[1] == 'u') layout_set_alternate(LAYOUT_RU);
         else if (value[0] == 'u' && value[1] == 'k') layout_set_alternate(LAYOUT_UK);
         else if (value[0] == 'e' && value[1] == 'l') layout_set_alternate(LAYOUT_GR);
@@ -471,6 +514,8 @@ void config_load(VOLUME* volume) {
     read_settings(volume, CONFIG_DIRECTORY "\\CONSOLE.CFG", apply_console, &theme);
     read_settings(volume, CONFIG_DIRECTORY "\\SOUND.CFG", apply_sound, &percent);
     read_settings(volume, CONFIG_DIRECTORY "\\SYSTEM.CFG", apply_system,
+                  (void*)0);
+    read_settings(volume, CONFIG_DIRECTORY "\\DESKTOP.CFG", apply_desktop,
                   (void*)0);
 
     if (percent >= 0) audio_set_volume(percent * 255 / 100);

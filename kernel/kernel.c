@@ -27,6 +27,8 @@
 #include "graphics.h"
 #include "audio.h"
 #include "timer.h"
+#include "random.h"
+#include "task.h"
 
 /* Everything the kernel reports goes to both the framebuffer and COM1. If a
    later step faults before drawing anything, the serial log is the only
@@ -36,11 +38,23 @@ static void report(const char* text) {
     serial_write(text);
 }
 
+/* How long a turn is.
+ *
+ * Ten milliseconds, which is what everything from Windows 95 to Linux picked
+ * and for the same reason: short enough that four programs sharing the
+ * processor look simultaneous to a person, long enough that the switch itself
+ * costs nothing worth measuring. The tick is a millisecond, so this counts
+ * ten of them. */
+#define QUANTUM_TICKS 10
+
 /* The millisecond tick, now arriving on its own rather than being counted by
    whoever remembers to look. */
 static void timer_interrupt(INTERRUPT_FRAME* frame) {
     (void)frame;
     timer_tick();
+    /* The turn is over; whether anything comes of it is decided after the
+       end-of-interrupt, and only for a program that was at ring 3. */
+    if (timer_ticks() % QUANTUM_TICKS == 0) task_want_reschedule();
     /* And the sound, for the same reason the tick is here: it has to happen
        whether or not anything else is looking. Forty-eight frames of mixing is
        a few microseconds, and it is the difference between sound that survives
@@ -84,9 +98,15 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
     gdt_init();
     tss_init();
     idt_init();
+    /* The kernel's own context becomes the first task, before anything can
+       ask for a second one. Nothing is switched here: this only gives what is
+       already running a name to be switched back to. */
+    task_init();
+    /* Floating point, before anything can want it. */
+    cpu_enable_sse();
     pic_init();
     cpu_enable_interrupts();
-    report("CPU: GDT IDT PIC READY\n");
+    report("CPU: GDT IDT PIC SSE READY\n");
 
     /* Own the page tables before any driver maps device memory. */
     if (paging_init(info)) {
@@ -130,6 +150,14 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
 
     timer_init();
     report("TIMER: PIT POLLING 1000 HZ\n");
+
+    /* The random pool, after the clock and the timer because it stirs both
+       in, and before anything that could want a key. Nothing does yet - TLS
+       is not written - but a generator started late is a generator that was
+       used early by accident. */
+    random_start();
+    report(random_is_strong() ? "RANDOM: HARDWARE SOURCE\n"
+                              : "RANDOM: TIMING SOURCE, WEAKER\n");
 
     /* The interrupt hardware, described rather than used yet. Reporting what
        ACPI says before anything depends on it means a machine that turns out
@@ -389,20 +417,55 @@ __attribute__((noreturn)) void kernel_main(BOOT_INFO* info) {
            only on the device we booted from - a marker on some other disk
            describes some other installation, not this one. */
         {
+            /* The scan has already found the marker and moved Z: if there was
+               one. What is left here is saying so, and saying the other thing
+               out loud when there was not. */
             VOLUME* loader = volume_boot();
-            for (boot_uint32_t index = 0; loader && index < volumes; index++) {
-                VOLUME* candidate = volume_at(index);
-                FAT_ENTRY entry;
+            /* The scan moved Z: if it found a marker, and only then is there
+               a loader's partition distinct from the system's. Asking that
+               rather than "is Z: an EFI partition" keeps the message right on
+               a stick with one partition, where the two are the same volume
+               and nothing was moved. */
+            int marked = volume_loader() != loader;
+            VOLUME* unmarked = (VOLUME*)0;
 
-                if (!candidate || candidate == loader) continue;
-                if (candidate->device != loader->device) continue;
-                if (!fat32_stat(candidate, SYSTEM_VOLUME_MARKER, &entry)) continue;
-
-                partition_set_system_volume(candidate);
+            if (marked) {
                 report("SYSTEM VOLUME: ");
-                report(candidate->label[0] ? candidate->label : "unlabelled");
+                report(loader->label[0] ? loader->label : "unlabelled");
                 report(" - the loader's partition has no drive letter\n");
-                break;
+            } else {
+                for (boot_uint32_t index = 0; index < volumes; index++) {
+                    VOLUME* candidate = volume_at(index);
+
+                    if (!candidate || candidate == loader) continue;
+                    if (loader && candidate->device != loader->device) continue;
+                    if (!unmarked) unmarked = candidate;
+                }
+            }
+
+            /* A two-partition disk whose system half is not marked.
+             *
+             * Then Z: is the loader's partition - a few hundred megabytes of
+             * boot files - and everything somebody installs goes onto it or
+             * onto a letter they have to remember. It works, in the sense
+             * that nothing fails; it is simply the wrong drive, and the only
+             * symptom is a Z: full of \EFI and \BOOT.
+             *
+             * Said out loud because it happened twice on the same machine and
+             * the system gave no clue either time. One line, and the command
+             * that fixes it. */
+            if (!marked && loader && unmarked && volume_is_efi_system(loader)) {
+                report("SYSTEM VOLUME: not marked - Z: is the loader's own "
+                       "partition\n");
+                report("  Run `sysvol ");
+                {
+                    char drive[3];
+                    drive[0] = unmarked->letter ? unmarked->letter : '?';
+                    drive[1] = ':';
+                    drive[2] = 0;
+                    report(drive);
+                }
+                report("` to say where the system lives.\n");
             }
         }
         /* Applied before the shell paints anything, so the first prompt is

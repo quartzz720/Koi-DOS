@@ -31,6 +31,13 @@
 #define PROGRAM_LIMIT 0x2000000ULL             /* 32 MiB */
 #define PROGRAM_STACK_SIZE 0x40000ULL          /* 256 KiB, at the top */
 
+/* Threads: another task in the same program, with its own two stacks. The
+   user stack is the program's to allocate - it knows how much it needs and
+   the kernel does not. Returns 0 when there is no room for another task. */
+int program_thread_start(boot_uint64_t entry, boot_uint64_t stack,
+                         boot_uint64_t argument);
+__attribute__((noreturn)) void program_thread_finish(void);
+
 /* The window is divided into slots so that more than one program can be
  * resident at once.
  *
@@ -75,6 +82,50 @@ int program_run(VOLUME* volume, const char* path, const char* arguments,
  * bench for the isolation Mizu's applications are going to live in. */
 void program_run_next_at_ring3(void);
 
+/* Run the next program without waiting for it.
+ *
+ * program_run returns as soon as the program has been started, and the
+ * program runs alongside whoever started it. This is the one thing the
+ * scheduler is actually for: everything else it does is machinery for making
+ * "and come back" possible without the caller having to stand still. */
+void program_run_next_in_background(void);
+
+/* Whether a request to do that is waiting. */
+int program_run_next_is_background(void);
+
+/* A name for the last program started in the background, so that whoever
+   asked has something to ask about later. It carries the slot and the number
+   of programs that slot has held, so a name outlives its program without ever
+   coming to mean a different one. */
+int program_last_started(void);
+
+/* Whether the program with that name is still running. A name whose program
+   has ended, or that was never handed out, is not running. */
+int program_is_running(int name);
+
+/* Both of the requests above, withdrawn - for a caller that asked and then
+   found there was nothing to run. */
+void program_run_next_cancel(void);
+
+/* Clear away programs that have finished and that nobody was waiting for. The
+   shell calls this on its way round the loop; program_run calls it before
+   looking for a free slot. */
+void program_reap(void);
+
+/* Who is asking, for the calls that hand out things a program owns: 0 for the
+   kernel's own, and otherwise a number that identifies one running program
+   for as long as it runs. */
+int program_owner(void);
+
+/* Whether the running program is at ring 3, for the calls that hand it
+   memory: what it is given has to be memory it can reach. */
+int program_is_user(void);
+
+/* Make a range reachable from ring 3 in the running program's tables - its
+   own, when it has them. What the kernel hands a program has to be marked
+   where that program is looking, and only there. */
+int program_allow_user(boot_uint64_t base, boot_uint64_t size);
+
 /* Load an image and stop there: segments copied, relocations applied, the
  * interface version checked, and the entry point handed back rather than
  * jumped to. Backs SYS_LOAD.
@@ -98,6 +149,10 @@ const char* program_arguments(void);
 /* Where the running program was loaded from, from the root of its drive. A
    program cannot work this out for itself, and one that asks to be run again
    after something else needs it. */
+/* Where the running program was loaded, for turning a fault's address into an
+   offset in that program. */
+boot_uint64_t program_base(void);
+
 const char* program_path(void);
 
 /* Called by SYS_EXIT. Unwinds straight back into program_run(). */

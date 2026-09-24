@@ -14,8 +14,11 @@
 #include "hda.h"
 #include "graphics.h"
 #include "net.h"
+#include "tcp.h"
 #include "e1000.h"
 #include "tftp.h"
+#include "http.h"
+#include "crypto_check.h"
 #include "mouse.h"
 
 #include "config.h"
@@ -591,6 +594,14 @@ static void command_help(void) {
     print_line("setup          install Koi-DOS onto a disk");
     print_line("shutdown       turn the machine off");
     print_line("reboot         restart the machine");
+    print_line("start <cmd>    run a program and do not wait for it");
+    print_line("desktop        start the desktop, if one is configured");
+    print_line("sysvol [d:]    which volume the system lives on, and set it");
+    print_line("sector <d:> <n>  read a sector two ways and compare - a bench");
+    print_line("crypto           check this machine's cryptography against the"
+               " standards");
+    print_line("keys             print the code of every key pressed - for a"
+               " keyboard that misbehaves");
     print_line("date           show the date");
     print_line("time           show the time");
     print_line("echo [text]    print text");
@@ -602,6 +613,7 @@ static void command_help(void) {
     print_line("net set <..>   set an address by hand, for a wire with no server");
     print_line("net usb        test the USB network device on its own");
     print_line("ping <host>    is it there, and how far away");
+    print_line("get <host>[/path] [file]  fetch a page over HTTP");
     print_line("dosget <..>    packages: list, install, update, remove");
     print_line("pointer        move the pointer about; hold the button to draw");
     print_line("log [file]     the kernel log: on screen, or written to a file");
@@ -648,6 +660,251 @@ static void command_vol(void) {
         print(" has no label");
     }
     print("\n");
+}
+
+/* Say which volume the system lives on, and write it down.
+ *
+ * The kernel decides this by looking for \BOOT\KOIDOS.SYS on the volumes
+ * beside the one the firmware loaded from. That file is how a two-partition
+ * disk says "the system is over here" - and a disk partitioned by hand, or by
+ * an installer that did not finish, does not have it. What that looks like is
+ * Z: being a few hundred megabytes of \EFI and \BOOT, with everything real
+ * on Y:. Nothing fails; it is simply the wrong drive, and it took two
+ * evenings to recognise the second time.
+ *
+ * So: `sysvol` says how things stand, and `sysvol Y:` writes the marker and
+ * hands that volume Z: there and then, without a reboot.
+ *
+ * Not folded into `setup`, which repartitions and reinstalls. This is one
+ * sentence about an existing disk, and a disk that is already correct except
+ * for one missing file should not have to be installed onto again.
+ */
+static void command_sysvol(const ARGUMENTS* arguments) {
+    VOLUME* target;
+    VOLUME* current = volume_boot();
+    FAT_ENTRY marker;
+    const char* text = "Koi-DOS system volume.\r\n";
+
+    if (!arguments->operand[0][0]) {
+        if (!current) { print_line("No system volume."); return; }
+        print("The system volume is ");
+        put(current->letter);
+        print(":");
+        if (current->label[0]) { print(" - "); print(current->label); }
+        print("\n");
+        if (volume_is_efi_system(current)) {
+            print_line("");
+            print_line("That is an EFI System partition - the one the firmware");
+            print_line("started us from. On a disk with a partition for the");
+            print_line("system, this is not where it should be: say where with");
+            print_line("`sysvol <drive>:` and that volume becomes Z:.");
+        }
+        return;
+    }
+
+    target = volume_by_letter(arguments->operand[0][0]);
+    if (!target) {
+        print_line("No such drive.");
+        return;
+    }
+    if (target == current) {
+        print_line("That is already the system volume.");
+        return;
+    }
+    /* \BOOT first: the marker lives in it, and on a volume that has only ever
+       held files it may not exist. A directory that is already there is not
+       an error. */
+    {
+        FAT_ENTRY directory;
+        if (!fat32_stat(target, "\\BOOT", &directory))
+            (void)fat32_create(target, "\\BOOT", FAT_ATTRIBUTE_DIRECTORY,
+                               &directory);
+    }
+    if (!fat32_stat(target, SYSTEM_VOLUME_MARKER, &marker)) {
+        if (!fat32_create(target, SYSTEM_VOLUME_MARKER, 0, &marker) ||
+            fat32_write(target, &marker, 0, text,
+                        (boot_uint32_t)strlen(text)) == 0) {
+            console_set_color(console_theme()->error, console_theme()->background);
+            print_line("Could not write the marker. Is the volume full or");
+            print_line("read-only?");
+            console_use_theme();
+            return;
+        }
+    }
+
+    partition_set_system_volume(target);
+    /* The shell is standing in a directory on a volume whose letter has just
+       changed under it. Put it at the root of the new Z: rather than leave it
+       pointing at a letter that now means something else. */
+    current_volume = volume_boot();
+    current_path[0] = '\\';
+    current_path[1] = 0;
+    syscall_set_location(current_volume, current_path);
+    print_line("Marked. The system volume is Z: and the loader's partition");
+    print_line("has no letter.");
+}
+
+static void print_hex(boot_uint64_t value, int digits);
+
+/* Read one sector two ways and show both.
+ *
+ * The question this exists to answer: a volume whose directory listings are
+ * right and whose file contents are wrong. Those two use different paths -
+ * a directory is walked one sector at a time through a scratch page, and a
+ * file is read a whole cluster at a time straight into the caller's buffer.
+ * If a device is fine with one and not the other, everything above it looks
+ * insane and nothing below it is obviously broken.
+ *
+ * So: the same sector, read alone and read as part of eight, and the first
+ * sixteen bytes of each. Identical lines mean the transport is sound and the
+ * fault is higher up. Different lines mean it is not, and which of the two is
+ * wrong says where to look.
+ */
+/* keys - what the keyboard is actually sending.
+ *
+ * Written because three separate reports came in of a key that "drops out to
+ * DOS" - Win+R, Ctrl+Escape, once Backspace - on one laptop and on no other
+ * machine, with nothing in the log. Guessing at that from here is guessing at
+ * somebody else's hardware; this prints the code of every key as it arrives,
+ * so the answer arrives as numbers instead.
+ *
+ * Escape three times in a row leaves, because a key diagnostic that is exited
+ * with a key has to reserve one, and one press is too easy to do by accident
+ * while finding out what a key does. */
+static void command_keys(void) {
+    int escapes = 0;
+
+    print_line("Every key you press, with its code. Escape three times to "
+               "stop.");
+    print_line("");
+
+    for (;;) {
+        int key = keyboard_getchar();
+        char line[96];
+        int at = 0;
+
+        if (key == 27) {
+            escapes++;
+            if (escapes >= 3) break;
+        } else {
+            escapes = 0;
+        }
+
+        /* Printable characters are shown as themselves as well as as a
+           number, because "97" and "a" answer different questions. */
+        line[at++] = ' ';
+        line[at++] = ' ';
+        line[at] = 0;
+        print(line);
+        print_dec((boot_uint64_t)key);
+        print("  0x");
+        console_write_hex((boot_uint64_t)key);
+        serial_write_hex((boot_uint64_t)key);
+        if (key >= ' ' && key < 127) {
+            print("  '");
+            put((char)key);
+            print("'");
+        } else if (key >= 0x100) {
+            print("  (a named key)");
+        } else if (key < 32) {
+            print("  (control-");
+            put((char)('A' + key - 1));
+            print(")");
+        }
+        print_line("");
+    }
+    print_line("");
+    print_line("Stopped.");
+}
+
+/* crypto - the machine's own cryptography against the standards' numbers.
+ *
+ * Here for the same reason `sector` is: the machine that fails is somebody
+ * else's, and the answer has to be obtainable there. A hash that is wrong by
+ * one bit produces a handshake that fails with no message at all, on that
+ * laptop and not on this one - and every hour of that would be spent looking
+ * at the network. */
+static void command_crypto(void) {
+    int failures = crypto_check(print);
+
+    print_line("");
+    if (!failures) {
+        print_line("All vectors match. The arithmetic on this machine is "
+                   "right.");
+        return;
+    }
+    print_dec((boot_uint64_t)failures);
+    print_line(" vectors did NOT match. Nothing here should be trusted until "
+               "that is understood.");
+}
+
+static void command_sector(const ARGUMENTS* arguments) {
+    VOLUME* volume;
+    boot_uint8_t* one;
+    boot_uint8_t* many;
+    boot_uint64_t sector = 0;
+    const char* cursor;
+    int differ = 0;
+
+    if (!arguments->operand[0][0]) {
+        print_line("Usage: sector <drive:> <number>");
+        print_line("Reads that sector of the volume twice - alone, and as one");
+        print_line("of eight - and shows both. They should be identical.");
+        return;
+    }
+    volume = volume_by_letter(arguments->operand[0][0]);
+    if (!volume) { print_line("Invalid drive."); return; }
+
+    for (cursor = arguments->operand[1]; *cursor >= '0' && *cursor <= '9'; cursor++)
+        sector = sector * 10 + (boot_uint64_t)(*cursor - '0');
+
+    one = (boot_uint8_t*)alloc_page();
+    many = (boot_uint8_t*)alloc_pages(8);
+    if (!one || !many) {
+        print_line("Out of memory.");
+        if (one) free_page(one);
+        if (many) free_pages(many, 8);
+        return;
+    }
+    memset(one, 0, PAGE_SIZE);
+    memset(many, 0, PAGE_SIZE * 8);
+
+    print("Sector ");
+    print_dec((boot_uint32_t)sector);
+    print(" of ");
+    put(volume->letter);
+    print_line(":");
+
+    if (!block_read(volume->device, volume->first_sector + sector, 1, one))
+        print_line("  alone : the read failed");
+    else {
+        print("  alone : ");
+        for (int index = 0; index < 16; index++) {
+            print_hex(one[index], 2);
+            print(" ");
+        }
+        print_line("");
+    }
+
+    if (!block_read(volume->device, volume->first_sector + sector, 8, many))
+        print_line("  of 8  : the read failed");
+    else {
+        print("  of 8  : ");
+        for (int index = 0; index < 16; index++) {
+            print_hex(many[index], 2);
+            print(" ");
+        }
+        print_line("");
+        for (int index = 0; index < 512; index++)
+            if (one[index] != many[index]) { differ = 1; break; }
+        print_line(differ
+            ? "  They differ. Reading several sectors at once returns"
+              " something else."
+            : "  They agree.");
+    }
+
+    free_page(one);
+    free_pages(many, 8);
 }
 
 /* `mem` is the one place the system describes itself, so it reports what was
@@ -934,6 +1191,9 @@ static void command_log(const ARGUMENTS* arguments) {
             put(character);
             if (character != '\n') continue;
             if (++lines < page) continue;
+            /* Not when somebody is collecting this rather than reading it:
+               see syscall_capturing. */
+            if (syscall_capturing()) { lines = 0; continue; }
             console_set_color(console_theme()->background,
                               console_theme()->foreground);
             print("-- More --");
@@ -1093,6 +1353,153 @@ static void command_net_set(const ARGUMENTS* arguments) {
 }
 
 /* Four echo requests, the way every ping since 1983 has done it. */
+static void string_join(char* into, boot_uint32_t size, const char* separator,
+                        const char* text);
+static int command_interrupted(void);
+
+/* GET a page over HTTP, and say what came back.
+ *
+ * The first thing built on TCP, and deliberately the smallest one that proves
+ * it: connect, send a request, read until the other end hangs up. Everything
+ * a browser does is this plus a way to draw what arrives.
+ *
+ * `get <host>[/path] [file]` - to the screen, or into a file when one is
+ * named. HTTP only: there is no TLS yet, and almost nothing in 2026 answers
+ * without it. What does answer is what this was tested against - info.cern.ch,
+ * the first web site there ever was, still served in plain.
+ */
+static void command_get(const ARGUMENTS* arguments) {
+    char host[128];
+    char path[192];
+    char request[384];
+    boot_uint32_t address;
+    int connection;
+    int at = 0;
+    int cut = 0;
+    long total = 0;
+    int in_header = 1;
+    VOLUME* into_volume = (VOLUME*)0;
+    FAT_ENTRY into_entry;
+    char into_path[PATH_MAX];
+    boot_uint32_t written = 0;
+
+    if (!arguments->operand[0][0]) {
+        print_line("Usage: get <host>[/path] [file]");
+        print_line("Fetches a page over HTTP. There is no TLS yet, so this");
+        print_line("reaches http:// and not https://.");
+        return;
+    }
+    if (!net_configured()) {
+        print_line("No address. The machine asks for one at boot; `net start`");
+        print_line("tries again.");
+        return;
+    }
+
+    /* Split "host/path" - and accept "http://host/path", because that is what
+       somebody will type. */
+    {
+        const char* from = arguments->operand[0];
+
+        if (from[0] == 'h' && from[1] == 't' && from[2] == 't' &&
+            from[3] == 'p' && from[4] == ':' && from[5] == '/' &&
+            from[6] == '/') from += 7;
+        while (from[at] && from[at] != '/' && at + 1 < (int)sizeof(host)) {
+            host[at] = from[at];
+            at++;
+        }
+        host[at] = 0;
+        cut = 0;
+        if (from[at] == '/')
+            while (from[at] && cut + 1 < (int)sizeof(path)) path[cut++] = from[at++];
+        path[cut] = 0;
+        if (!path[0]) { path[0] = '/'; path[1] = 0; }
+    }
+
+    if (arguments->operand[1][0]) {
+        if (!resolve_path(arguments->operand[1], &into_volume, into_path)) {
+            print_line("Invalid drive.");
+            return;
+        }
+        if (fat32_stat(into_volume, into_path, &into_entry))
+            fat32_remove(into_volume, into_path);
+        if (!fat32_create(into_volume, into_path, 0, &into_entry)) {
+            print_line("Unable to create the file.");
+            return;
+        }
+    }
+
+    if (!net_resolve(host, &address)) {
+        print("Cannot find ");
+        print_line(host);
+        return;
+    }
+
+    connection = tcp_connect(address, 80, 8000);
+    if (connection < 0) {
+        print_line("Nothing answered on port 80.");
+        return;
+    }
+
+    /* HTTP/1.0 with an explicit close: the reply then ends when the
+       connection does, and there is no chunked encoding to unpick. A browser
+       will want 1.1 and keep-alive; this wants to be read in one sitting. */
+    /* Built by hand: there is no formatter in the kernel and one request is
+       not a reason for one. */
+    request[0] = 0;
+    string_join(request, sizeof(request), "", "GET ");
+    string_join(request, sizeof(request), "", path);
+    string_join(request, sizeof(request), "", " HTTP/1.0\r\nHost: ");
+    string_join(request, sizeof(request), "", host);
+    string_join(request, sizeof(request), "",
+                "\r\nUser-Agent: Koi-DOS\r\nConnection: close\r\n\r\n");
+    {
+        boot_uint32_t length = (boot_uint32_t)strlen(request);
+        if (tcp_send(connection, request, length, 8000) != (int)length) {
+            print_line("The request could not be sent.");
+            tcp_close(connection, 1000);
+            return;
+        }
+    }
+
+    for (;;) {
+        char chunk[1024];
+        int got = tcp_receive(connection, chunk, sizeof(chunk), 8000);
+
+        if (got <= 0) break;
+        total += got;
+
+        if (into_volume) {
+            written += fat32_write(into_volume, &into_entry, written, chunk,
+                                   (boot_uint32_t)got);
+            continue;
+        }
+        /* To the screen, with the headers separated from the page by the
+           blank line the protocol puts between them. */
+        for (int index = 0; index < got; index++) {
+            if (in_header && index + 3 < got && chunk[index] == 13 &&
+                chunk[index + 1] == 10 && chunk[index + 2] == 13 &&
+                chunk[index + 3] == 10) {
+                in_header = 0;
+                print_line("");
+                index += 3;
+                continue;
+            }
+            if (chunk[index] != 13) put(chunk[index]);
+        }
+        if (command_interrupted()) break;
+    }
+    tcp_close(connection, 2000);
+
+    print_line("");
+    print_dec((boot_uint32_t)total);
+    print(" bytes");
+    if (into_volume) {
+        print(" written to ");
+        print(arguments->operand[1]);
+    }
+    print_line("");
+}
+
 static void command_ping(const ARGUMENTS* arguments) {
     boot_uint32_t address;
     int replies = 0;
@@ -1407,8 +1814,12 @@ static void command_disk(void) {
         if (!listed) print_line("  no partition table, and nothing we can read");
     }
     print_line("");
-    print_line("A partition with no drive letter has no filesystem this system");
-    print_line("understands. That does not mean it is empty.");
+    print_line("A partition with no drive letter is one of three things: it");
+    print_line("has no filesystem this system understands - FAT12 and FAT16");
+    print_line("included, this driver reads FAT32 - or it is an EFI System");
+    print_line("partition that is not the one we booted from, deliberately");
+    print_line("left unlettered, or it would not mount. `log` says which.");
+    print_line("None of them means empty.");
 }
 
 /* Find a partition by the name `disk` prints for it, e.g. "nvme0p2". */
@@ -1443,50 +1854,31 @@ static PARTITION* partition_by_name(const char* name) {
    before this - including the one the user was standing on - is stale. */
 static void remount_everything(void);
 
-/* The note the block layer rings when a disk appears or goes away. Registered
-   once, at startup. */
+/* The note the block layer rings when a disk appears or goes away.
+ *
+ * It used to remount every volume on the machine right here - inside the USB
+ * poll, which runs from a program's system call, while that program may be
+ * halfway through reading a file. Unmounting a filesystem under somebody
+ * reading it is how a program gets handed another disk's bytes, and doing it
+ * from a poll is why plugging a stick in stopped the machine for half a
+ * second.
+ *
+ * So this notes nothing at all now: the block layer already counts the change,
+ * and the rescan happens where a rescan is safe - at the prompt, and at a
+ * system call made by a program with no files open. See partition_settle. */
 static void disks_changed(void) {
-    remount_everything();
 }
 
 static void remount_everything(void) {
     boot_uint32_t volumes;
 
-    /* Before the rescan, not after: the volume table is a static array, so the
-       rescan refills the same addresses and any mount record still pointing at
-       one of them would carry the old filesystem's geometry into the new
-       filesystem's device. */
-    fat32_unmount_all();
+    /* Unmounting, remounting and working out which volume the system is on
+       all happen inside the scan now - there is one place that answers "what
+       are the drives", and it answers the whole question. This used to be
+       three copies of that answer, and the copy a program reached by asking
+       whether the disks had changed was the one missing both halves. */
     volumes = partition_rescan();
-
-    for (boot_uint32_t index = 0; index < volumes; index++) {
-        VOLUME* volume = volume_at(index);
-        if (volume) (void)fat32_mount(volume);
-    }
-
-    /* And which of them the system is installed on, which the scan cannot know
-     * on its own: it is a file, so it can only be looked for once the volumes
-     * are mounted.
-     *
-     * This was done at boot and nowhere else, because a rescan only ever
-     * happened after `format` - where losing your place was expected. Wiring
-     * it to a stick being plugged in made the omission visible immediately and
-     * absurdly: plugging in a USB stick moved the system to Y: and handed Z:
-     * to the loader's partition, which is the one volume that is meant to have
-     * no letter at all. */
-    {
-        VOLUME* loader = volume_boot();
-        for (boot_uint32_t index = 0; loader && index < volumes; index++) {
-            VOLUME* candidate = volume_at(index);
-            FAT_ENTRY entry;
-
-            if (!candidate || candidate == loader) continue;
-            if (candidate->device != loader->device) continue;
-            if (!fat32_stat(candidate, SYSTEM_VOLUME_MARKER, &entry)) continue;
-            partition_set_system_volume(candidate);
-            break;
-        }
-    }
+    (void)volumes;
 
     current_volume = volume_boot();
     current_path[0] = '\\';
@@ -1796,13 +2188,33 @@ static void fetch_progress_end(void) {
 }
 
 /* Fetch one file from the source into `buffer`. */
+/* HTTP first, TFTP if that finds nobody.
+ *
+ * Not a switch anybody has to set: a server with the new daemon answers on
+ * port 80 and a server without one refuses the connection in a few
+ * milliseconds, which is cheaper than asking and far cheaper than the minute
+ * TFTP costs on a large package. A machine pointed at an old server keeps
+ * working and is only slower, which is the behaviour worth having while both
+ * exist.
+ *
+ * The difference is not small: 21 KiB/s over TFTP against 282 measured
+ * against the same server over HTTP, because TFTP waits for an
+ * acknowledgement between every block and TCP does not. */
 static int dosget_fetch(boot_uint32_t source, const char* name, void* buffer,
                         boot_uint32_t size) {
     const char* why = (const char*)0;
     int got;
 
     fetch_progress_begin();
-    got = tftp_fetch(source, name, buffer, size, &why);
+    http_progress(fetch_total_is, fetch_progress);
+    got = http_fetch(source, name, buffer, size, &why);
+    http_progress((void (*)(boot_uint32_t))0, (void (*)(boot_uint32_t))0);
+    if (got < 0) {
+        /* Quietly: a server that speaks only TFTP is not an error, and the
+           reason is printed only if that fails too. */
+        why = (const char*)0;
+        got = tftp_fetch(source, name, buffer, size, &why);
+    }
     fetch_progress_end();
 
     if (got < 0) {
@@ -2129,7 +2541,16 @@ static int dosget_install(boot_uint32_t source, const char* raw_package,
     char package[64];
     char path[PATH_MAX];
     char directory[PATH_MAX];
-    char manifest[1024];
+    /* The manifest, which is a line per file and two for the whole package.
+     *
+     * A kilobyte was enough until Mizu grew icons and a startup sound: at
+     * nineteen files it came to 1067 bytes and installing stopped with a
+     * message about a file being too large for the room available - which is
+     * true, and reads as though the package were too big rather than the list
+     * of its names. Eight kilobytes is a hundred and thirty files, which is
+     * more than any package here will have before this is rewritten to fetch
+     * over HTTP. */
+    char manifest[8192];
     char name[64];
     char version[32];
     VOLUME* volume;
@@ -2150,7 +2571,14 @@ static int dosget_install(boot_uint32_t source, const char* raw_package,
     string_join(path, sizeof(path), "", "/MANIFEST");
     {
         int got = dosget_fetch(source, path, manifest, sizeof(manifest) - 1);
-        if (got < 0) return 0;
+        if (got < 0) {
+            /* The one failure worth naming here: everything else dosget_fetch
+               has already explained. */
+            print_line("The package list could not be read. If it says the");
+            print_line("file is too large, this kernel is older than the");
+            print_line("package - update SYSTEM first.");
+            return 0;
+        }
         manifest[got] = 0;
         manifest_length = (boot_uint32_t)got;
     }
@@ -2268,12 +2696,31 @@ static int dosget_install(boot_uint32_t source, const char* raw_package,
             if (fat32_stat(volume, keep, &previous))
                 fat32_remove(volume, keep);
             if (fat32_create(volume, keep, 0, &previous)) {
-                boot_uint8_t* old = buffer + DOSGET_BUFFER / 2;
-                boot_uint32_t was = fat32_read(volume, &entry, 0, old,
-                                               DOSGET_BUFFER / 2);
-                if (was) (void)fat32_write(volume, &previous, 0, old, was);
-                print("  kept the old one as ");
-                print_line(keep);
+                /* Copied in pieces, through a scratch page of its own.
+                 *
+                 * This used to read the old kernel into the second half of
+                 * the download buffer - two megabytes - and write back what
+                 * it got. The kernel passed two megabytes some time ago, so
+                 * what was kept as KERNEL.BAK was the first two thirds of it:
+                 * a rescue copy that cannot boot, discovered on the day it is
+                 * needed. */
+                boot_uint8_t* scratch = (boot_uint8_t*)alloc_pages(16);
+
+                if (scratch) {
+                    boot_uint32_t at = 0;
+
+                    for (;;) {
+                        boot_uint32_t piece = fat32_read(volume, &entry, at,
+                                                         scratch, 16 * PAGE_SIZE);
+                        if (!piece) break;
+                        if (fat32_write(volume, &previous, at, scratch,
+                                        piece) != piece) break;
+                        at += piece;
+                    }
+                    free_pages(scratch, 16);
+                    print("  kept the old one as ");
+                    print_line(keep);
+                }
             }
         }
 
@@ -4406,6 +4853,7 @@ static void command_more(const ARGUMENTS* arguments) {
             put(character);
             if (character != '\n') continue;
             if (++lines < page) continue;
+            if (syscall_capturing()) { lines = 0; continue; }
             /* -- More -- and wait, the way the DOS filter did. */
             console_set_color(console_theme()->background, console_theme()->foreground);
             print("-- More --");
@@ -4531,6 +4979,11 @@ static void command_attrib(const ARGUMENTS* arguments) {
    to load. `.EXE` is appended when the user did not write it.
    Search order is the current directory then the root of the current drive -
    a two-entry PATH, which is all a system without one needs. */
+/* Set around the run, read by the epilogue several screens below it. */
+static int held_screen_before;
+static int held_break_before = 1;
+static int held_gesture_before;
+
 static int try_program(const char* input, const ARGUMENTS* arguments) {
     char name[PATH_MAX];
     char path[PATH_MAX];
@@ -4576,21 +5029,65 @@ static int try_program(const char* input, const ARGUMENTS* arguments) {
     }
 
     syscall_set_location(current_volume, current_path);
-    code = program_run(program_volume, path, arguments->tail, &exit_code);
-    syscall_close_all();
+    /* Whether somebody was already holding the screen when this started.
+     *
+     * The rule below - take the screen back whether or not the program gave
+     * it up - is right for a program the shell started and wrong for one
+     * started from inside a program that is still drawing. A desktop running
+     * a command through SYS_CAPTURE is exactly that: it is holding the
+     * screen, the command it asked for exits, and the screen was taken away
+     * from the desktop rather than from the command. */
+    {
+        int screen_was_taken = graphics_active();
+        /* Asked before the program runs, because by the time it returns the
+           request has been consumed and the answer is gone. */
+        int backgrounded = program_run_next_is_background();
+
+        /* And what the caller had arranged about the keyboard, for the same
+         * reason. Both settings are put back below rather than forced to the
+         * prompt's values: the caller is not always the prompt.
+         *
+         * Mizu turns Ctrl+C off, because on a desktop it is a keystroke and
+         * not "stop the program" - the program is the desktop. Its terminal
+         * window then runs a command, and forcing Ctrl+C back on afterwards
+         * handed that key back to the kernel: the next Ctrl+C anywhere in the
+         * desktop stopped Mizu and dropped whoever pressed it at the prompt,
+         * with every window gone. The same applies to the Alt+Shift gesture,
+         * which the desktop's own editor asks for. */
+        int break_before = keyboard_break_enabled();
+        int gesture_before = layout_gesture_enabled();
+
+        code = program_run(program_volume, path, arguments->tail, &exit_code);
+        held_screen_before = screen_was_taken;
+        held_break_before = break_before;
+        held_gesture_before = gesture_before;
+        if (code == PROGRAM_OK && backgrounded) return 1;
+    }
+    /* A program nobody is waiting for has not ended, so none of the tidying
+       below applies to it: its files are still open because it is still using
+       them, and taking the screen or the colours back now would take them
+       from a program that is running rather than from one that has finished.
+       Everything here happens when that program's slot is cleared away
+       instead. */
+    /* What the program was holding was given back when its slot was cleared
+       away - by owner, in program.c, whether or not anybody was waiting for
+       it. The shell used to do it here on the assumption that anything open
+       belonged to the program that had just ended, which stopped being true
+       the moment a second program could still be running. */
     /* The keyboard back to English, for the same reason as the screen and the
        colours below: a program that asked for Alt+Shift and exited while the
        other layout was selected would hand the prompt a keyboard typing in
        Cyrillic, and the prompt is ASCII. */
-    layout_gesture_enable(0);
+    layout_gesture_enable(held_gesture_before);
     /* And Ctrl+C stops programs again, whatever the one that just ended
        thought about it. */
-    keyboard_break_enable(1);
+    keyboard_break_enable(held_break_before);
     /* And take the screen back, whether or not the program gave it up. A
        program that returns while still holding it would otherwise leave the
        shell invisible with no way to ask for it back - which is precisely the
-       failure this mode was shaped to avoid. */
-    graphics_leave();
+       failure this mode was shaped to avoid. Unless it was never the
+       program's: see above. */
+    if (!held_screen_before) graphics_leave();
     /* And the colours back too, for the same reason and with the same
        reasoning. A program is free to paint the console however it likes while
        it runs; a program that exits having left the shell wearing its scheme
@@ -4717,7 +5214,36 @@ static void command_set(const char* tail) {
  * does. Input is a file the reading commands are handed instead of the
  * keyboard.
  */
-#define PIPE_FILE "\\PIPE.$$$"
+/* The temporary file a pipe passes through, one per stage.
+ *
+ * `a | b` needs one. `a | b | c` needs two, and needs them to be different
+ * files: the second stage opens its own for writing while the first is still
+ * being read from, and with one name it truncated its own input. Everything
+ * after the second bar came out empty - which looked, from the prompt, exactly
+ * like a filter that matches nothing.
+ *
+ * Numbered by depth rather than counted upwards, so a run of pipes reuses two
+ * names instead of littering the disk with a hundred. */
+#define PIPE_FILE_MAX 8
+static int pipe_depth;
+
+static const char* pipe_file(int depth) {
+    static char name[16];
+    int at = 0;
+
+    name[at++] = '\\';
+    name[at++] = 'P';
+    name[at++] = 'I';
+    name[at++] = 'P';
+    name[at++] = 'E';
+    name[at++] = (char)('0' + (depth % 10));
+    name[at++] = '.';
+    name[at++] = '$';
+    name[at++] = '$';
+    name[at++] = '$';
+    name[at] = 0;
+    return name;
+}
 
 static VOLUME* capture_volume;
 static FAT_ENTRY capture_entry;
@@ -5145,15 +5671,150 @@ static void command_ring3(const ARGUMENTS* arguments) {
         char line[INPUT_MAX];
         boot_uint32_t at = 0;
 
+        /* Verbatim, for the same reason as START above: everything after the
+           command word belongs to the program, and rebuilding it from the
+           first two operands dropped the third. */
         line[0] = 0;
-        string_join(line, sizeof(line), "", arguments->operand[0]);
-        if (arguments->operand[1][0]) {
-            string_join(line, sizeof(line), " ", arguments->operand[1]);
-        }
+        string_join(line, sizeof(line), "", arguments->tail);
         while (line[at]) at++;
         parse_arguments(line, &inner);
         if (!try_program(line, &inner))
             print_line("Bad command or file name.");
+    }
+}
+
+/* Start the desktop, and put it back on its feet when it falls over.
+ *
+ * `command = \MIZU\MIZU` in \BOOT\CONFIG\DESKTOP.CFG. With that line the
+ * machine starts the
+ * desktop rather than the prompt, and the shell is underneath it rather than
+ * in front of it - which is the whole difference between DOS with a graphical
+ * program on it and a system whose shell is a compatibility layer.
+ *
+ * A desktop that crashes comes back. That is not indulgence: at ring 3 a
+ * crashed desktop is a program that died and left the machine intact, and
+ * leaving somebody at a bare prompt because a program failed is throwing away
+ * exactly the thing the ring was built to give. Windows 95 restarted Explorer
+ * for the same reason and it was right to.
+ *
+ * A desktop that exits on purpose does not come back, and that is the way
+ * out: "Exit to Koi-DOS" is a choice somebody made, and a system that argues
+ * with it is a system nobody can leave.
+ *
+ * Three crashes in a row and it stops trying. A desktop that faults on
+ * startup would otherwise take the machine round a loop nobody can break into
+ * - and the one thing a person needs at that point is the prompt.
+ */
+#define DESKTOP_CRASHES_ALLOWED 3
+
+static void run_desktop(int announce) {
+    const char* configured = config_desktop();
+    char line[INPUT_MAX];
+    int crashes = 0;
+
+    if (!configured || !configured[0]) return;
+
+    for (;;) {
+        line[0] = 0;
+        /* At ring 3, always. A desktop is the largest program on the machine
+           and the one that runs everything else; if anything is going to be
+           held at arm's length it is this. */
+        string_join(line, sizeof(line), "", "RING3 ");
+        string_join(line, sizeof(line), "", configured);
+        if (announce) {
+            print("Starting ");
+            print(configured);
+            print_line("...");
+        }
+        announce = 0;
+
+        execute(line);
+        /* Anything the desktop left behind - a program it started and did not
+           wait for, and whose slot nobody has cleared. */
+        program_reap();
+
+        if (last_exit_code != KOI_EXIT_FAULT) {
+            /* It was asked to leave, and it left. Where the way back is, said
+               once: somebody who chose "exit to Koi-DOS" is looking at a
+               prompt and has no reason to guess the word. */
+            print_line("");
+            print_line("Type DESKTOP to start it again.");
+            return;
+        }
+        if (++crashes >= DESKTOP_CRASHES_ALLOWED) {
+            console_set_color(console_theme()->error,
+                              console_theme()->background);
+            print_line("");
+            print_line("The desktop has crashed three times running.");
+            print_line("Not starting it again. Type DESKTOP to try by hand.");
+            console_use_theme();
+            return;
+        }
+        console_use_theme();
+        console_show_cursor(1);
+        print_line("");
+        print_line("The desktop stopped. Starting it again.");
+    }
+}
+
+/* And by hand, for somebody who left it and wants it back. */
+static void command_desktop(void) {
+    if (!config_desktop()[0]) {
+        print_line("No desktop is configured.");
+        print_line("Put `command = \\MIZU\\MIZU` in \\BOOT\\CONFIG\\DESKTOP.CFG.");
+        return;
+    }
+    run_desktop(1);
+}
+
+/* Run a program and do not wait for it.
+ *
+ * This is the one command that could not have existed before there was a
+ * scheduler, and the shortest possible statement of what the scheduler is
+ * for. Everything else about tasks is machinery; this is the thing a person
+ * can see.
+ *
+ * Two honest limitations, said out loud rather than discovered:
+ *
+ * The console is shared. Two programs printing at once produce two programs'
+ * output interleaved, because there is one screen and nothing owns it. That
+ * is a real defect and the answer to it is a window per program, which is
+ * Mizu's job and not the shell's - the shell is where this gets tested, not
+ * where it gets used.
+ *
+ * Ctrl+C goes to whoever asks for it first. Also real, also waiting for
+ * something that can say which program the keyboard is talking to.
+ *
+ * What this is actually for is the call underneath it: a desktop that starts
+ * a program and keeps drawing. That has been the missing piece since the day
+ * Mizu could run something, and every freeze while DOOM loaded was this. */
+static void command_start(const ARGUMENTS* arguments) {
+    if (!arguments->operand[0][0]) {
+        print_line("Usage: start <program>");
+        print_line("Runs it alongside the shell instead of waiting for it.");
+        return;
+    }
+    {
+        char line[INPUT_MAX];
+
+        /* The rest of the line verbatim, rather than the operands joined back
+           together: what follows START is a command line and it belongs to
+           whatever runs it. Rebuilding it from the first two operands quietly
+           dropped the third, which is how `start ring3 spin A 6` became a
+           program with no arguments at all. */
+        line[0] = 0;
+        string_join(line, sizeof(line), "", arguments->tail);
+
+        /* Through the whole dispatcher rather than straight at the program
+           loader, so that `start ring3 mizu` means what it reads as. The cost
+           is that `start dir` is accepted and does nothing unusual - DIR is
+           not a program and there is nothing to not wait for. */
+        program_run_next_in_background();
+        execute(line);
+        /* Whatever that turned out to be, the request is over. A built-in
+           command consumes neither flag, and a request that outlived the line
+           that made it would background the next program somebody ran. */
+        program_run_next_cancel();
     }
 }
 
@@ -5198,6 +5859,15 @@ static void command_mode(void) {
    including the ones that are not characters, which is why this reads an
    event rather than a line. */
 static void command_pause(void) {
+    /* Except when nobody can press one. A captured command runs with its
+       output going into a program's buffer and that program stopped inside
+       the call - so waiting here waits forever. Saying the line and carrying
+       on is the only behaviour that is not a hang. */
+    if (syscall_capturing()) {
+        print_line("Press any key to continue . . . (not waiting: no keyboard "
+                   "here)");
+        return;
+    }
     print("Press any key to continue . . .");
     (void)keyboard_getchar();
     print_line("");
@@ -5636,6 +6306,8 @@ static void run_batch(VOLUME* volume, const char* path, const char* arguments) {
     kfree(contents);
 }
 
+int command_last_exit(void) { return last_exit_code; }
+
 int command_execute_line(const char* line) {
     if (!line) return -1;
     execute(line);
@@ -5745,27 +6417,53 @@ static void execute(const char* input) {
             }
             if (!right[0]) { print_line("Nothing after the pipe."); return; }
 
-            if (!capture_begin(PIPE_FILE, 0)) {
-                print_line("Could not make the pipe file.");
-                return;
-            }
-            execute(left);
-            ok = capture_end();
-            if (!ok) print_line("The pipe file could not be written.");
-            else {
-                char keep[PATH_MAX];
-                boot_uint64_t at = 0;
-                while (input_source[at]) { keep[at] = input_source[at]; at++; }
-                keep[at] = 0;
-                set_input_source(PIPE_FILE);
-                execute(right);
-                set_input_source(keep);
-            }
             {
-                VOLUME* volume;
-                char path[PATH_MAX];
-                if (resolve_path(PIPE_FILE, &volume, path))
-                    fat32_remove(volume, path);
+                char through[16];
+                int depth = pipe_depth;
+                boot_uint64_t at = 0;
+
+                if (depth >= PIPE_FILE_MAX) {
+                    print_line("Too many pipes in one line.");
+                    return;
+                }
+                {
+                    const char* name = pipe_file(depth);
+
+                    while (name[at]) { through[at] = name[at]; at++; }
+                    through[at] = 0;
+                }
+
+                if (!capture_begin(through, 0)) {
+                    print_line("Could not make the pipe file.");
+                    return;
+                }
+                pipe_depth = depth + 1;
+                execute(left);
+                pipe_depth = depth;
+                ok = capture_end();
+                if (!ok) print_line("The pipe file could not be written.");
+                else {
+                    char keep[PATH_MAX];
+                    boot_uint64_t kept = 0;
+
+                    while (input_source[kept]) {
+                        keep[kept] = input_source[kept];
+                        kept++;
+                    }
+                    keep[kept] = 0;
+                    set_input_source(through);
+                    pipe_depth = depth + 1;
+                    execute(right);
+                    pipe_depth = depth;
+                    set_input_source(keep);
+                }
+                {
+                    VOLUME* volume;
+                    char path[PATH_MAX];
+
+                    if (resolve_path(through, &volume, path))
+                        fat32_remove(volume, path);
+                }
             }
             return;
         }
@@ -5870,6 +6568,7 @@ static void execute(const char* input) {
         return;
     }
     if (word_is(input, "PING")) { command_ping(&arguments); return; }
+    if (word_is(input, "GET")) { command_get(&arguments); return; }
     if (word_is(input, "DOSGET")) { command_dosget(&arguments); return; }
     if (word_is(input, "POINTER")) { command_pointer(); return; }
     if (word_is(input, "LOG")) { command_log(&arguments); return; }
@@ -5901,6 +6600,12 @@ static void execute(const char* input) {
     if (word_is(input, "MODE")) { command_mode(); return; }
     if (word_is(input, "MOUSE")) { command_mouse(); return; }
     if (word_is(input, "RING3")) { command_ring3(&arguments); return; }
+    if (word_is(input, "START")) { command_start(&arguments); return; }
+    if (word_is(input, "DESKTOP")) { command_desktop(); return; }
+    if (word_is(input, "SYSVOL")) { command_sysvol(&arguments); return; }
+    if (word_is(input, "SECTOR")) { command_sector(&arguments); return; }
+    if (word_is(input, "CRYPTO")) { command_crypto(); return; }
+    if (word_is(input, "KEYS")) { command_keys(); return; }
     if (word_is(input, "GOTO")) { command_goto(&arguments); return; }
     if (word_is(input, "IF")) { command_if(arguments.tail); return; }
     if (word_is(input, "SHIFT")) {
@@ -6012,6 +6717,34 @@ __attribute__((noreturn)) void command_run(void) {
     command_ver();
     print("\n");
 
+    /* An address, if there is a wire and nobody said not to.
+     *
+     * `net start` was a command somebody had to know existed, typed before
+     * anything that needs a network would work - which is every machine's
+     * first five minutes spent doing what the machine could have done itself.
+     * Asked for here rather than in the kernel's own startup because it takes
+     * seconds when there is no server, and the shell is where a wait can be
+     * seen and said out loud.
+     *
+     * Only with a link. A cable that is not plugged in is not a question
+     * worth four seconds. */
+    if (config_network_automatic() && net_link_ready() && !net_configured()) {
+        print_line("Asking the network for an address...");
+        if (net_start()) {
+            char text[16];
+
+            net_format_address(net_address(), text);
+            print("Address ");
+            print(text);
+            net_format_address(net_gateway(), text);
+            print(", gateway ");
+            print_line(text);
+        } else {
+            print_line("No answer. `net start` tries again; `net set` does it"
+                       " by hand.");
+        }
+    }
+
     /* AUTOEXEC.BAT at the root of the boot drive, if there is one. It runs
        before the check below, because on a machine with no keyboard whatever
        it prints is the only thing the system will ever say. */
@@ -6049,7 +6782,19 @@ __attribute__((noreturn)) void command_run(void) {
        wrong in some other way has still left its account of itself. */
     save_boot_log();
 
+    /* And then the desktop, if this machine has one. */
+    run_desktop(1);
+
     for (;;) {
+        /* Anything started with START that has since ended is cleared away
+           here. A program nobody waited for has nobody to notice that it
+           finished, and its memory, its tables and its open files stay its own
+           until somebody does. */
+        program_reap();
+        /* A disk that appeared while the last command ran gets its letter
+           here, where nothing is holding a file open and a rescan is safe. A
+           stick plugged in at the prompt is ready by the next prompt. */
+        if (partition_changed()) remount_everything();
         print_prompt();
         keyboard_read_line(input, sizeof(input));
         /* keyboard_read_line echoes to the screen only, so the line is
@@ -6057,6 +6802,12 @@ __attribute__((noreturn)) void command_run(void) {
            print_prompt() has already written to both. */
         serial_write(input);
         serial_write("\n");
+        /* And again here, before the command runs rather than only before the
+           prompt is drawn: a stick plugged in while somebody was typing is a
+           stick they expect the command they are typing to know about. One
+           cycle late is exactly what "walk to another drive and back" was
+           papering over. */
+        if (partition_changed()) remount_everything();
         if (input[0]) execute(input);
         run_chained();
     }

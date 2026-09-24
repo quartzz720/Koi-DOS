@@ -59,7 +59,18 @@ int edit_load(EDITOR* editor, const char* path, long capacity) {
     if (handle < 0) return 1;          /* a new file with a name, not a failure */
 
     size = koi_filesize(handle);
-    if (size > capacity) size = capacity;
+    if (size > capacity) {
+        /* Refused rather than trimmed.
+         *
+         * It used to load the first `capacity` bytes and say nothing, which
+         * meant the editor showed a file that looked complete, and saving it
+         * wrote that truncated version back over the real one. A file lost
+         * that way is lost in a way nobody notices until they need the end of
+         * it. Refusing to open is an inconvenience; the other is a shredder. */
+        koi_close(handle);
+        editor->path[0] = 0;
+        return 0;
+    }
     while (got < size) {
         long step = koi_read(handle, editor->text + got, size - got);
         if (step <= 0) break;

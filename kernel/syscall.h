@@ -13,8 +13,18 @@
    working from the root however deep the user had navigated. */
 void syscall_set_location(VOLUME* volume, const char* directory);
 
-/* Drop every open handle. Called when a program ends, so a program that exits
-   without closing its files does not leak them into the next one. */
-void syscall_close_all(void);
+/* Everything one program was holding - files, searches, memory, sound. Called
+   when that program's slot is cleared away, whether or not anybody was
+   waiting for it. */
+void syscall_close_owner(int owner);
+
+/* Whether a program is collecting output rather than it reaching a screen.
+   Anything that would stop and wait for a keystroke has to ask: in a captured
+   command there is nobody able to press one. */
+int syscall_capturing(void);
+
+/* Whether any file or directory search is open. A disk rescan is only safe
+   when nothing is. */
+int syscall_files_open(void);
 
 #endif
